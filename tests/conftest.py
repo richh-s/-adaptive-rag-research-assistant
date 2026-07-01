@@ -8,7 +8,11 @@ from rag_assistant.config import get_settings
 
 
 @pytest.fixture(autouse=True)
-def _default_test_env(monkeypatch):
+def _default_test_env(request, monkeypatch):
+    # `live` tests hit real APIs and need the real keys from .env/the environment,
+    # so don't clobber them with fake values here.
+    if request.node.get_closest_marker("live"):
+        return
     monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
     monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
 

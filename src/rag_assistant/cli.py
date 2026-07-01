@@ -5,6 +5,7 @@ from rag_assistant.ingestion.build_index import build_index
 from rag_assistant.llm import get_chat_model
 from rag_assistant.logging_conf import configure_logging
 from rag_assistant.retrieval.vector_store import get_retriever
+from rag_assistant.retrieval.web_search import WebSearchTool
 
 app = typer.Typer(help="Adaptive RAG Research Assistant")
 console = Console()
@@ -54,6 +55,26 @@ def retrieve(question: str, k: int = 4) -> None:
     for i, doc in enumerate(docs, start=1):
         console.print(f"[bold]{i}. {doc.metadata.get('source', 'unknown')}[/bold]")
         console.print(doc.page_content[:200] + ("..." if len(doc.page_content) > 200 else ""))
+        console.print()
+
+
+@app.command()
+def search(query: str, max_results: int = 5) -> None:
+    """Debug command: run a raw Tavily web search for a query."""
+    configure_logging()
+    try:
+        results = WebSearchTool().search(query, max_results=max_results)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    if not results:
+        console.print("[yellow]No results.[/yellow]")
+        return
+    for i, doc in enumerate(results, start=1):
+        title = doc.metadata.get("title", "unknown")
+        url = doc.metadata.get("url", "")
+        console.print(f"[bold]{i}. {title}[/bold] ({url})")
+        console.print(doc.content[:200] + ("..." if len(doc.content) > 200 else ""))
         console.print()
 
 
