@@ -1,6 +1,7 @@
 import typer
 from rich.console import Console
 
+from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.ingestion.build_index import build_index
 from rag_assistant.llm import get_chat_model
 from rag_assistant.logging_conf import configure_logging
@@ -76,6 +77,31 @@ def search(query: str, max_results: int = 5) -> None:
         console.print(f"[bold]{i}. {title}[/bold] ({url})")
         console.print(doc.content[:200] + ("..." if len(doc.content) > 200 else ""))
         console.print()
+
+
+@app.command()
+def ask(question: str) -> None:
+    """Run the full adaptive research graph on a question."""
+    configure_logging()
+    try:
+        result = build_graph().invoke({"question": question}, config={"recursion_limit": 50})
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[dim]route: {result['route']} -- {result['route_reasoning']}[/dim]")
+    sub_queries = result.get("sub_queries", [])
+    if len(sub_queries) > 1:
+        console.print("[dim]sub-queries:[/dim]")
+        for sub_query in sub_queries:
+            console.print(f"  [dim]- {sub_query}[/dim]")
+    console.print()
+    console.print(result["final_answer"])
+    if result["citations"]:
+        console.print()
+        console.print("[bold]Sources:[/bold]")
+        for citation in result["citations"]:
+            console.print(f"  {citation['marker']} {citation['source_id']}")
 
 
 def main() -> None:
