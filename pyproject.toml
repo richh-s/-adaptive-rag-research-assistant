@@ -1,0 +1,43 @@
+[project]
+name = "rag-assistant"
+version = "0.1.0"
+description = "Adaptive RAG Research Assistant: agentic retrieval routing, RAG fusion, query decomposition, and corrective fallback over LangGraph"
+readme = "README.md"
+authors = [
+    { name = "richh-s", email = "rahelsamson953@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "chromadb>=1.5.9",
+    "fastapi>=0.138.2",
+    "langchain-chroma>=1.1.0",
+    "langchain-google-genai>=4.2.6",
+    "langchain-text-splitters>=1.1.2",
+    "langgraph>=1.2.7",
+    "pydantic-settings>=2.14.2",
+    "python-dotenv>=1.2.2",
+    "rich>=15.0.0",
+    "tavily-python>=0.7.26",
+    "typer>=0.26.8",
+]
+
+[project.scripts]
+rag-assistant = "rag_assistant.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.25,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.15.20",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+markers = ["live: hits real external APIs (Gemini/Tavily), excluded by default"]
+addopts = "-m 'not live'"
