@@ -18,14 +18,16 @@ def decompose_query(state: ResearchState) -> dict:
 
 def dispatch_retrieval(state: ResearchState) -> list[Send]:
     """Fans out one `Send` per (sub-query, retrieval path) pair -- LangGraph's map step.
-    Each `Send` triggers an independent invocation of `retrieve_vector`/`web_search` carrying
-    only that one sub-query; their `vector_results`/`web_results` writes are concatenated back
-    together via the `operator.add` reducer declared on those state fields."""
+    Each `Send` triggers an independent invocation of `retrieve_vector`/`retrieve_bm25`/
+    `web_search` carrying only that one sub-query; their `vector_results`/`bm25_results`/
+    `web_results` writes are concatenated back together via the `operator.add` reducer
+    declared on those state fields."""
     route = state["route"]
     sends = []
     for sub_query in state["sub_queries"]:
         if route in ("vector", "both"):
             sends.append(Send("retrieve_vector", {"sub_query": sub_query}))
+            sends.append(Send("retrieve_bm25", {"sub_query": sub_query}))
         if route in ("web", "both"):
             sends.append(Send("web_search", {"sub_query": sub_query}))
     return sends

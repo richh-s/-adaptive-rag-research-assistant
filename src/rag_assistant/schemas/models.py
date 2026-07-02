@@ -72,3 +72,10 @@ class DocGradeBatch(BaseModel):
     grades: list[DocGrade] = Field(
         description="Exactly one grade per document, in the same order the documents were given."
     )
+
+
+class Citation(BaseModel):
+    """One deterministic citation marker, assigned in fused rank order."""
+
+    marker: str
+    source_id: str

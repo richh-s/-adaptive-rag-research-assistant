@@ -5,7 +5,8 @@ from rag_assistant.graph.nodes.corrective_fallback import corrective_web_search
 from rag_assistant.graph.nodes.decompose import decompose_query, dispatch_retrieval
 from rag_assistant.graph.nodes.fuse import fuse_results
 from rag_assistant.graph.nodes.grade import after_grade, grade_and_score
-from rag_assistant.graph.nodes.retrieve import retrieve_vector
+from rag_assistant.graph.nodes.report import format_report
+from rag_assistant.graph.nodes.retrieve import retrieve_bm25, retrieve_vector
 from rag_assistant.graph.nodes.router import after_route, route_query
 from rag_assistant.graph.nodes.synthesize import synthesize_answer
 from rag_assistant.graph.nodes.web_search_node import web_search
@@ -18,11 +19,13 @@ def build_graph() -> CompiledStateGraph:
     graph.add_node("route_query", route_query)
     graph.add_node("decompose_query", decompose_query)
     graph.add_node("retrieve_vector", retrieve_vector)
+    graph.add_node("retrieve_bm25", retrieve_bm25)
     graph.add_node("web_search", web_search)
     graph.add_node("fuse_results", fuse_results)
     graph.add_node("grade_and_score", grade_and_score)
     graph.add_node("corrective_web_search", corrective_web_search)
     graph.add_node("synthesize_answer", synthesize_answer)
+    graph.add_node("format_report", format_report)
 
     graph.add_edge(START, "route_query")
     graph.add_conditional_edges(
@@ -33,9 +36,10 @@ def build_graph() -> CompiledStateGraph:
     graph.add_conditional_edges(
         "decompose_query",
         dispatch_retrieval,
-        ["retrieve_vector", "web_search"],
+        ["retrieve_vector", "retrieve_bm25", "web_search"],
     )
     graph.add_edge("retrieve_vector", "fuse_results")
+    graph.add_edge("retrieve_bm25", "fuse_results")
     graph.add_edge("web_search", "fuse_results")
     graph.add_edge("fuse_results", "grade_and_score")
     graph.add_conditional_edges(
@@ -44,6 +48,7 @@ def build_graph() -> CompiledStateGraph:
         ["corrective_web_search", "synthesize_answer"],
     )
     graph.add_edge("corrective_web_search", "fuse_results")
-    graph.add_edge("synthesize_answer", END)
+    graph.add_edge("synthesize_answer", "format_report")
+    graph.add_edge("format_report", END)
 
     return graph.compile()

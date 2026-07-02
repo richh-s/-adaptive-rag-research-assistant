@@ -15,6 +15,7 @@ def test_vector_routed_question_returns_cited_answer():
     assert result["route"] in ("vector", "both")
     assert result["final_answer"]
     assert result["vector_results"]
+    assert result["bm25_results"]
     assert result["fused_documents"]
     assert result["doc_grades"]
     assert 0.0 <= result["confidence_score"] <= 1.0
@@ -42,6 +43,7 @@ def test_compound_question_decomposes_into_multiple_subqueries():
     assert len(result["sub_queries"]) >= 2
     assert result["final_answer"]
     assert result["vector_results"]
+    assert result["bm25_results"]
     assert result["fused_documents"]
 
 

@@ -46,3 +46,15 @@ def test_results_sorted_descending_by_score():
     assert [d.rrf_score for d in fused] == sorted(
         [d.rrf_score for d in fused], reverse=True
     )
+
+
+def test_document_ranked_in_three_lists_outranks_document_in_one():
+    consensus = _doc("consensus content", "consensus")
+    solo = _doc("solo content", "solo")
+
+    fused = reciprocal_rank_fusion([[consensus], [consensus, solo], [consensus]])
+
+    assert fused[0].content == "consensus content"
+    assert fused[0].rrf_score == pytest.approx(3 * (1 / 61))
+    assert fused[1].content == "solo content"
+    assert fused[0].rrf_score > fused[1].rrf_score

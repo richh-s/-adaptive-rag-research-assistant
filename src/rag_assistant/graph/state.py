@@ -1,7 +1,7 @@
 import operator
 from typing import Annotated, Literal, TypedDict
 
-from rag_assistant.schemas.models import DocGrade, FusedDocument, SubQueryResult
+from rag_assistant.schemas.models import Citation, DocGrade, FusedDocument, SubQueryResult
 
 
 class ResearchState(TypedDict):
@@ -17,10 +17,11 @@ class ResearchState(TypedDict):
     # decomposition -- Concept: query decomposition
     sub_queries: list[str]
 
-    # `operator.add` reducer: each Send-based retrieve_vector/web_search invocation
-    # contributes a one-element list for its sub-query, and LangGraph concatenates them
-    # all here instead of the default "last write wins" behavior.
+    # `operator.add` reducer: each Send-based retrieve_vector/retrieve_bm25/web_search
+    # invocation contributes a one-element list for its sub-query, and LangGraph concatenates
+    # them all here instead of the default "last write wins" behavior.
     vector_results: Annotated[list[SubQueryResult], operator.add]
+    bm25_results: Annotated[list[SubQueryResult], operator.add]
     web_results: Annotated[list[SubQueryResult], operator.add]
 
     # fusion -- Concept: RAG Fusion. Written once by the `fuse_results` join point, so no
@@ -34,6 +35,9 @@ class ResearchState(TypedDict):
     correction_attempted: bool
 
     final_answer: str
-    citations: list[dict]
+    citations: list[Citation]
+
+    # report formatting -- Concept: transparency reporting
+    research_report: str
 
     errors: list[str]

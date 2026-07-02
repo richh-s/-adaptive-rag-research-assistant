@@ -1,5 +1,6 @@
 import typer
 from rich.console import Console
+from rich.markdown import Markdown
 
 from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.ingestion.build_index import build_index
@@ -80,6 +81,15 @@ def search(query: str, max_results: int = 5) -> None:
 
 
 @app.command()
+def serve(host: str = "127.0.0.1", port: int = 8000, reload: bool = False) -> None:
+    """Run the FastAPI server exposing POST /research."""
+    import uvicorn
+
+    configure_logging()
+    uvicorn.run("rag_assistant.api:app", host=host, port=port, reload=reload)
+
+
+@app.command()
 def ask(question: str) -> None:
     """Run the full adaptive research graph on a question."""
     configure_logging()
@@ -89,19 +99,7 @@ def ask(question: str) -> None:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
 
-    console.print(f"[dim]route: {result['route']} -- {result['route_reasoning']}[/dim]")
-    sub_queries = result.get("sub_queries", [])
-    if len(sub_queries) > 1:
-        console.print("[dim]sub-queries:[/dim]")
-        for sub_query in sub_queries:
-            console.print(f"  [dim]- {sub_query}[/dim]")
-    console.print()
-    console.print(result["final_answer"])
-    if result["citations"]:
-        console.print()
-        console.print("[bold]Sources:[/bold]")
-        for citation in result["citations"]:
-            console.print(f"  {citation['marker']} {citation['source_id']}")
+    console.print(Markdown(result["research_report"]))
 
 
 def main() -> None:

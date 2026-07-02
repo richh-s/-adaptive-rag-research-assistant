@@ -1,3 +1,4 @@
+from rag_assistant.retrieval.bm25_store import bm25_search
 from rag_assistant.retrieval.vector_store import get_retriever
 from rag_assistant.schemas.models import RetrievedDoc, SubQueryResult
 
@@ -16,3 +17,12 @@ def retrieve_vector(state: dict) -> dict:
         for doc in docs
     ]
     return {"vector_results": [SubQueryResult(sub_query=sub_query, docs=retrieved)]}
+
+
+def retrieve_bm25(state: dict) -> dict:
+    """Local BM25 keyword retrieval for one sub-query, mirroring retrieve_vector's Send-based
+    shape. Complements dense vector search with exact keyword matching (names, acronyms) that
+    embedding similarity sometimes under-ranks."""
+    sub_query = state["sub_query"]
+    docs = bm25_search(sub_query, k=4)
+    return {"bm25_results": [SubQueryResult(sub_query=sub_query, docs=docs)]}
