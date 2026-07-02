@@ -1,7 +1,7 @@
 import operator
 from typing import Annotated, Literal, TypedDict
 
-from rag_assistant.schemas.models import SubQueryResult
+from rag_assistant.schemas.models import DocGrade, FusedDocument, SubQueryResult
 
 
 class ResearchState(TypedDict):
@@ -22,6 +22,16 @@ class ResearchState(TypedDict):
     # all here instead of the default "last write wins" behavior.
     vector_results: Annotated[list[SubQueryResult], operator.add]
     web_results: Annotated[list[SubQueryResult], operator.add]
+
+    # fusion -- Concept: RAG Fusion. Written once by the `fuse_results` join point, so no
+    # reducer needed here.
+    fused_documents: list[FusedDocument]
+
+    # confidence / correction -- Concept: Corrective-RAG
+    doc_grades: list[DocGrade]
+    confidence_score: float
+    needs_correction: bool
+    correction_attempted: bool
 
     final_answer: str
     citations: list[dict]

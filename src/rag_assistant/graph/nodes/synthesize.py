@@ -1,18 +1,15 @@
 from rag_assistant.graph.state import ResearchState
 from rag_assistant.llm import get_chat_model
 from rag_assistant.prompts.synthesis_prompt import NO_CONTEXT_PROMPT, SYNTHESIS_PROMPT
-from rag_assistant.schemas.models import RetrievedDoc
+from rag_assistant.schemas.models import FusedDocument
 
 
 def synthesize_answer(state: ResearchState) -> dict:
-    """Builds the final cited answer from every retrieved document across sub-queries and
-    retrieval paths, or answers directly from the model's own knowledge when the router
-    decided no retrieval was needed."""
-    docs: list[RetrievedDoc] = [
-        doc
-        for result in state.get("vector_results", []) + state.get("web_results", [])
-        for doc in result.docs
-    ]
+    """Builds the final cited answer from the fused, deduplicated, rank-ordered documents,
+    or answers directly from the model's own knowledge when the router decided no retrieval
+    was needed. Citation markers follow fused rank order, so the highest-consensus documents
+    get the lowest (most prominent) marker numbers."""
+    docs: list[FusedDocument] = state.get("fused_documents", [])
 
     if not docs:
         answer = get_chat_model().invoke(NO_CONTEXT_PROMPT.format(question=state["question"]))

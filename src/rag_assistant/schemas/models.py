@@ -45,3 +45,30 @@ class SubQueryResult(BaseModel):
 
     sub_query: str
     docs: list[RetrievedDoc] = []
+
+
+class FusedDocument(BaseModel):
+    """A document after Reciprocal Rank Fusion -- deduplicated across every ranked list it
+    appeared in, carrying a single fused score reflecting how consistently high it ranked."""
+
+    content: str
+    metadata: dict = {}
+    source_id: str
+    rrf_score: float
+
+
+class DocGrade(BaseModel):
+    """Corrective-RAG style relevance grade for a single document."""
+
+    relevant: bool = Field(description="Whether this document meaningfully helps answer the question.")
+    score: float = Field(
+        ge=0.0, le=1.0, description="Relevance score from 0.0 (irrelevant) to 1.0 (highly relevant)."
+    )
+
+
+class DocGradeBatch(BaseModel):
+    """Structured output for grading every fused document in a single LLM call."""
+
+    grades: list[DocGrade] = Field(
+        description="Exactly one grade per document, in the same order the documents were given."
+    )
