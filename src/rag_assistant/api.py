@@ -34,6 +34,23 @@ _graph = build_graph()
 
 _RECURSION_LIMIT = 50
 
+# Human-readable progress label per graph node, shown to the client as each node completes.
+# `dispatch_retrieval`'s `Send` fan-out means retrieve_vector/retrieve_bm25/web_search can
+# each fire multiple times (once per sub-query) and `fuse_results` can fire twice (corrective
+# retry loop), so this lookup must stay stateless per event rather than assume 1 event/node.
+NODE_MESSAGES: dict[str, str] = {
+    "route_query": "Routing question...",
+    "decompose_query": "Decomposing into sub-queries...",
+    "retrieve_vector": "Retrieving from local knowledge base...",
+    "retrieve_bm25": "Searching local corpus by keyword...",
+    "web_search": "Searching the web...",
+    "fuse_results": "Fusing retrieved results...",
+    "grade_and_score": "Grading relevance and confidence...",
+    "corrective_web_search": "Confidence low, running corrective web search...",
+    "synthesize_answer": "Synthesizing answer...",
+    "format_report": "Formatting report...",
+}
+
 
 @app.get("/health")
 def health() -> dict:
@@ -54,4 +71,46 @@ def research(request: ResearchRequest) -> ResearchResponse:
         report=result["research_report"],
         route=result.get("route"),
         confidence_score=result.get("confidence_score"),
+    )
+
+
+async def _stream_research_events(question: str) -> AsyncIterator[str]:
+    # Once this generator has started, the response is already HTTP 200 with headers flushed
+    # -- there is no way to surface an HTTP error status mid-stream. Every failure, including
+    # ones from deep inside a graph node (e.g. quota exhaustion), must degrade to a "type":
+    # "error" SSE frame instead of propagating and truncating the connection.
+    try:
+        final_state: dict = {}
+        async for update in _graph.astream(
+            {"question": question},
+            config={"recursion_limit": _RECURSION_LIMIT},
+            stream_mode="updates",
+        ):
+            for node_name, node_output in update.items():
+                final_state.update(node_output)
+                event = StreamEvent(
+                    type="progress",
+                    node=node_name,
+                    message=NODE_MESSAGES.get(node_name, node_name),
+                )
+                yield f"data: {event.model_dump_json()}\n\n"
+
+        done_event = StreamEvent(
+            type="done",
+            report=final_state.get("research_report", ""),
+            route=final_state.get("route"),
+            confidence_score=final_state.get("confidence_score"),
+        )
+        yield f"data: {done_event.model_dump_json()}\n\n"
+    except Exception as exc:
+        error_event = StreamEvent(type="error", detail=str(exc))
+        yield f"data: {error_event.model_dump_json()}\n\n"
+
+
+@app.post("/research/stream")
+async def research_stream(request: ResearchRequest) -> StreamingResponse:
+    return StreamingResponse(
+        _stream_research_events(request.question),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

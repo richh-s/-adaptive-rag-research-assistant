@@ -1,6 +1,10 @@
+import json
+from pathlib import Path
+
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.table import Table
 
 from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.ingestion.build_index import build_index
@@ -8,6 +12,12 @@ from rag_assistant.llm import get_chat_model
 from rag_assistant.logging_conf import configure_logging
 from rag_assistant.retrieval.vector_store import get_retriever
 from rag_assistant.retrieval.web_search import WebSearchTool
+
+# Graph execution alone costs ~4 Gemini calls/question (route, decompose, grade, synthesize),
+# independent of whether --llm-judge adds further scoring calls -- this is the dominant,
+# easy-to-underestimate cost against the 20-calls/day free-tier quota.
+_GRAPH_CALLS_PER_QUESTION = 4
+_LLM_JUDGE_CALLS_PER_QUESTION = 2  # Faithfulness + ResponseRelevancy, each one extra call
 
 app = typer.Typer(help="Adaptive RAG Research Assistant")
 console = Console()
@@ -100,6 +110,53 @@ def ask(question: str) -> None:
         raise typer.Exit(code=1) from exc
 
     console.print(Markdown(result["research_report"]))
+
+
+@app.command(name="eval")
+def eval_(
+    llm_judge: bool = False,
+    limit: int = 3,
+    output: Path | None = None,
+) -> None:
+    """Run the RAGAS eval harness against the golden dataset. `limit` defaults to 3 (not the
+    full dataset) because graph execution alone costs ~4 Gemini calls/question -- the primary
+    quota lever, independent of --llm-judge which only adds further scoring calls."""
+    configure_logging()
+
+    graph_calls = limit * _GRAPH_CALLS_PER_QUESTION
+    judge_calls = limit * _LLM_JUDGE_CALLS_PER_QUESTION if llm_judge else 0
+    console.print(
+        f"[yellow]Estimated Gemini calls: ~{graph_calls} for graph execution"
+        + (f" + ~{judge_calls} for LLM-judge scoring" if llm_judge else "")
+        + f" = ~{graph_calls + judge_calls} total against the 20/day free-tier quota.[/yellow]"
+    )
+
+    from rag_assistant.eval.run_eval import run_eval
+
+    try:
+        results, eval_result = run_eval(limit=limit, llm_judge=llm_judge)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    table = Table(title="Golden question checks")
+    table.add_column("Question")
+    table.add_column("Route")
+    table.add_column("Sources")
+    for r in results:
+        route_cell = f"{r.actual_route} ({'✓' if r.route_match else '✗ expected ' + r.expected_route})"
+        sources_cell = "✓" if r.source_overlap else f"✗ expected {r.expected_sources}"
+        table.add_row(r.question, route_cell, sources_cell)
+    console.print(table)
+
+    metrics = eval_result.to_pandas().mean(numeric_only=True).to_dict()
+    console.print("[bold]RAGAS metrics:[/bold]", metrics)
+
+    if output:
+        output.write_text(
+            json.dumps({"results": [r.__dict__ for r in results], "metrics": metrics}, indent=2)
+        )
+        console.print(f"[green]Wrote results to {output}[/green]")
 
 
 def main() -> None:

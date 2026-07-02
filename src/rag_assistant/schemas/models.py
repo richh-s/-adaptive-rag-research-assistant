@@ -79,3 +79,13 @@ class Citation(BaseModel):
 
     marker: str
     source_id: str
+
+
+class GoldenQuestion(BaseModel):
+    """One hand-authored row of the eval golden dataset (data/golden_eval/dataset.jsonl)."""
+
+    question: str
+    ground_truth: str
+    reference_contexts: list[str]
+    expected_route: Literal["vector", "web", "both", "none"]
+    expected_sources: list[str]

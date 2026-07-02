@@ -7,7 +7,58 @@ export interface ResearchResponse {
   confidence_score: number | null
 }
 
+export interface StreamEvent {
+  type: 'progress' | 'done' | 'error'
+  node?: string | null
+  message?: string | null
+  report?: string | null
+  route?: string | null
+  confidence_score?: number | null
+  detail?: string | null
+}
+
 export class ResearchApiError extends Error {}
+
+export async function streamResearch(
+  question: string,
+  onEvent: (event: StreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/research/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question }),
+    signal,
+  })
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => null)
+    throw new ResearchApiError(body?.detail ?? `Request failed with status ${response.status}`)
+  }
+
+  const reader = response.body?.getReader()
+  if (!reader) {
+    throw new ResearchApiError('Streaming is not supported by this browser.')
+  }
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const frames = buffer.split('\n\n')
+    buffer = frames.pop() ?? ''
+
+    for (const frame of frames) {
+      const line = frame.split('\n').find((l) => l.startsWith('data: '))
+      if (!line) continue
+      onEvent(JSON.parse(line.slice('data: '.length)))
+    }
+  }
+}
 
 export async function research(question: string): Promise<ResearchResponse> {
   const response = await fetch(`${API_BASE_URL}/research`, {
