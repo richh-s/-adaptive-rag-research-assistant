@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from rag_assistant.graph.build_graph import build_graph
+from rag_assistant.graph.research_summary import build_research_summary
 from rag_assistant.logging_conf import configure_logging
 from rag_assistant.schemas.api import ResearchRequest, ResearchResponse, StreamEvent
 
@@ -33,6 +34,12 @@ app.add_middleware(
 _graph = build_graph()
 
 _RECURSION_LIMIT = 50
+
+# Mirrors the `Annotated[..., operator.add]` fields in `graph/state.py`. `stream_mode="updates"`
+# yields each node invocation's own delta (e.g. one retrieve_vector call per sub-query), so
+# reassembling a final state here must concatenate these keys the same way LangGraph's reducer
+# does internally -- a plain dict.update() would silently keep only the last invocation's delta.
+_ACCUMULATING_KEYS = {"vector_results", "bm25_results", "web_results", "node_timings"}
 
 # Human-readable progress label per graph node, shown to the client as each node completes.
 # `dispatch_retrieval`'s `Send` fan-out means retrieve_vector/retrieve_bm25/web_search can
@@ -71,6 +78,7 @@ def research(request: ResearchRequest) -> ResearchResponse:
         report=result["research_report"],
         route=result.get("route"),
         confidence_score=result.get("confidence_score"),
+        summary=build_research_summary(result),
     )
 
 
@@ -87,7 +95,11 @@ async def _stream_research_events(question: str) -> AsyncIterator[str]:
             stream_mode="updates",
         ):
             for node_name, node_output in update.items():
-                final_state.update(node_output)
+                for key, value in node_output.items():
+                    if key in _ACCUMULATING_KEYS:
+                        final_state[key] = final_state.get(key, []) + value
+                    else:
+                        final_state[key] = value
                 event = StreamEvent(
                     type="progress",
                     node=node_name,
@@ -100,6 +112,7 @@ async def _stream_research_events(question: str) -> AsyncIterator[str]:
             report=final_state.get("research_report", ""),
             route=final_state.get("route"),
             confidence_score=final_state.get("confidence_score"),
+            summary=build_research_summary(final_state),
         )
         yield f"data: {done_event.model_dump_json()}\n\n"
     except Exception as exc:

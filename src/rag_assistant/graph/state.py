@@ -41,3 +41,7 @@ class ResearchState(TypedDict):
     research_report: str
 
     errors: list[str]
+
+    # observability -- one entry per node invocation (Send fan-out nodes like retrieve_vector
+    # contribute one entry per sub-query), used to build the explainability/latency panel.
+    node_timings: Annotated[list[dict], operator.add]

@@ -4,6 +4,7 @@ import { useHealthStatus } from './hooks/useHealthStatus'
 import { Header } from './components/Header'
 import { AskCard } from './components/AskCard'
 import { ResultCard } from './components/ResultCard'
+import { ResearchSummaryPanel } from './components/ResearchSummaryPanel'
 import { ErrorBanner } from './components/ErrorBanner'
 import { ProgressIndicator } from './components/ProgressIndicator'
 import './App.css'
@@ -35,6 +36,7 @@ function App() {
             report: event.report ?? '',
             route: event.route ?? null,
             confidence_score: event.confidence_score ?? null,
+            summary: event.summary ?? null,
           })
         } else if (event.type === 'error') {
           setError(event.detail ?? 'The research request failed.')
@@ -59,6 +61,7 @@ function App() {
       {loading && <ProgressIndicator messages={progressMessages} />}
       {error && <ErrorBanner message={error} />}
       {result && <ResultCard result={result} />}
+      {result?.summary && <ResearchSummaryPanel summary={result.summary} />}
     </div>
   )
 }

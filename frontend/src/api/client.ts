@@ -1,10 +1,33 @@
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
 
+export interface RetrievalCounts {
+  vector: number
+  bm25: number
+  web: number
+}
+
+export interface NodeLatency {
+  node: string
+  latency_ms: number
+}
+
+export interface ResearchSummary {
+  route: string | null
+  sub_queries: string[]
+  retrieval_counts: RetrievalCounts
+  fused_document_count: number
+  confidence_score: number | null
+  correction_attempted: boolean
+  node_latencies_ms: NodeLatency[]
+  total_latency_ms: number
+}
+
 export interface ResearchResponse {
   question: string
   report: string
   route: string | null
   confidence_score: number | null
+  summary?: ResearchSummary | null
 }
 
 export interface StreamEvent {
@@ -15,6 +38,7 @@ export interface StreamEvent {
   route?: string | null
   confidence_score?: number | null
   detail?: string | null
+  summary?: ResearchSummary | null
 }
 
 export class ResearchApiError extends Error {}

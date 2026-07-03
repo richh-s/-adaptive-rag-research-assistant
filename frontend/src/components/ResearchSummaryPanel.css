@@ -1,0 +1,83 @@
+.summary-panel {
+  width: 100%;
+  max-width: 640px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  font-size: 14px;
+}
+
+.summary-panel h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.summary-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.summary-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.summary-label {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.summary-value {
+  color: var(--text-h);
+  text-align: right;
+}
+
+.summary-checklist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.summary-checklist .check {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.summary-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  color: var(--text-h);
+}
+
+.summary-latency {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.summary-latency td {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.summary-latency td:last-child {
+  text-align: right;
+  color: var(--text-h);
+}
+
+.summary-latency-total td {
+  border-bottom: none;
+  border-top: 1px solid var(--border);
+  font-weight: 600;
+  color: var(--text-h);
+}
