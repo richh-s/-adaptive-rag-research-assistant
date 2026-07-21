@@ -1,12 +1,27 @@
+import re
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_ALNUM_RE = re.compile(r"\w", re.UNICODE)
 
 
 class ResearchRequest(BaseModel):
     """POST /research request body."""
 
-    question: str
+    question: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("question")
+    @classmethod
+    def _clean_and_validate(cls, value: str) -> str:
+        stripped = _HTML_TAG_RE.sub("", value).strip()
+        if not stripped:
+            raise ValueError("question must not be empty")
+        alnum_count = len(_ALNUM_RE.findall(stripped))
+        if alnum_count / len(stripped) < 0.1:
+            raise ValueError("question appears to be gibberish (too few alphanumeric characters)")
+        return stripped
 
 
 class RetrievalCounts(BaseModel):
@@ -57,7 +72,7 @@ class StreamEvent(BaseModel):
     "error" carries detail. Kept as one flat model (rather than a Union) since the frontend
     parses raw JSON by hand and checks `type` first regardless."""
 
-    type: Literal["progress", "done", "error"]
+    type: Literal["progress", "done", "error", "close"]
     node: str | None = None
     message: str | None = None
     report: str | None = None

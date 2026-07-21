@@ -1,3 +1,4 @@
+import logging
 import time
 from typing import Callable
 
@@ -15,18 +16,24 @@ from rag_assistant.graph.nodes.synthesize import synthesize_answer
 from rag_assistant.graph.nodes.web_search_node import web_search
 from rag_assistant.graph.state import ResearchState
 
+logger = logging.getLogger(__name__)
+
 
 def _timed(node_name: str, node_fn: Callable[[dict], dict]) -> Callable[[dict], dict]:
-    """Wraps a node function to record its own wall-clock latency into `node_timings`.
-    Send-fanned nodes (retrieve_vector/retrieve_bm25/web_search) get invoked once per
-    sub-query, so this contributes one entry per invocation, not one per node type --
-    the explainability panel sums/groups these by node name when it builds the summary."""
+    """Wraps a node function to record its own wall-clock latency into `node_timings` and log
+    a structured line per invocation. Send-fanned nodes (retrieve_vector/retrieve_bm25/
+    web_search) get invoked once per sub-query, so this contributes one entry per invocation,
+    not one per node type -- the explainability panel sums/groups these by node name."""
 
     def wrapper(state: dict) -> dict:
         start = time.perf_counter()
         result = node_fn(state)
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        return {**result, "node_timings": [{"node": node_name, "latency_ms": round(elapsed_ms, 1)}]}
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+        logger.info(
+            "node completed",
+            extra={"trace_id": state.get("trace_id"), "node": node_name, "latency_ms": elapsed_ms},
+        )
+        return {**result, "node_timings": [{"node": node_name, "latency_ms": elapsed_ms}]}
 
     return wrapper
 

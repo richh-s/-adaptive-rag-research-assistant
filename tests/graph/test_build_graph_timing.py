@@ -1,3 +1,5 @@
+import logging
+
 from rag_assistant.graph.build_graph import _timed
 
 
@@ -24,3 +26,16 @@ def test_timed_wrapper_preserves_existing_result_keys():
     assert result["vector_results"] == []
     assert result["bm25_results"] == []
     assert result["node_timings"][0]["node"] == "retrieve_vector"
+
+
+def test_timed_wrapper_logs_trace_id_from_state(caplog):
+    def fake_node(state):
+        return {"route": "vector"}
+
+    wrapped = _timed("route_query", fake_node)
+    with caplog.at_level(logging.INFO, logger="rag_assistant.graph.build_graph"):
+        wrapped({"question": "anything", "trace_id": "abc-123"})
+
+    record = next(r for r in caplog.records if r.message == "node completed")
+    assert record.trace_id == "abc-123"
+    assert record.node == "route_query"

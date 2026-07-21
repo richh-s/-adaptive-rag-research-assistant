@@ -1,0 +1,17 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+chroma_db/
+.env
+.env.*
+!.env.example
+node_modules/
+frontend/dist/
+frontend/node_modules/
+tests/
+data/golden_eval/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.DS_Store

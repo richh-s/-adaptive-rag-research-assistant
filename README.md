@@ -131,6 +131,12 @@ uv run rag-assistant hello    # confirms chat model connectivity (Anthropic if s
 uv run rag-assistant ingest   # embeds the sample corpus (data/corpus/) into Chroma, incrementally
 ```
 
+Or run the API + Redis via Docker Compose instead:
+
+```bash
+docker compose up --build   # api on http://localhost:8000, redis alongside it
+```
+
 > **Free-tier quota note:** if `ANTHROPIC_API_KEY` is unset, chat calls fall back to Gemini,
 > whose free tier caps at ~20 requests/day; one research question costs ~4 calls (route,
 > decompose, grade, synthesize) plus embedding calls (embeddings always go through Gemini
@@ -262,6 +268,23 @@ quality against a golden dataset with zero additional LLM calls, so regressions 
 be caught without spending quota — LLM-judged metrics (faithfulness, relevancy) are opt-in for
 when that extra cost is worth it.
 
+## Production readiness
+
+Beyond the core RAG pipeline, the API is hardened for running as an actual service rather than a
+local demo script:
+
+| Area | What's there |
+| --- | --- |
+| Containerization | Multi-stage `Dockerfile` (non-root user), `docker-compose.yml` wiring `api` + `redis` with a named volume for the Chroma persist directory (`chromadb.HttpClient` server mode is a documented TODO if this ever needs multiple `api` replicas — embedded Chroma's SQLite backing locks the file to one process) |
+| Health & readiness | `GET /health` is a pure liveness check; `GET /ready` actually pings Chroma (`_collection.count()`) and Tavily (`HEAD` request) and returns 503 if either dependency is down, so an orchestrator can distinguish "process is up" from "can actually serve a request" |
+| Input validation | `question` is required, capped at 2000 chars, HTML-tag-stripped, and rejected as gibberish if under 10% alphanumeric — all in a pydantic `field_validator`, so bad input 422s before it ever reaches the graph |
+| Rate limiting | `slowapi`-based, both per-IP (`RATE_LIMIT_RPM`, default 10/min) and a global cap (`RATE_LIMIT_RPM_GLOBAL`, default 30/min) across `/research` and `/research/stream` |
+| Timeouts | Tavily's HTTP client is capped at `TAVILY_TIMEOUT_SECONDS` (default 10s); the whole graph execution behind `/research/stream` is bounded by `GRAPH_TIMEOUT_SECONDS` (default 45s) via a monotonic-clock deadline around `astream()`, emitting an `"error"` SSE frame and closing the connection instead of hanging indefinitely |
+| Graceful shutdown | SIGTERM is caught via `loop.add_signal_handler` inside the FastAPI lifespan; active SSE connections (tracked in a `weakref.WeakSet`) are sent a `"close"` frame before the process exits, instead of being cut off mid-stream |
+| Structured logging | JSON logs (`python-json-logger`) with a UUID4 `trace_id` generated per request by an ASGI middleware, propagated through `contextvars` *and* threaded explicitly into the LangGraph state (belt-and-suspenders, since LangGraph's internal scheduling isn't guaranteed to preserve context automatically) — every log line, including each node's completion log, carries `trace_id`/`node`/`route`/`latency_ms`, and the response carries the same trace ID in an `X-Trace-Id` header |
+| Caching | Redis-backed, best-effort (`USE_CACHE=false` or any Redis error both degrade silently to "no cache" — a cache outage is never worse than having no cache): router decisions keyed by question (`CACHE_TTL_ROUTER`, 5min), Tavily results keyed by query (`CACHE_TTL_TAVILY`, 10min), synthesized answers keyed by question + route + fused source IDs (`CACHE_TTL_SYNTHESIS`, 30min) — all under a `v1:` key prefix so a payload-shape change can be rolled out by bumping the prefix rather than migrating existing entries |
+| Configuration | All of the above is `pydantic-settings`-driven (`config.py`), reading exclusively from environment variables with fail-fast validation at startup instead of scattered `os.environ.get()` calls with silent defaults |
+
 ## Self-audit: findings & fixes
 
 A structured pass through routing, retrieval, corrective RAG, citations, evaluation, and
@@ -318,7 +341,8 @@ npm test               # Vitest + React Testing Library — hooks and components
 
 ```
 src/rag_assistant/
-├── config.py, llm.py, logging_conf.py   # settings, model factories, logging
+├── config.py, llm.py, logging_conf.py   # settings, model factories, structured JSON logging
+├── tracing.py, cache.py, readiness.py    # trace-ID contextvar, Redis cache, Chroma/Tavily health checks
 ├── ingestion/                            # load -> split -> embed -> index the sample corpus
 ├── retrieval/                            # Chroma vector store, BM25 keyword store, Tavily web search
 ├── fusion/rrf.py                         # Reciprocal Rank Fusion (pure function)
@@ -330,7 +354,9 @@ src/rag_assistant/
 ├── schemas/models.py                     # internal domain / structured-output schemas
 ├── schemas/api.py                        # external API request/response contracts
 ├── cli.py                                # Typer app: hello / ingest / retrieve / search / ask / serve / eval
-└── api.py                                # FastAPI: GET /health, POST /research, POST /research/stream
+└── api.py                                # FastAPI: GET /health, GET /ready, POST /research, POST /research/stream
+
+Dockerfile, docker-compose.yml, .dockerignore  # multi-stage build, non-root user, api + redis services
 
 frontend/src/
 ├── api/client.ts                         # fetch + SSE client for the backend API

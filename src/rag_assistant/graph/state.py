@@ -10,6 +10,12 @@ class ResearchState(TypedDict):
 
     question: str
 
+    # Set once by the API layer from the request's trace_id (see api.py's TraceIdMiddleware)
+    # and read by every node's timing wrapper (build_graph.py's `_timed`) so its per-node log
+    # line can be correlated back to the request, independent of contextvar propagation through
+    # LangGraph's own task/thread scheduling.
+    trace_id: str | None
+
     # routing -- Concept: Agentic/Self-RAG
     route: Literal["vector", "web", "both", "none"] | None
     route_reasoning: str | None
