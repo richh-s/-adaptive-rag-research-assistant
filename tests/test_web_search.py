@@ -66,6 +66,17 @@ def test_search_handles_empty_results():
     assert tool.search("query") == []
 
 
+class _FailingTavilyClient:
+    def search(self, query: str, max_results: int) -> dict:
+        raise RuntimeError("simulated Tavily outage")
+
+
+def test_tavily_failure_returns_empty():
+    tool = WebSearchTool(client=_FailingTavilyClient())
+
+    assert tool.search("query") == []
+
+
 @pytest.mark.live
 def test_live_tavily_search_returns_results():
     results = WebSearchTool().search("what is LangGraph", max_results=2)

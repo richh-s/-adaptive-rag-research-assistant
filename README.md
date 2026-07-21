@@ -41,10 +41,14 @@ blank to run entirely on Gemini's free tier.
   ships with a structured "Research Summary": route, sub-queries, per-source retrieval counts,
   fused document count, confidence, whether a corrective search fired, and a per-node latency
   breakdown — the same facts the graph already computes, surfaced instead of hidden.
-- **RAGAS evaluation harness** — a golden-question dataset scored with context precision/recall
-  (and optionally LLM-judged faithfulness/relevancy), run explicitly via `rag-assistant eval`
-  rather than left unmeasured. The dataset spans every route (`vector`, `web`, `both`, `none`),
-  including a case designed to exercise the corrective-fallback loop.
+- **RAGAS evaluation harness** — a golden-question dataset scored with non-LLM context
+  precision/recall (string/set overlap against reference contexts, not semantic judgment)
+  and, optionally, LLM-judged faithfulness/answer relevancy, run explicitly via
+  `rag-assistant eval` rather than left unmeasured. The dataset spans every route (`vector`,
+  `web`, `both`, `none`), including a case designed to exercise the corrective-fallback loop.
+  It's a small (13-question), hand-curated set with no adversarial cases and no naive-RAG
+  baseline to compare against — useful as a regression smoke test, not as proof the adaptive
+  pipeline outperforms a simpler one.
 - **Provider fallback** — Anthropic Claude is the primary chat/reasoning model when
   `ANTHROPIC_API_KEY` is set, with `.with_fallbacks()` to Gemini on error; embeddings always go
   through Gemini. Falls back to Gemini-only if no Anthropic key is configured.
@@ -257,6 +261,31 @@ non-LLM metrics (`NonLLMContextPrecisionWithReference`, `NonLLMContextRecall`) s
 quality against a golden dataset with zero additional LLM calls, so regressions in retrieval can
 be caught without spending quota — LLM-judged metrics (faithfulness, relevancy) are opt-in for
 when that extra cost is worth it.
+
+## Self-audit: findings & fixes
+
+A structured pass through routing, retrieval, corrective RAG, citations, evaluation, and
+streaming — the kind of review that unit tests alone don't catch — surfaced real gaps beyond
+happy-path correctness. Fixed:
+
+| Area | Finding | Fix |
+| --- | --- | --- |
+| Vector store | Chroma had no explicit distance metric, silently defaulting to L2 while Gemini embeddings are meant to be compared via cosine similarity | Set `hnsw:space: cosine` explicitly and rebuilt the index (`ingest --full`) |
+| Web search resilience | A Tavily outage/rate-limit raised unhandled and crashed the graph node | `WebSearchTool.search` now catches the failure and degrades to `[]` |
+| Answer synthesis | An empty `fused_documents` was treated as one case ("no retrieval needed"), but it also happens when retrieval is attempted and comes back empty — same prompt, very different risk of confident hallucination | Split into `NO_CONTEXT_PROMPT` (route == `none`) vs. `EMPTY_RETRIEVAL_PROMPT` (retrieval ran, found nothing), which forces the model to state upfront that no sources were found |
+| Non-streaming API | `/research` only caught `RuntimeError`; any other exception fell through to a bare, contentless 500 | Broadened to `except Exception`, still raised as a proper `HTTPException` with `detail` |
+| Documentation | README implied RAGAS's semantic, LLM-judged `context_precision`/`context_recall`, when the harness actually runs the non-LLM overlap variants | Relabeled accurately, and noted the eval set is small and non-adversarial with no baseline comparison |
+
+Verified with the full offline suite (68/68) plus a live end-to-end run: a real router call
+picked the `web` route for a live-price question, a simulated Tavily outage was forced, and the
+resulting Research Summary (`retrieval_counts: 0`, `confidence_score: 0.0`, `citations: []`) and
+synthesized answer ("No relevant sources were found...") both came out correct — confirming the
+state plumbing, not just the code path in isolation.
+
+Gaps identified but deliberately not yet acted on: no few-shot examples in the router/
+decomposition prompts, exact-content-hash dedup can still let the same source get cited twice
+under different markers if local and web copies differ even slightly, and synthesis has no
+token/context-length cap on however many documents fusion returns.
 
 ## Future improvements
 

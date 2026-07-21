@@ -30,6 +30,10 @@ def get_vector_store(
                     collection_name=COLLECTION_NAME,
                     embedding_function=embeddings or get_embeddings_model(),
                     persist_directory=resolved_persist_dir,
+                    # Chroma defaults to l2 (squared Euclidean) if unset; Gemini's embeddings
+                    # are meant to be compared by cosine similarity, so leaving this unset
+                    # silently ranks documents by the wrong metric.
+                    collection_metadata={"hnsw:space": "cosine"},
                 )
     return _store_cache[resolved_persist_dir]
 

@@ -1,6 +1,10 @@
 from rag_assistant.graph.state import ResearchState
 from rag_assistant.llm import get_chat_model
-from rag_assistant.prompts.synthesis_prompt import NO_CONTEXT_PROMPT, SYNTHESIS_PROMPT
+from rag_assistant.prompts.synthesis_prompt import (
+    EMPTY_RETRIEVAL_PROMPT,
+    NO_CONTEXT_PROMPT,
+    SYNTHESIS_PROMPT,
+)
 from rag_assistant.schemas.models import Citation, FusedDocument
 
 
@@ -12,7 +16,15 @@ def synthesize_answer(state: ResearchState) -> dict:
     docs: list[FusedDocument] = state.get("fused_documents", [])
 
     if not docs:
-        answer = get_chat_model().invoke(NO_CONTEXT_PROMPT.format(question=state["question"]))
+        # An empty `fused_documents` means two very different things: the router decided
+        # retrieval wasn't needed at all ("none" -- safe to answer from general knowledge),
+        # or retrieval was attempted on the "vector"/"web"/"both" route and came back empty
+        # (risky -- answering confidently here looks indistinguishable from a grounded answer).
+        if state.get("route") == "none":
+            prompt = NO_CONTEXT_PROMPT.format(question=state["question"])
+        else:
+            prompt = EMPTY_RETRIEVAL_PROMPT.format(question=state["question"])
+        answer = get_chat_model().invoke(prompt)
         return {"final_answer": answer.content, "citations": []}
 
     context = "\n\n".join(f"[{i + 1}] (source: {d.source_id})\n{d.content}" for i, d in enumerate(docs))

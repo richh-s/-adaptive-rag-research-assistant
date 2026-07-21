@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
@@ -10,6 +11,7 @@ from rag_assistant.logging_conf import configure_logging
 from rag_assistant.schemas.api import ResearchRequest, ResearchResponse, StreamEvent
 
 configure_logging()
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Adaptive RAG Research Assistant",
@@ -70,7 +72,8 @@ def research(request: ResearchRequest) -> ResearchResponse:
         result = _graph.invoke(
             {"question": request.question}, config={"recursion_limit": _RECURSION_LIMIT}
         )
-    except RuntimeError as exc:
+    except Exception as exc:
+        logger.exception("research failed for question=%r", request.question)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return ResearchResponse(
@@ -116,7 +119,9 @@ async def _stream_research_events(question: str) -> AsyncIterator[str]:
         )
         yield f"data: {done_event.model_dump_json()}\n\n"
     except Exception as exc:
-        error_event = StreamEvent(type="error", detail=str(exc))
+        logger.exception("research_stream failed for question=%r", question)
+        detail = str(exc) or f"{type(exc).__name__} (no further detail from the underlying service)"
+        error_event = StreamEvent(type="error", detail=detail)
         yield f"data: {error_event.model_dump_json()}\n\n"
 
 
