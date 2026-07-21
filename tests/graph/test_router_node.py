@@ -8,10 +8,10 @@ def test_route_query_returns_route_and_reasoning(monkeypatch):
     fake_decision = RouteDecision(route="vector", reasoning="Local KB covers this.")
     fake_structured_llm = MagicMock()
     fake_structured_llm.invoke.return_value = fake_decision
-    fake_llm = MagicMock()
-    fake_llm.with_structured_output.return_value = fake_structured_llm
 
-    monkeypatch.setattr("rag_assistant.graph.nodes.router.get_chat_model", lambda: fake_llm)
+    monkeypatch.setattr(
+        "rag_assistant.graph.nodes.router.get_structured_llm", lambda schema: fake_structured_llm
+    )
 
     result = route_query({"question": "Who founded Anthropic?"})
 

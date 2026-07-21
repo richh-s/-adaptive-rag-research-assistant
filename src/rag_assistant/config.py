@@ -15,9 +15,13 @@ class Settings(BaseSettings):
 
     google_api_key: str = Field(..., description="Google AI Studio API key (free tier)")
     tavily_api_key: str = Field(..., description="Tavily API key (free tier)")
+    anthropic_api_key: str | None = Field(
+        default=None, description="Anthropic API key; when set, becomes the primary chat model"
+    )
 
     gemini_chat_model: str = "gemini-2.5-flash"
     gemini_embedding_model: str = "models/gemini-embedding-001"
+    anthropic_chat_model: str = "claude-sonnet-5"
 
     corpus_dir: Path = PROJECT_ROOT / "data" / "corpus"
     chroma_persist_dir: Path = PROJECT_ROOT / "chroma_db"

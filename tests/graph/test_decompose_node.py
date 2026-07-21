@@ -8,10 +8,10 @@ def test_decompose_query_returns_sub_queries(monkeypatch):
     fake_result = SubQueries(sub_queries=["Who founded Anthropic?", "Who founded OpenAI?"])
     fake_structured_llm = MagicMock()
     fake_structured_llm.invoke.return_value = fake_result
-    fake_llm = MagicMock()
-    fake_llm.with_structured_output.return_value = fake_structured_llm
 
-    monkeypatch.setattr("rag_assistant.graph.nodes.decompose.get_chat_model", lambda: fake_llm)
+    monkeypatch.setattr(
+        "rag_assistant.graph.nodes.decompose.get_structured_llm", lambda schema: fake_structured_llm
+    )
 
     result = decompose_query({"question": "Who founded Anthropic and OpenAI?"})
 

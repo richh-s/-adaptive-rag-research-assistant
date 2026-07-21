@@ -1,5 +1,5 @@
 from rag_assistant.graph.state import ResearchState
-from rag_assistant.llm import get_chat_model
+from rag_assistant.llm import get_structured_llm
 from rag_assistant.prompts.router_prompt import ROUTER_PROMPT
 from rag_assistant.schemas.models import RouteDecision
 
@@ -7,7 +7,7 @@ from rag_assistant.schemas.models import RouteDecision
 def route_query(state: ResearchState) -> dict:
     """Agentic/Self-RAG routing: ask the LLM which retrieval path(s) this question needs,
     instead of always retrieving the same way."""
-    llm = get_chat_model().with_structured_output(RouteDecision)
+    llm = get_structured_llm(RouteDecision)
     decision: RouteDecision = llm.invoke(ROUTER_PROMPT.format(question=state["question"]))
     return {"route": decision.route, "route_reasoning": decision.reasoning}
 

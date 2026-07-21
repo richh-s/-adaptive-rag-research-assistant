@@ -1,0 +1,122 @@
+.graph-viz {
+  width: 100%;
+  max-width: 640px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 16px 20px;
+}
+
+.graph-viz-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.graph-viz-stage {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 6px 0;
+}
+
+.graph-viz-stage:not(:last-child)::before {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 20px;
+  bottom: -6px;
+  width: 1px;
+  background: var(--border);
+}
+
+.graph-viz-dot {
+  flex: none;
+  width: 11px;
+  height: 11px;
+  margin-top: 4px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  background: var(--bg);
+  transition:
+    background 0.2s ease,
+    border-color 0.2s ease;
+}
+
+.graph-viz-done .graph-viz-dot {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.graph-viz-active .graph-viz-dot {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+  animation: graph-viz-pulse 1.2s ease-in-out infinite;
+}
+
+.graph-viz-skipped .graph-viz-dot {
+  border-style: dashed;
+  opacity: 0.5;
+}
+
+.graph-viz-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.graph-viz-label {
+  font-size: 14px;
+  color: var(--text);
+}
+
+.graph-viz-active .graph-viz-label {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.graph-viz-done .graph-viz-label {
+  color: var(--text-h);
+}
+
+.graph-viz-pending .graph-viz-label {
+  opacity: 0.5;
+}
+
+.graph-viz-skipped .graph-viz-label {
+  opacity: 0.5;
+  text-decoration: line-through;
+}
+
+.graph-viz-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.graph-viz-badge {
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text);
+  background: var(--code-bg);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.graph-viz-skipped-note {
+  font-size: 12px;
+  font-style: italic;
+  opacity: 0.6;
+}
+
+@keyframes graph-viz-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 3px var(--accent-bg);
+  }
+  50% {
+    box-shadow: 0 0 0 6px var(--accent-bg);
+  }
+}

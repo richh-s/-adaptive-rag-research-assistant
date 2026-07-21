@@ -14,10 +14,10 @@ def test_grade_documents_returns_grades_in_order(monkeypatch):
     )
     fake_structured_llm = MagicMock()
     fake_structured_llm.invoke.return_value = fake_batch
-    fake_llm = MagicMock()
-    fake_llm.with_structured_output.return_value = fake_structured_llm
 
-    monkeypatch.setattr("rag_assistant.grading.relevance_grader.get_chat_model", lambda: fake_llm)
+    monkeypatch.setattr(
+        "rag_assistant.grading.relevance_grader.get_structured_llm", lambda schema: fake_structured_llm
+    )
 
     grades = grade_documents("question", [_doc("a"), _doc("b")])
 
@@ -32,10 +32,10 @@ def test_grade_documents_falls_back_when_grade_count_mismatches(monkeypatch):
     fake_batch = DocGradeBatch(grades=[DocGrade(relevant=True, score=0.9)])
     fake_structured_llm = MagicMock()
     fake_structured_llm.invoke.return_value = fake_batch
-    fake_llm = MagicMock()
-    fake_llm.with_structured_output.return_value = fake_structured_llm
 
-    monkeypatch.setattr("rag_assistant.grading.relevance_grader.get_chat_model", lambda: fake_llm)
+    monkeypatch.setattr(
+        "rag_assistant.grading.relevance_grader.get_structured_llm", lambda schema: fake_structured_llm
+    )
 
     grades = grade_documents("question", [_doc("a"), _doc("b")])
 

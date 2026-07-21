@@ -1,4 +1,4 @@
-from rag_assistant.llm import get_chat_model
+from rag_assistant.llm import get_structured_llm
 from rag_assistant.prompts.grading_prompt import GRADING_PROMPT
 from rag_assistant.schemas.models import DocGrade, DocGradeBatch, FusedDocument
 
@@ -11,7 +11,7 @@ def grade_documents(question: str, docs: list[FusedDocument]) -> list[DocGrade]:
         return []
 
     numbered = "\n\n".join(f"[{i + 1}] {doc.content}" for i, doc in enumerate(docs))
-    llm = get_chat_model().with_structured_output(DocGradeBatch)
+    llm = get_structured_llm(DocGradeBatch)
     result: DocGradeBatch = llm.invoke(GRADING_PROMPT.format(question=question, documents=numbered))
 
     if len(result.grades) != len(docs):

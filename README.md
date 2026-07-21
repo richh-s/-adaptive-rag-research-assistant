@@ -7,7 +7,10 @@ retrieval path, checks its own confidence, and falls back to web search when the
 knowledge base comes up short — then synthesizes a cited, transparency-reported answer,
 streamed live to the browser as each step of the pipeline runs.
 
-Built with LangGraph, Google Gemini (free tier), Chroma, and Tavily — no paid services required.
+Built with LangGraph, Chroma, and Tavily. Chat/reasoning defaults to Anthropic's Claude when an
+`ANTHROPIC_API_KEY` is set, with automatic fallback to Google Gemini (free tier) on error;
+Gemini always handles embeddings. No paid services are required — leave `ANTHROPIC_API_KEY`
+blank to run entirely on Gemini's free tier.
 
 <!--
   TODO(portfolio polish): drop a screenshot or short GIF of the web UI here, e.g.
@@ -40,7 +43,17 @@ Built with LangGraph, Google Gemini (free tier), Chroma, and Tavily — no paid 
   breakdown — the same facts the graph already computes, surfaced instead of hidden.
 - **RAGAS evaluation harness** — a golden-question dataset scored with context precision/recall
   (and optionally LLM-judged faithfulness/relevancy), run explicitly via `rag-assistant eval`
-  rather than left unmeasured.
+  rather than left unmeasured. The dataset spans every route (`vector`, `web`, `both`, `none`),
+  including a case designed to exercise the corrective-fallback loop.
+- **Provider fallback** — Anthropic Claude is the primary chat/reasoning model when
+  `ANTHROPIC_API_KEY` is set, with `.with_fallbacks()` to Gemini on error; embeddings always go
+  through Gemini. Falls back to Gemini-only if no Anthropic key is configured.
+- **Incremental indexing** — `rag-assistant ingest` hashes file contents against a manifest and
+  only re-embeds changed or new files, removing chunks for deleted files, instead of rebuilding
+  the whole collection every run (`--full` forces a clean rebuild).
+- **Live graph execution visualization** — the web UI renders the LangGraph pipeline as a stepper
+  that highlights each node as it runs, sourced from the same per-node SSE progress events the
+  streaming endpoint already emits.
 
 ## Architecture
 
@@ -107,14 +120,18 @@ uv sync
 cp .env.example .env
 # fill in GOOGLE_API_KEY (https://aistudio.google.com/apikey) and
 # TAVILY_API_KEY (https://app.tavily.com) in .env
+# optionally also fill in ANTHROPIC_API_KEY (https://console.anthropic.com/settings/keys) to
+# use Claude as the primary chat model, with Gemini as automatic fallback
 
-uv run rag-assistant hello    # confirms Gemini connectivity
-uv run rag-assistant ingest   # embeds the sample corpus (data/corpus/) into Chroma
+uv run rag-assistant hello    # confirms chat model connectivity (Anthropic if set, else Gemini)
+uv run rag-assistant ingest   # embeds the sample corpus (data/corpus/) into Chroma, incrementally
 ```
 
-> **Free-tier quota note:** Gemini's free tier caps at ~20 requests/day, and one research
-> question costs ~4 calls (route, decompose, grade, synthesize) plus embedding calls. Budget
-> accordingly when running `ask`, `serve`, or `eval` repeatedly in a single day.
+> **Free-tier quota note:** if `ANTHROPIC_API_KEY` is unset, chat calls fall back to Gemini,
+> whose free tier caps at ~20 requests/day; one research question costs ~4 calls (route,
+> decompose, grade, synthesize) plus embedding calls (embeddings always go through Gemini
+> regardless of the chat provider). Budget accordingly when running `ask`, `serve`, or `eval`
+> repeatedly in a single day.
 
 ## Usage
 
@@ -124,6 +141,14 @@ uv run rag-assistant ingest   # embeds the sample corpus (data/corpus/) into Chr
 uv run rag-assistant ask "Who founded Anthropic and what is their safety research called?"
 uv run rag-assistant ask "What is the most recent Claude model release?"
 uv run rag-assistant ask "Compare Anthropic and Mistral AI's founding stories and safety focus."
+```
+
+`ingest` is incremental by default: it hashes each file in `data/corpus/` against a manifest and
+only re-embeds new or changed files, removing chunks for any file that's been deleted since the
+last run. Pass `--full` to reset the collection and re-embed everything from scratch:
+
+```bash
+uv run rag-assistant ingest --full
 ```
 
 Debug commands for individual pieces of the pipeline:
@@ -159,9 +184,11 @@ Interactive API docs at `http://127.0.0.1:8000/docs`.
 
 ### Web UI
 
-A React + Vite single-page app in `frontend/` streams `/research/stream` live, showing per-node
-progress messages as the graph runs, then the rendered markdown report and the Research Summary
-panel.
+A React + Vite single-page app in `frontend/` streams `/research/stream` live. A graph
+visualization stepper highlights each LangGraph node as it runs (grouping the fanned-out
+`retrieve_vector` / `retrieve_bm25` / `web_search` nodes into one "Retrieve" stage with
+per-source counts, and marking `corrective_web_search` as skipped when the confidence gate
+doesn't trigger it), then renders the markdown report and the Research Summary panel.
 
 ```bash
 uv run rag-assistant serve       # terminal 1 -- backend on http://127.0.0.1:8000
@@ -244,15 +271,6 @@ needing a concrete driving requirement before they're worth the added complexity
   before this could be exposed as a multi-user service.
 - **Multi-tenancy** — one shared corpus/index for everyone; would need per-tenant indexes or
   namespacing to isolate data between users.
-- **Incremental indexing** — `ingest` rebuilds from the full corpus each time; an incremental
-  path (detect changed/added files, upsert only those) matters once the corpus is large or
-  updated frequently.
-- **Provider abstraction** — Gemini and Tavily are called directly rather than through a
-  swappable provider interface; only worth adding if actually supporting multiple LLM/search
-  providers becomes a real goal, not preemptively.
-- **Graph execution visualization** — a live view of the LangGraph node-by-node execution (e.g.
-  highlighting each node as it completes), reusing the same per-node SSE events the streaming
-  endpoint already emits.
 
 ## Testing
 
@@ -260,6 +278,11 @@ needing a concrete driving requirement before they're worth the added complexity
 uv run pytest          # offline unit + node + e2e tests (no external API calls)
 uv run pytest -m live  # also exercises real Gemini/Tavily calls; requires .env and a run of `ingest` first
 uv run ruff check .
+```
+
+```bash
+cd frontend
+npm test               # Vitest + React Testing Library — hooks and components
 ```
 
 ## Project layout
@@ -283,9 +306,11 @@ src/rag_assistant/
 frontend/src/
 ├── api/client.ts                         # fetch + SSE client for the backend API
 ├── hooks/useHealthStatus.ts              # polls GET /health on mount
+├── hooks/useResearchStream.ts            # SSE streaming + progress/result state, testable in isolation
 ├── constants/exampleQuestions.ts         # example-question chip data
 ├── components/                           # Header, AskCard, ResultCard, ResearchSummaryPanel,
-│                                          # ProgressIndicator, ErrorBanner, ErrorBoundary
+│                                          # GraphVisualization, ErrorBanner, ErrorBoundary
+├── test/setup.ts                         # jest-dom matchers + RTL cleanup for Vitest
 ├── App.tsx                               # composition root
 └── index.css                             # shared theme (light/dark)
 ```

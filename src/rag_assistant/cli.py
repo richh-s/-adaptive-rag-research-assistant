@@ -8,7 +8,7 @@ from rich.table import Table
 
 from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.ingestion.build_index import build_index
-from rag_assistant.llm import get_chat_model
+from rag_assistant.llm import get_chat_model, primary_chat_provider_name
 from rag_assistant.logging_conf import configure_logging
 from rag_assistant.retrieval.vector_store import get_retriever
 from rag_assistant.retrieval.web_search import WebSearchTool
@@ -30,26 +30,37 @@ def callback() -> None:
 
 @app.command()
 def hello() -> None:
-    """Prove end-to-end connectivity to Gemini."""
+    """Prove end-to-end connectivity to the configured chat model (Anthropic if set, else Gemini)."""
     configure_logging()
+    provider = primary_chat_provider_name()
     try:
         response = get_chat_model().invoke("Reply with a short one-sentence greeting.")
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
-    console.print(f"[green]Gemini says:[/green] {response.content}")
+    console.print(f"[green]{provider} says:[/green] {response.content}")
 
 
 @app.command()
-def ingest() -> None:
-    """Load, chunk, embed, and index the sample corpus into Chroma."""
+def ingest(
+    full: bool = typer.Option(
+        False, "--full", help="Reset the collection and re-embed every file from scratch."
+    ),
+) -> None:
+    """Load, chunk, embed, and index the corpus into Chroma. Incremental by default: only
+    new or changed files are (re)embedded, and files removed from the corpus have their
+    chunks removed too. Pass --full to force a clean rebuild."""
     configure_logging()
     try:
-        num_chunks = build_index()
+        result = build_index(incremental=not full)
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
-    console.print(f"[green]Indexed[/green] {num_chunks} chunks into Chroma.")
+    console.print(
+        f"[green]Indexed[/green] {result.indexed_chunks} chunks across "
+        f"{result.changed_files} changed file(s); {result.skipped_files} unchanged file(s) "
+        f"skipped; {result.removed_files} removed file(s) cleaned up."
+    )
 
 
 @app.command()
@@ -119,16 +130,24 @@ def eval_(
     output: Path | None = None,
 ) -> None:
     """Run the RAGAS eval harness against the golden dataset. `limit` defaults to 3 (not the
-    full dataset) because graph execution alone costs ~4 Gemini calls/question -- the primary
-    quota lever, independent of --llm-judge which only adds further scoring calls."""
+    full dataset) because graph execution alone costs ~4 chat-model calls/question -- the
+    primary quota lever when running on the Gemini free tier, independent of --llm-judge
+    which only adds further scoring calls."""
     configure_logging()
 
+    provider = primary_chat_provider_name()
     graph_calls = limit * _GRAPH_CALLS_PER_QUESTION
     judge_calls = limit * _LLM_JUDGE_CALLS_PER_QUESTION if llm_judge else 0
+    total = graph_calls + judge_calls
+    quota_note = (
+        " against the 20/day free-tier quota" if provider == "Gemini" else " (Gemini free-tier"
+        " quota no longer applies since Anthropic is primary; embeddings still call Gemini"
+        " separately)"
+    )
     console.print(
-        f"[yellow]Estimated Gemini calls: ~{graph_calls} for graph execution"
+        f"[yellow]Estimated {provider} calls: ~{graph_calls} for graph execution"
         + (f" + ~{judge_calls} for LLM-judge scoring" if llm_judge else "")
-        + f" = ~{graph_calls + judge_calls} total against the 20/day free-tier quota.[/yellow]"
+        + f" = ~{total} total{quota_note}.[/yellow]"
     )
 
     from rag_assistant.eval.run_eval import run_eval
