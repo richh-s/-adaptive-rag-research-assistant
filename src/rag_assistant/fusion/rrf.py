@@ -12,7 +12,7 @@ def reciprocal_rank_fusion(
 ) -> list[FusedDocument]:
     """Merges multiple independently-ranked retrieval lists (one per sub-query/source pair)
     into a single ranking. Each list votes for its documents by rank rather than by raw
-    similarity score -- vector cosine distance and Tavily relevance scores aren't comparable
+    similarity score -- vector cosine distance and web-search relevance scores aren't comparable
     on the same scale, but rank position always is. `score = sum(1 / (k + rank))` across
     every list a document appears in, so a document ranked highly across several lists
     outranks one that's #1 in only a single list."""

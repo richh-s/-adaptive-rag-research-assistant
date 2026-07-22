@@ -30,7 +30,7 @@ def test_cache_key_is_stable_and_namespaced():
 
 
 def test_cache_key_differs_by_namespace_and_parts():
-    assert cache.cache_key("router", "a") != cache.cache_key("tavily", "a")
+    assert cache.cache_key("router", "a") != cache.cache_key("web_search", "a")
     assert cache.cache_key("router", "a") != cache.cache_key("router", "b")
 
 

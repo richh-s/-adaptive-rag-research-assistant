@@ -32,7 +32,12 @@ function App() {
         {loading && <GraphVisualization visits={visits} loading={loading} />}
         {error && <ErrorBanner message={error} />}
         {result && <ResultCard result={result} />}
-        {result?.summary && <ResearchSummaryPanel summary={result.summary} />}
+        {result?.summary && (
+          <details className="tech-details">
+            <summary>Show technical details</summary>
+            <ResearchSummaryPanel summary={result.summary} />
+          </details>
+        )}
       </div>
     </div>
   )

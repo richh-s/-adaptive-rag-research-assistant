@@ -15,7 +15,6 @@ def _default_test_env(request, monkeypatch):
     if request.node.get_closest_marker("live"):
         return
     monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
-    monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
     # Tests run fully offline by default -- no local Redis is assumed to be running, and
     # caching behavior itself is tested separately with an explicit fake client.
     monkeypatch.setenv("USE_CACHE", "false")

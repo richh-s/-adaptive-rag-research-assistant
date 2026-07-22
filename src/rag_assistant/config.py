@@ -18,7 +18,6 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     google_api_key: str = Field(..., description="Google AI Studio API key (free tier)")
-    tavily_api_key: str = Field(..., description="Tavily API key (free tier)")
     # Required (must be present, even set to "") rather than defaulted to None, so a fresh
     # clone that never touches .env.example fails fast with a clear message instead of
     # silently starting half-configured. Left blank, behavior is unchanged: get_chat_model()
@@ -40,7 +39,7 @@ class Settings(BaseSettings):
     use_cache: bool = True
     redis_url: str = "redis://localhost:6379/0"
     cache_ttl_router: int = 300
-    cache_ttl_tavily: int = 600
+    cache_ttl_web_search: int = 600
     cache_ttl_synthesis: int = 1800
 
     # rate limiting -- see api.py's limiter setup.
@@ -48,7 +47,7 @@ class Settings(BaseSettings):
     rate_limit_rpm_global: int = 30
 
     # request timeouts
-    tavily_timeout_seconds: float = 10.0
+    web_search_timeout_seconds: float = 10.0
     graph_timeout_seconds: float = 45.0
 
 
@@ -59,6 +58,6 @@ def get_settings() -> Settings:
     except Exception as exc:
         raise RuntimeError(
             "Missing or invalid configuration. Copy .env.example to .env and fill in "
-            "GOOGLE_API_KEY, TAVILY_API_KEY, and ANTHROPIC_API_KEY (may be left blank).\n"
+            "GOOGLE_API_KEY and ANTHROPIC_API_KEY (may be left blank).\n"
             f"Original error: {exc}"
         ) from exc

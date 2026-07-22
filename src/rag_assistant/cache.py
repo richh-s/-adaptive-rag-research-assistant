@@ -1,4 +1,4 @@
-"""Redis-backed cache for router decisions, Tavily results, and synthesized answers. Every
+"""Redis-backed cache for router decisions, web search results, and synthesized answers. Every
 key is namespaced under a `v1:` prefix so an incompatible value-shape change can be rolled out
 by bumping the prefix instead of migrating or invalidating existing entries. Values are JSON.
 

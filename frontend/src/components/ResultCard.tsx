@@ -9,12 +9,6 @@ interface ResultCardProps {
 export function ResultCard({ result }: ResultCardProps) {
   return (
     <div className="result">
-      <div className="meta">
-        {result.route && <span className="badge">route: {result.route}</span>}
-        {result.confidence_score !== null && (
-          <span className="badge">confidence: {result.confidence_score.toFixed(2)}</span>
-        )}
-      </div>
       <ReactMarkdown>{result.report}</ReactMarkdown>
     </div>
   )

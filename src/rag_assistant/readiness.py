@@ -1,5 +1,5 @@
 """Liveness checks for the two external dependencies the graph can't function without.
-Kept lightweight and side-effect-free: no embedding calls, no Tavily search credits spent —
+Kept lightweight and side-effect-free: no embedding calls, no web-search requests spent —
 these run on every `/ready` poll from a load balancer/orchestrator, so cost has to stay ~0."""
 
 import httpx
@@ -15,11 +15,12 @@ def check_chroma() -> tuple[bool, str | None]:
     return True, None
 
 
-def check_tavily() -> tuple[bool, str | None]:
+def check_web_search() -> tuple[bool, str | None]:
     try:
-        response = httpx.head("https://api.tavily.com", timeout=3.0)
-        # Tavily's base domain doesn't necessarily return 2xx for a bare HEAD -- reachability
-        # (a response at all, not a connection error/timeout) is the actual signal here.
+        response = httpx.head("https://duckduckgo.com", timeout=3.0)
+        # DuckDuckGo's base domain doesn't necessarily return 2xx for a bare HEAD --
+        # reachability (a response at all, not a connection error/timeout) is the actual
+        # signal here.
         del response
     except httpx.HTTPError as exc:
         return False, str(exc)

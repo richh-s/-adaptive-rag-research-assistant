@@ -83,7 +83,7 @@ def retrieve(question: str, k: int = 4) -> None:
 
 @app.command()
 def search(query: str, max_results: int = 5) -> None:
-    """Debug command: run a raw Tavily web search for a query."""
+    """Debug command: run a raw DuckDuckGo web search for a query."""
     configure_logging()
     try:
         results = WebSearchTool().search(query, max_results=max_results)

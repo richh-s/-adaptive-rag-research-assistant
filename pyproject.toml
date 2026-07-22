@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "chromadb>=1.5.9",
+    "ddgs>=9.14.4",
     "fastapi>=0.138.2",
     "httpx>=0.28.1",
     "langchain-anthropic>=1.4.8",
@@ -28,7 +29,6 @@ dependencies = [
     "redis>=8.0.1",
     "rich>=15.0.0",
     "slowapi>=0.1.10",
-    "tavily-python>=0.7.26",
     "typer>=0.26.8",
     "uvicorn[standard]>=0.49.0",
 ]
@@ -51,5 +51,5 @@ dev = [
 line-length = 100
 
 [tool.pytest.ini_options]
-markers = ["live: hits real external APIs (Gemini/Tavily), excluded by default"]
+markers = ["live: hits real external APIs (Gemini/DuckDuckGo), excluded by default"]
 addopts = "-m 'not live'"

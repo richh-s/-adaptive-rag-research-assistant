@@ -68,7 +68,7 @@ def test_research_passes_trace_id_into_graph_state(monkeypatch):
 
 def test_ready_returns_200_when_both_deps_up(monkeypatch):
     monkeypatch.setattr(api, "check_chroma", lambda: (True, None))
-    monkeypatch.setattr(api, "check_tavily", lambda: (True, None))
+    monkeypatch.setattr(api, "check_web_search", lambda: (True, None))
     client = TestClient(api.app)
 
     response = client.get("/ready")
@@ -77,12 +77,12 @@ def test_ready_returns_200_when_both_deps_up(monkeypatch):
     body = response.json()
     assert body["status"] == "ok"
     assert body["chroma"] == {"ok": True, "error": None}
-    assert body["tavily"] == {"ok": True, "error": None}
+    assert body["web_search"] == {"ok": True, "error": None}
 
 
 def test_ready_returns_503_when_a_dep_is_down(monkeypatch):
     monkeypatch.setattr(api, "check_chroma", lambda: (False, "connection refused"))
-    monkeypatch.setattr(api, "check_tavily", lambda: (True, None))
+    monkeypatch.setattr(api, "check_web_search", lambda: (True, None))
     client = TestClient(api.app)
 
     response = client.get("/ready")

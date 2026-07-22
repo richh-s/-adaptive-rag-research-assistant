@@ -7,7 +7,7 @@ retrieval path, checks its own confidence, and falls back to web search when the
 knowledge base comes up short — then synthesizes a cited, transparency-reported answer,
 streamed live to the browser as each step of the pipeline runs.
 
-Built with LangGraph, Chroma, and Tavily. Chat/reasoning defaults to Anthropic's Claude when an
+Built with LangGraph, Chroma, and DuckDuckGo web search. Chat/reasoning defaults to Anthropic's Claude when an
 `ANTHROPIC_API_KEY` is set, with automatic fallback to Google Gemini (free tier) on error;
 Gemini always handles embeddings. No paid services are required — leave `ANTHROPIC_API_KEY`
 blank to run entirely on Gemini's free tier.
@@ -122,8 +122,9 @@ something more than "a single LLM call with extra steps."
 ```bash
 uv sync
 cp .env.example .env
-# fill in GOOGLE_API_KEY (https://aistudio.google.com/apikey) and
-# TAVILY_API_KEY (https://app.tavily.com) in .env
+# fill in GOOGLE_API_KEY (https://aistudio.google.com/apikey) in .env
+# web search (DuckDuckGo via `ddgs`) needs no key, signup, or billing account -- nothing to
+# configure there
 # optionally also fill in ANTHROPIC_API_KEY (https://console.anthropic.com/settings/keys) to
 # use Claude as the primary chat model, with Gemini as automatic fallback
 
@@ -165,7 +166,7 @@ Debug commands for individual pieces of the pipeline:
 
 ```bash
 uv run rag-assistant retrieve "anthropic founders" --k 4   # raw vector-store retrieval
-uv run rag-assistant search "claude model releases 2026"   # raw Tavily web search
+uv run rag-assistant search "claude model releases 2026"   # raw DuckDuckGo web search
 ```
 
 ### API
@@ -250,7 +251,7 @@ quota cost — and is a well-established way to combine heterogeneous retrieval 
 BM25, web) without having to calibrate their scores onto a common scale.
 
 **Why Corrective-RAG (confidence-gated web fallback) instead of always searching the web?**
-Always searching the web on every question would spend Tavily quota and latency even when the
+Always searching the web on every question would add latency even when the
 local corpus already answers confidently. Gating the fallback on a relevance-graded confidence
 score means the web search only fires when the vector-only route is actually falling short —
 demonstrating self-assessment rather than blind escalation.
@@ -276,13 +277,13 @@ local demo script:
 | Area | What's there |
 | --- | --- |
 | Containerization | Multi-stage `Dockerfile` (non-root user), `docker-compose.yml` wiring `api` + `redis` with a named volume for the Chroma persist directory (`chromadb.HttpClient` server mode is a documented TODO if this ever needs multiple `api` replicas — embedded Chroma's SQLite backing locks the file to one process) |
-| Health & readiness | `GET /health` is a pure liveness check; `GET /ready` actually pings Chroma (`_collection.count()`) and Tavily (`HEAD` request) and returns 503 if either dependency is down, so an orchestrator can distinguish "process is up" from "can actually serve a request" |
+| Health & readiness | `GET /health` is a pure liveness check; `GET /ready` actually pings Chroma (`_collection.count()`) and DuckDuckGo (`HEAD` request) and returns 503 if either dependency is down, so an orchestrator can distinguish "process is up" from "can actually serve a request" |
 | Input validation | `question` is required, capped at 2000 chars, HTML-tag-stripped, and rejected as gibberish if under 10% alphanumeric — all in a pydantic `field_validator`, so bad input 422s before it ever reaches the graph |
 | Rate limiting | `slowapi`-based, both per-IP (`RATE_LIMIT_RPM`, default 10/min) and a global cap (`RATE_LIMIT_RPM_GLOBAL`, default 30/min) across `/research` and `/research/stream` |
-| Timeouts | Tavily's HTTP client is capped at `TAVILY_TIMEOUT_SECONDS` (default 10s); the whole graph execution behind `/research/stream` is bounded by `GRAPH_TIMEOUT_SECONDS` (default 45s) via a monotonic-clock deadline around `astream()`, emitting an `"error"` SSE frame and closing the connection instead of hanging indefinitely |
+| Timeouts | The web search client is capped at `WEB_SEARCH_TIMEOUT_SECONDS` (default 10s); the whole graph execution behind `/research/stream` is bounded by `GRAPH_TIMEOUT_SECONDS` (default 45s) via a monotonic-clock deadline around `astream()`, emitting an `"error"` SSE frame and closing the connection instead of hanging indefinitely |
 | Graceful shutdown | SIGTERM is caught via `loop.add_signal_handler` inside the FastAPI lifespan; active SSE connections (tracked in a `weakref.WeakSet`) are sent a `"close"` frame before the process exits, instead of being cut off mid-stream |
 | Structured logging | JSON logs (`python-json-logger`) with a UUID4 `trace_id` generated per request by an ASGI middleware, propagated through `contextvars` *and* threaded explicitly into the LangGraph state (belt-and-suspenders, since LangGraph's internal scheduling isn't guaranteed to preserve context automatically) — every log line, including each node's completion log, carries `trace_id`/`node`/`route`/`latency_ms`, and the response carries the same trace ID in an `X-Trace-Id` header |
-| Caching | Redis-backed, best-effort (`USE_CACHE=false` or any Redis error both degrade silently to "no cache" — a cache outage is never worse than having no cache): router decisions keyed by question (`CACHE_TTL_ROUTER`, 5min), Tavily results keyed by query (`CACHE_TTL_TAVILY`, 10min), synthesized answers keyed by question + route + fused source IDs (`CACHE_TTL_SYNTHESIS`, 30min) — all under a `v1:` key prefix so a payload-shape change can be rolled out by bumping the prefix rather than migrating existing entries |
+| Caching | Redis-backed, best-effort (`USE_CACHE=false` or any Redis error both degrade silently to "no cache" — a cache outage is never worse than having no cache): router decisions keyed by question (`CACHE_TTL_ROUTER`, 5min), web search results keyed by query (`CACHE_TTL_WEB_SEARCH`, 10min), synthesized answers keyed by question + route + fused source IDs (`CACHE_TTL_SYNTHESIS`, 30min) — all under a `v1:` key prefix so a payload-shape change can be rolled out by bumping the prefix rather than migrating existing entries |
 | Configuration | All of the above is `pydantic-settings`-driven (`config.py`), reading exclusively from environment variables with fail-fast validation at startup instead of scattered `os.environ.get()` calls with silent defaults |
 
 ## Self-audit: findings & fixes
@@ -294,13 +295,13 @@ happy-path correctness. Fixed:
 | Area | Finding | Fix |
 | --- | --- | --- |
 | Vector store | Chroma had no explicit distance metric, silently defaulting to L2 while Gemini embeddings are meant to be compared via cosine similarity | Set `hnsw:space: cosine` explicitly and rebuilt the index (`ingest --full`) |
-| Web search resilience | A Tavily outage/rate-limit raised unhandled and crashed the graph node | `WebSearchTool.search` now catches the failure and degrades to `[]` |
+| Web search resilience | A web-search outage/rate-limit raised unhandled and crashed the graph node | `WebSearchTool.search` now catches the failure and degrades to `[]` |
 | Answer synthesis | An empty `fused_documents` was treated as one case ("no retrieval needed"), but it also happens when retrieval is attempted and comes back empty — same prompt, very different risk of confident hallucination | Split into `NO_CONTEXT_PROMPT` (route == `none`) vs. `EMPTY_RETRIEVAL_PROMPT` (retrieval ran, found nothing), which forces the model to state upfront that no sources were found |
 | Non-streaming API | `/research` only caught `RuntimeError`; any other exception fell through to a bare, contentless 500 | Broadened to `except Exception`, still raised as a proper `HTTPException` with `detail` |
 | Documentation | README implied RAGAS's semantic, LLM-judged `context_precision`/`context_recall`, when the harness actually runs the non-LLM overlap variants | Relabeled accurately, and noted the eval set is small and non-adversarial with no baseline comparison |
 
 Verified with the full offline suite (68/68) plus a live end-to-end run: a real router call
-picked the `web` route for a live-price question, a simulated Tavily outage was forced, and the
+picked the `web` route for a live-price question, a simulated web-search outage was forced, and the
 resulting Research Summary (`retrieval_counts: 0`, `confidence_score: 0.0`, `citations: []`) and
 synthesized answer ("No relevant sources were found...") both came out correct — confirming the
 state plumbing, not just the code path in isolation.
@@ -328,7 +329,7 @@ needing a concrete driving requirement before they're worth the added complexity
 
 ```bash
 uv run pytest          # offline unit + node + e2e tests (no external API calls)
-uv run pytest -m live  # also exercises real Gemini/Tavily calls; requires .env and a run of `ingest` first
+uv run pytest -m live  # also exercises real Gemini/DuckDuckGo calls; requires .env and a run of `ingest` first
 uv run ruff check .
 ```
 
@@ -342,9 +343,9 @@ npm test               # Vitest + React Testing Library — hooks and components
 ```
 src/rag_assistant/
 ├── config.py, llm.py, logging_conf.py   # settings, model factories, structured JSON logging
-├── tracing.py, cache.py, readiness.py    # trace-ID contextvar, Redis cache, Chroma/Tavily health checks
+├── tracing.py, cache.py, readiness.py    # trace-ID contextvar, Redis cache, Chroma/web search health checks
 ├── ingestion/                            # load -> split -> embed -> index the sample corpus
-├── retrieval/                            # Chroma vector store, BM25 keyword store, Tavily web search
+├── retrieval/                            # Chroma vector store, BM25 keyword store, DuckDuckGo web search
 ├── fusion/rrf.py                         # Reciprocal Rank Fusion (pure function)
 ├── grading/relevance_grader.py           # batched LLM relevance grading
 ├── graph/                                # ResearchState, one node module per concept, build_graph(),

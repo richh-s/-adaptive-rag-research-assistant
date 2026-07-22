@@ -1,32 +1,37 @@
+import re
+
 from rag_assistant.graph.state import ResearchState
+
+_MARKER_RE = re.compile(r"\[\d+\]")
 
 
 def format_report(state: ResearchState) -> dict:
-    """Assembles the final markdown report: the answer, its sources, and a "how this was
-    researched" transparency section covering the routing decision, any decomposition, and
-    the confidence/correction outcome. A pure function so both the CLI and the FastAPI
-    endpoint (Phase 8) can render the exact same report without duplicating this logic."""
+    """Assembles the final markdown report: the answer plus a source list. Routing/retrieval/
+    confidence detail lives only in the structured research summary (see build_research_summary
+    in api.py) -- keeping it out of this prose avoids showing non-technical readers internal
+    jargon ("route: both", "confidence: 0.05") next to their answer.
+
+    The source list is filtered to citation markers the model actually used in `final_answer`
+    (fused documents the model never referenced would otherwise show up as unexplained
+    "sources") and deduped by source_id, since several fused chunks often come from the same
+    file -- listing that file three times reads as a bug to a non-technical reader."""
     lines = [state["final_answer"], ""]
 
     citations = state.get("citations", [])
-    if citations:
+    used_markers = set(_MARKER_RE.findall(state["final_answer"]))
+    cited = [c for c in citations if c.marker in used_markers]
+
+    if cited:
+        markers_by_source: dict[str, list[str]] = {}
+        order: list[str] = []
+        for c in cited:
+            if c.source_id not in markers_by_source:
+                markers_by_source[c.source_id] = []
+                order.append(c.source_id)
+            markers_by_source[c.source_id].append(c.marker)
+
         lines.append("**Sources:**")
-        lines.extend(f"- {c.marker} {c.source_id}" for c in citations)
+        lines.extend(f"- {''.join(markers_by_source[source_id])} {source_id}" for source_id in order)
         lines.append("")
-
-    lines.append("**How this was researched:**")
-    route = state.get("route") or "none"
-    lines.append(f"- Route: `{route}` -- {state.get('route_reasoning') or 'no retrieval needed'}")
-
-    sub_queries = state.get("sub_queries", [])
-    if len(sub_queries) > 1:
-        lines.append(f"- Decomposed into {len(sub_queries)} sub-queries:")
-        lines.extend(f"  - {sub_query}" for sub_query in sub_queries)
-
-    if "confidence_score" in state:
-        lines.append(f"- Retrieval confidence: {state['confidence_score']:.2f}")
-
-    if state.get("correction_attempted"):
-        lines.append("- Low confidence triggered a corrective web search fallback.")
 
     return {"research_report": "\n".join(lines)}

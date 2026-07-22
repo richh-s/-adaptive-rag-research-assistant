@@ -8,23 +8,6 @@
   box-shadow: var(--shadow-md);
 }
 
-.meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 18px;
-}
-
-.badge {
-  font-size: 12.5px;
-  font-weight: 600;
-  padding: 5px 12px;
-  border-radius: 999px;
-  background: var(--accent-bg);
-  color: var(--accent-strong);
-  border: 1px solid var(--accent-border);
-}
-
 .result :is(h1, h2, h3) {
   font-size: 17px;
   line-height: 1.3;

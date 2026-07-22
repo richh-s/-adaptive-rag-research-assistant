@@ -35,25 +35,25 @@ def test_check_chroma_failure_returns_error(monkeypatch):
     assert "no such collection" in err
 
 
-def test_check_tavily_ok(monkeypatch):
+def test_check_web_search_ok(monkeypatch):
     class _FakeResponse:
         status_code = 200
 
     monkeypatch.setattr(readiness.httpx, "head", lambda url, timeout=None: _FakeResponse())
 
-    ok, err = readiness.check_tavily()
+    ok, err = readiness.check_web_search()
 
     assert ok is True
     assert err is None
 
 
-def test_check_tavily_unreachable_returns_error(monkeypatch):
+def test_check_web_search_unreachable_returns_error(monkeypatch):
     def _raise(url, timeout=None):
         raise readiness.httpx.ConnectError("connection refused")
 
     monkeypatch.setattr(readiness.httpx, "head", _raise)
 
-    ok, err = readiness.check_tavily()
+    ok, err = readiness.check_web_search()
 
     assert ok is False
     assert "connection refused" in err

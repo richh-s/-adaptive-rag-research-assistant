@@ -18,7 +18,7 @@ from rag_assistant.config import get_settings
 from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.graph.research_summary import build_research_summary
 from rag_assistant.logging_conf import configure_logging
-from rag_assistant.readiness import check_chroma, check_tavily
+from rag_assistant.readiness import check_chroma, check_web_search
 from rag_assistant.schemas.api import ResearchRequest, ResearchResponse, StreamEvent
 from rag_assistant.tracing import get_trace_id, new_trace_id, trace_id_var
 
@@ -89,7 +89,12 @@ def _global_limit() -> str:
 # this API directly from the browser during development.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5175",
+        "http://127.0.0.1:5175",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -170,13 +175,13 @@ def health() -> dict:
 @app.get("/ready")
 def ready() -> JSONResponse:
     chroma_ok, chroma_err = check_chroma()
-    tavily_ok, tavily_err = check_tavily()
+    web_search_ok, web_search_err = check_web_search()
     body = {
-        "status": "ok" if chroma_ok and tavily_ok else "unavailable",
+        "status": "ok" if chroma_ok and web_search_ok else "unavailable",
         "chroma": {"ok": chroma_ok, "error": chroma_err},
-        "tavily": {"ok": tavily_ok, "error": tavily_err},
+        "web_search": {"ok": web_search_ok, "error": web_search_err},
     }
-    return JSONResponse(content=body, status_code=200 if chroma_ok and tavily_ok else 503)
+    return JSONResponse(content=body, status_code=200 if chroma_ok and web_search_ok else 503)
 
 
 @app.post("/research", response_model=ResearchResponse)

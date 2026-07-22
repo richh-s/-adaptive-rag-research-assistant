@@ -22,3 +22,38 @@
     gap: 20px;
   }
 }
+
+.tech-details {
+  width: 100%;
+  max-width: 640px;
+}
+
+.tech-details > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  padding: 4px 0;
+  user-select: none;
+}
+
+.tech-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tech-details > summary::before {
+  content: '▸';
+  display: inline-block;
+  margin-right: 6px;
+  font-size: 11px;
+  transition: transform 0.15s ease;
+}
+
+.tech-details[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.tech-details[open] > summary {
+  margin-bottom: 12px;
+}
