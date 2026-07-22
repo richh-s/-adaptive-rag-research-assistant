@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     # request timeouts
     web_search_timeout_seconds: float = 10.0
     graph_timeout_seconds: float = 45.0
+    # Per-attempt LLM call timeout, with retries capped low. Neither langchain-anthropic nor
+    # langchain-google-genai sets a request timeout by default, and Gemini defaults to 6
+    # retries -- a slow/rate-limited provider can silently retry with backoff for tens of
+    # seconds, which is most of graph_timeout_seconds for a single node. Bounding both keeps
+    # a stuck provider from starving the rest of the graph's budget.
+    llm_request_timeout_seconds: float = 12.0
+    llm_max_retries: int = 1
 
 
 @lru_cache

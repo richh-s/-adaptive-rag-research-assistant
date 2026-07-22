@@ -13,7 +13,14 @@ def grade_and_score(state: ResearchState) -> dict:
     docs = state.get("fused_documents", [])[:TOP_N_TO_GRADE]
     grades = grade_documents(state["question"], docs)
 
-    confidence = sum(g.score for g in grades) / len(grades) if grades else 0.0
+    # Average only over docs graded relevant, not every graded doc. The corpus has several
+    # similarly-structured company profiles, so fusion often pulls in a couple of off-topic
+    # chunks (e.g. another company's "safety focus" section) alongside the right ones --
+    # averaging those low scores in with a genuinely strong match drags confidence below
+    # threshold and falsely triggers corrective_web_search even when the local docs already
+    # answer the question. What matters is the quality of what's actually relevant.
+    relevant_scores = [g.score for g in grades if g.relevant]
+    confidence = sum(relevant_scores) / len(relevant_scores) if relevant_scores else 0.0
     needs_correction = (
         confidence < get_settings().confidence_threshold
         and state["route"] == "vector"

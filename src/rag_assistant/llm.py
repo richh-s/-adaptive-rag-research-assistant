@@ -12,6 +12,8 @@ def _gemini_chat_model(temperature: float) -> ChatGoogleGenerativeAI:
         model=settings.gemini_chat_model,
         temperature=temperature,
         google_api_key=settings.google_api_key,
+        timeout=settings.llm_request_timeout_seconds,
+        max_retries=settings.llm_max_retries,
     )
 
 
@@ -21,6 +23,8 @@ def _anthropic_chat_model() -> ChatAnthropic:
     return ChatAnthropic(
         model=settings.anthropic_chat_model,
         api_key=settings.anthropic_api_key,
+        default_request_timeout=settings.llm_request_timeout_seconds,
+        max_retries=settings.llm_max_retries,
     )
 
 

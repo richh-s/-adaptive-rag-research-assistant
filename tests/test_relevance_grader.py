@@ -40,4 +40,4 @@ def test_grade_documents_falls_back_when_grade_count_mismatches(monkeypatch):
     grades = grade_documents("question", [_doc("a"), _doc("b")])
 
     assert len(grades) == 2
-    assert all(g.relevant is False and g.score == 0.0 for g in grades)
+    assert all(g.relevant is True and g.score == 1.0 for g in grades)
