@@ -1,59 +1,121 @@
-header {
-  text-align: center;
+.site-header {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.6);
+  backdrop-filter: blur(6px);
+}
+
+.nav-bar {
+  width: 100%;
+  max-width: 700px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+}
+
+.nav-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.nav-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  color: #fff;
+  background: linear-gradient(155deg, var(--accent), var(--accent-strong));
+}
+
+.nav-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-h);
+  letter-spacing: -0.01em;
+}
+
+.hero {
   max-width: 620px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
+  gap: 14px;
+  text-align: center;
+  padding: 48px 24px 40px;
 }
 
-header h1 {
-  line-height: 1.15;
+.eyebrow {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--accent-strong);
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  padding: 5px 12px;
+  border-radius: 999px;
+  letter-spacing: 0.01em;
+}
+
+.hero h1 {
+  line-height: 1.1;
 }
 
 .subtitle {
   color: var(--text);
   font-size: 16px;
-  line-height: 150%;
+  line-height: 1.55;
+  max-width: 480px;
 }
 
 .status {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  margin-top: 8px;
-  padding: 5px 14px;
+  padding: 5px 12px;
   border-radius: 999px;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 500;
   border: 1px solid var(--border);
   color: var(--text);
+  background: var(--surface);
 }
 
 .status::before {
   content: '';
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   background: var(--text);
 }
 
 .status.up {
-  color: #16a34a;
-  border-color: rgba(22, 163, 74, 0.35);
-  background: rgba(22, 163, 74, 0.08);
+  color: var(--success);
+  border-color: rgba(47, 125, 79, 0.3);
+  background: rgba(47, 125, 79, 0.08);
 }
 
 .status.up::before {
-  background: #16a34a;
+  background: var(--success);
 }
 
 .status.down {
-  color: #dc2626;
-  border-color: rgba(220, 38, 38, 0.35);
-  background: rgba(220, 38, 38, 0.08);
+  color: var(--danger);
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
 }
 
 .status.down::before {
-  background: #dc2626;
+  background: var(--danger);
+}
+
+@media (max-width: 640px) {
+  .hero {
+    padding: 32px 20px 28px;
+  }
 }

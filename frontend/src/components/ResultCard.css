@@ -2,32 +2,33 @@
   width: 100%;
   max-width: 640px;
   border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 28px 32px;
-  box-shadow: var(--shadow);
+  border-radius: 20px;
+  background: var(--surface);
+  padding: 28px 30px;
+  box-shadow: var(--shadow-md);
 }
 
 .meta {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  margin-bottom: 16px;
+  margin-bottom: 18px;
 }
 
 .badge {
-  font-size: 13px;
-  font-weight: 500;
+  font-size: 12.5px;
+  font-weight: 600;
   padding: 5px 12px;
   border-radius: 999px;
   background: var(--accent-bg);
-  color: var(--accent);
+  color: var(--accent-strong);
   border: 1px solid var(--accent-border);
 }
 
 .result :is(h1, h2, h3) {
-  font-size: 18px;
+  font-size: 17px;
   line-height: 1.3;
-  margin: 20px 0 8px;
+  margin: 22px 0 8px;
 }
 
 .result :is(h1, h2, h3):first-child {
@@ -36,20 +37,23 @@
 
 .result p {
   margin: 10px 0;
-  line-height: 160%;
+  line-height: 1.65;
+  color: var(--text-h);
 }
 
 .result ul,
 .result ol {
   margin: 10px 0;
   padding-left: 22px;
-  line-height: 160%;
+  line-height: 1.65;
+  color: var(--text-h);
 }
 
 .result a {
-  color: var(--accent);
+  color: var(--accent-strong);
+  text-decoration-color: var(--accent-border);
 }
 
 .result code {
-  font-size: 14px;
+  font-size: 13px;
 }

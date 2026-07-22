@@ -2,8 +2,10 @@
   width: 100%;
   max-width: 640px;
   border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 16px 20px;
+  border-radius: 20px;
+  background: var(--surface);
+  padding: 20px 24px;
+  box-shadow: var(--shadow-sm);
 }
 
 .graph-viz-list {
@@ -18,16 +20,16 @@
   position: relative;
   display: flex;
   align-items: flex-start;
-  gap: 12px;
-  padding: 6px 0;
+  gap: 14px;
+  padding: 8px 0;
 }
 
 .graph-viz-stage:not(:last-child)::before {
   content: '';
   position: absolute;
   left: 5px;
-  top: 20px;
-  bottom: -6px;
+  top: 22px;
+  bottom: -8px;
   width: 1px;
   background: var(--border);
 }
@@ -36,10 +38,10 @@
   flex: none;
   width: 11px;
   height: 11px;
-  margin-top: 4px;
+  margin-top: 5px;
   border-radius: 50%;
-  border: 2px solid var(--border);
-  background: var(--bg);
+  border: 2px solid var(--border-strong);
+  background: var(--surface);
   transition:
     background 0.2s ease,
     border-color 0.2s ease;
@@ -73,8 +75,8 @@
 }
 
 .graph-viz-active .graph-viz-label {
-  color: var(--accent);
-  font-weight: 500;
+  color: var(--accent-strong);
+  font-weight: 600;
 }
 
 .graph-viz-done .graph-viz-label {
@@ -86,7 +88,7 @@
 }
 
 .graph-viz-skipped .graph-viz-label {
-  opacity: 0.5;
+  opacity: 0.55;
   text-decoration: line-through;
 }
 
@@ -102,7 +104,7 @@
   color: var(--text);
   background: var(--code-bg);
   border-radius: 999px;
-  padding: 2px 8px;
+  padding: 2px 9px;
 }
 
 .graph-viz-skipped-note {

@@ -22,16 +22,18 @@ function App() {
   return (
     <div className="page">
       <Header backendUp={backendUp} />
-      <AskCard
-        question={question}
-        onQuestionChange={setQuestion}
-        onSubmit={handleSubmit}
-        loading={loading}
-      />
-      {loading && <GraphVisualization visits={visits} loading={loading} />}
-      {error && <ErrorBanner message={error} />}
-      {result && <ResultCard result={result} />}
-      {result?.summary && <ResearchSummaryPanel summary={result.summary} />}
+      <div className="page-content">
+        <AskCard
+          question={question}
+          onQuestionChange={setQuestion}
+          onSubmit={handleSubmit}
+          loading={loading}
+        />
+        {loading && <GraphVisualization visits={visits} loading={loading} />}
+        {error && <ErrorBanner message={error} />}
+        {result && <ResultCard result={result} />}
+        {result?.summary && <ResearchSummaryPanel summary={result.summary} />}
+      </div>
     </div>
   )
 }

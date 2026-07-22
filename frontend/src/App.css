@@ -3,7 +3,22 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 56px 24px 72px;
-  gap: 32px;
+}
+
+.page-content {
+  width: 100%;
+  max-width: 700px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 28px;
+  padding: 40px 24px 80px;
   text-align: left;
+}
+
+@media (max-width: 640px) {
+  .page-content {
+    padding: 28px 16px 56px;
+    gap: 20px;
+  }
 }

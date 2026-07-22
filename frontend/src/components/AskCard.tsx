@@ -9,6 +9,20 @@ interface AskCardProps {
   loading: boolean
 }
 
+function SendIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M4 12L20 4L13 20L11 13L4 12Z"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
+
 export function AskCard({ question, onQuestionChange, onSubmit, loading }: AskCardProps) {
   return (
     <div className="ask-card">
@@ -19,9 +33,18 @@ export function AskCard({ question, onQuestionChange, onSubmit, loading }: AskCa
           placeholder="Ask a research question…"
           rows={3}
         />
-        <button type="submit" disabled={loading || !question.trim()}>
-          {loading ? 'Researching…' : 'Ask'}
-        </button>
+        <div className="ask-form-footer">
+          <span className="ask-hint">Routes automatically to local docs, web search, or both</span>
+          <button type="submit" disabled={loading || !question.trim()}>
+            {loading ? (
+              'Researching…'
+            ) : (
+              <>
+                Ask <SendIcon />
+              </>
+            )}
+          </button>
+        </div>
       </form>
 
       <div className="examples">
