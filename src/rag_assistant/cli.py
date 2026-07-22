@@ -38,7 +38,7 @@ def hello() -> None:
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
-    console.print(f"[green]{provider} says:[/green] {response.content}")
+    console.print(f"[green]{provider} says:[/green] {response.text}")
 
 
 @app.command()

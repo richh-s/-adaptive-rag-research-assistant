@@ -35,13 +35,13 @@ def synthesize_answer(state: ResearchState) -> dict:
         else:
             prompt = EMPTY_RETRIEVAL_PROMPT.format(question=question)
         answer = get_chat_model().invoke(prompt)
-        result = {"final_answer": answer.content, "citations": []}
+        result = {"final_answer": answer.text, "citations": []}
     else:
         context = "\n\n".join(f"[{i + 1}] (source: {d.source_id})\n{d.content}" for i, d in enumerate(docs))
         prompt = SYNTHESIS_PROMPT.format(question=question, context=context)
         answer = get_chat_model().invoke(prompt)
         citations = [Citation(marker=f"[{i + 1}]", source_id=d.source_id) for i, d in enumerate(docs)]
-        result = {"final_answer": answer.content, "citations": citations}
+        result = {"final_answer": answer.text, "citations": citations}
 
     cache_set(
         key,

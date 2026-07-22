@@ -6,7 +6,7 @@ from rag_assistant.prompts.synthesis_prompt import EMPTY_RETRIEVAL_PROMPT
 
 def _fake_llm(content: str) -> MagicMock:
     fake = MagicMock()
-    fake.invoke.return_value = MagicMock(content=content)
+    fake.invoke.return_value = MagicMock(content=content, text=content)
     return fake
 
 
