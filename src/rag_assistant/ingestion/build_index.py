@@ -1,5 +1,6 @@
 import threading
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from rag_assistant.config import get_settings
 from rag_assistant.ingestion.loaders import load_documents
 from rag_assistant.ingestion.manifest import hash_content, load_manifest, save_manifest
 from rag_assistant.ingestion.splitter import split_documents
-from rag_assistant.retrieval.bm25_store import invalidate_bm25_index
+from rag_assistant.retrieval.bm25_store import get_bm25_index, invalidate_bm25_index
 from rag_assistant.retrieval.vector_store import get_vector_store
 
 # Serializes full build_index() runs. Needed for two reasons: (1) the manifest is a plain
@@ -52,6 +53,7 @@ def build_index(
     persist_dir: Path | None = None,
     embeddings: Embeddings | None = None,
     incremental: bool = True,
+    on_stage: Callable[[str, str], None] | None = None,
 ) -> IndexResult:
     """Load the corpus, chunk it, embed it, and (re)populate the Chroma collection.
 
@@ -60,12 +62,19 @@ def build_index(
     their old chunks deleted and replaced, and files removed from the corpus have their chunks
     deleted too -- only new/changed content pays for embedding calls. Pass `incremental=False`
     to reset the collection and manifest and rebuild everything from scratch.
+
+    `on_stage(stage, message)` is an optional hook fired at each phase transition (currently
+    "parsing" and "indexing") -- callers that expose ingestion progress externally (e.g. the
+    `/api/v1/ingest` background task) use it to update a task-status record without this
+    function needing to know anything about tasks, HTTP, or polling.
     """
     settings = get_settings()
     source_dir = source_dir or settings.corpus_dir
     persist_dir = persist_dir or settings.chroma_persist_dir
 
     with INGEST_LOCK:
+        if on_stage:
+            on_stage("parsing", "Loading and parsing corpus files...")
         documents = load_documents(source_dir)
         store = get_vector_store(embeddings=embeddings, persist_dir=persist_dir)
 
@@ -81,6 +90,9 @@ def build_index(
         for source in removed_sources:
             store.delete(ids=manifest[source]["chunk_ids"])
             del manifest[source]
+
+        if on_stage:
+            on_stage("indexing", "Embedding and indexing changed files...")
 
         indexed_chunks = 0
         changed_files = 0
@@ -107,11 +119,27 @@ def build_index(
 
         save_manifest(persist_dir, manifest)
 
-        # The BM25 index is a lazily-built in-memory singleton (see bm25_store.py) with no
-        # awareness of when the corpus on disk changes -- without this, newly ingested files
-        # would be invisible to BM25 retrieval for the rest of the process's lifetime.
+        # Hot-reload, part 1/2 -- BM25: the index is a lazily-built in-memory singleton (see
+        # bm25_store.py) with no awareness of when the corpus on disk changes. Rebuilding it
+        # *eagerly* here (not just invalidating and leaving it to the next query to rebuild
+        # lazily) means that by the time this function returns -- and callers like
+        # `/api/v1/ingest`'s background task mark the job "indexed" -- BM25 has already
+        # absorbed the new corpus. Without this, a query landing in the gap between
+        # invalidation and the next lazy rebuild would pay the rebuild latency inline, and a
+        # "indexed" status would be very slightly ahead of what BM25 could actually serve.
+        #
+        # Hot-reload, part 2/2 -- Chroma: no equivalent step is needed. `store` above came
+        # from `get_vector_store()`'s process-wide cache keyed by `persist_dir`, and
+        # `/research`'s retrieval node fetches that exact same cached client instance --
+        # ingestion's `store.add_documents(...)` calls above already wrote directly into the
+        # live object every query reads from, so there is no separate client to refresh. (A
+        # multi-worker deployment would break this assumption -- see tasks.py's module
+        # docstring -- but this project runs a single worker.)
         if changed_files or removed_sources:
             invalidate_bm25_index(source_dir)
+            get_bm25_index(source_dir)
+            if on_stage:
+                on_stage("indexing", "Refreshing in-memory search indices...")
 
     return IndexResult(
         indexed_chunks=indexed_chunks,

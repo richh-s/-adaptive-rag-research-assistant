@@ -1,9 +1,14 @@
 __pycache__/
 *.pyc
 .venv/
-.env
 chroma_db/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
 dist/
+config.bat
+node_modules
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore

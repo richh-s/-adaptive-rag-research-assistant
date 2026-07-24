@@ -69,13 +69,29 @@ class ResearchResponse(BaseModel):
 class IngestResponse(BaseModel):
     """POST /api/v1/ingest response body. Indexing runs in a BackgroundTask after this
     response is sent, so this only confirms the upload was validated and persisted to
-    `corpus_dir` -- not that embedding/indexing has finished."""
+    `corpus_dir` -- not that embedding/indexing has finished. Poll
+    GET /api/v1/ingest/{task_id} with `task_id` for real progress."""
 
+    task_id: str
     filename: str
     original_filename: str
     size_bytes: int
     status: Literal["queued"]
     message: str
+
+
+class IngestTaskStatus(BaseModel):
+    """GET /api/v1/ingest/{task_id} response body. `stage` walks forward through
+    queued -> parsing -> indexing -> indexed, or to failed at any point; `error` is only set
+    once `stage == "failed"`."""
+
+    task_id: str
+    filename: str
+    original_filename: str
+    stage: Literal["queued", "parsing", "indexing", "indexed", "failed"]
+    message: str
+    error: str | None = None
+    indexed_chunks: int | None = None
 
 
 class StreamEvent(BaseModel):

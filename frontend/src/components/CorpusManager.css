@@ -154,6 +154,12 @@
   border-color: rgba(47, 125, 79, 0.3);
 }
 
+.upload-badge-progress {
+  color: var(--accent-strong);
+  background: var(--accent-bg);
+  border-color: var(--accent-border);
+}
+
 .upload-badge-error {
   color: var(--danger);
   background: var(--danger-bg);

@@ -22,9 +22,16 @@ from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.graph.research_summary import build_research_summary
 from rag_assistant.ingestion.build_index import build_index
 from rag_assistant.ingestion.loaders import SUPPORTED_SUFFIXES
+from rag_assistant.ingestion.tasks import create_task, get_task, update_task
 from rag_assistant.logging_conf import configure_logging
 from rag_assistant.readiness import check_chroma, check_web_search
-from rag_assistant.schemas.api import IngestResponse, ResearchRequest, ResearchResponse, StreamEvent
+from rag_assistant.schemas.api import (
+    IngestResponse,
+    IngestTaskStatus,
+    ResearchRequest,
+    ResearchResponse,
+    StreamEvent,
+)
 from rag_assistant.tracing import get_trace_id, new_trace_id, trace_id_var
 
 configure_logging()
@@ -204,13 +211,20 @@ def _safe_stem(filename: str) -> str:
     return cleaned or "upload"
 
 
-def _run_ingest_in_background(trace_id: str) -> None:
+def _run_ingest_in_background(trace_id: str, task_id: str) -> None:
     """Runs in FastAPI's threadpool after the response has already been sent (see
     BackgroundTasks below) -- exceptions here would otherwise vanish silently, so they're
-    caught and logged rather than left to crash the worker thread unobserved."""
+    caught, logged, and reflected onto the task record rather than left to crash the worker
+    thread unobserved. `build_index()`'s `on_stage` hook drives the "parsing"/"indexing"
+    transitions; this function only owns the terminal "indexed"/"failed" transition, since it's
+    the one place that knows whether the whole job actually succeeded.
+    """
     token = trace_id_var.set(trace_id)
+    update_task(task_id, stage="parsing", message="Starting ingestion...")
     try:
-        result = build_index()
+        result = build_index(
+            on_stage=lambda stage, message: update_task(task_id, stage=stage, message=message)
+        )
         logger.info(
             "background ingestion complete",
             extra={
@@ -220,8 +234,17 @@ def _run_ingest_in_background(trace_id: str) -> None:
                 "removed_files": result.removed_files,
             },
         )
-    except Exception:
+        if result.changed_files == 0 and result.removed_files == 0:
+            message = "No changes detected -- file content matched what was already indexed."
+        else:
+            message = (
+                f"Indexed {result.indexed_chunks} chunk(s) from {result.changed_files} "
+                f"file(s); local search is up to date."
+            )
+        update_task(task_id, stage="indexed", message=message, indexed_chunks=result.indexed_chunks)
+    except Exception as exc:
         logger.exception("background ingestion failed")
+        update_task(task_id, stage="failed", message="Indexing failed.", error=str(exc))
     finally:
         trace_id_var.reset(token)
 
@@ -284,14 +307,40 @@ async def ingest_document(
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
     logger.info("upload persisted", extra={"dest_name": dest_name, "size_bytes": size_bytes})
-    background_tasks.add_task(_run_ingest_in_background, get_trace_id())
+
+    task = create_task(filename=dest_name, original_filename=file.filename)
+    background_tasks.add_task(_run_ingest_in_background, get_trace_id(), task.task_id)
 
     return IngestResponse(
+        task_id=task.task_id,
         filename=dest_name,
         original_filename=file.filename,
         size_bytes=size_bytes,
         status="queued",
         message="File saved; indexing has started in the background.",
+    )
+
+
+@app.get("/api/v1/ingest/{task_id}", response_model=IngestTaskStatus)
+async def get_ingest_task_status(task_id: str) -> IngestTaskStatus:
+    """Polled by the frontend every ~1-2s while a drawer entry is non-terminal. Deliberately
+    not behind `@limiter.limit`/`@global_limiter.limit` -- those budgets are sized for
+    LLM-backed endpoints, and a client polling this every second for a multi-minute PDF embed
+    would blow through them. Reading an in-memory dict is cheap enough not to need its own
+    limit.
+    """
+    task = get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Unknown ingest task.")
+
+    return IngestTaskStatus(
+        task_id=task.task_id,
+        filename=task.filename,
+        original_filename=task.original_filename,
+        stage=task.stage,
+        message=task.message,
+        error=task.error,
+        indexed_chunks=task.indexed_chunks,
     )
 
 
