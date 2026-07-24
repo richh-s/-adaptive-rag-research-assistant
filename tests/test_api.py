@@ -284,7 +284,9 @@ def test_ingest_persists_file_and_schedules_background_index(monkeypatch, tmp_pa
     monkeypatch.setenv("CORPUS_DIR", str(tmp_path))
     scheduled = []
     monkeypatch.setattr(
-        api, "_run_ingest_in_background", lambda trace_id: scheduled.append(trace_id)
+        api,
+        "_run_ingest_in_background",
+        lambda trace_id, task_id: scheduled.append((trace_id, task_id)),
     )
     client = TestClient(api.app)
 
@@ -296,6 +298,7 @@ def test_ingest_persists_file_and_schedules_background_index(monkeypatch, tmp_pa
     assert response.status_code == 202
     body = response.json()
     assert body["status"] == "queued"
+    assert body["task_id"]
     assert body["original_filename"] == "cohere.md"
     assert body["filename"].startswith("cohere_") and body["filename"].endswith(".md")
     assert body["size_bytes"] == len(b"Cohere builds enterprise LLMs.")
@@ -305,11 +308,12 @@ def test_ingest_persists_file_and_schedules_background_index(monkeypatch, tmp_pa
     # BackgroundTasks run after the response is returned by TestClient, so by the time we get
     # here the background callable has already fired.
     assert scheduled
+    assert scheduled[0][1] == body["task_id"]
 
 
 def test_ingest_sanitizes_path_traversal_in_filename(monkeypatch, tmp_path):
     monkeypatch.setenv("CORPUS_DIR", str(tmp_path))
-    monkeypatch.setattr(api, "_run_ingest_in_background", lambda trace_id: None)
+    monkeypatch.setattr(api, "_run_ingest_in_background", lambda trace_id, task_id: None)
     client = TestClient(api.app)
 
     response = client.post(
@@ -336,6 +340,71 @@ def test_ingest_rejects_file_over_size_limit(monkeypatch, tmp_path):
 
     assert response.status_code == 413
     assert not any(tmp_path.iterdir())
+
+
+def test_get_ingest_task_status_returns_404_for_unknown_task():
+    client = TestClient(api.app)
+
+    response = client.get("/api/v1/ingest/does-not-exist")
+
+    assert response.status_code == 404
+
+
+def test_ingest_task_status_reaches_indexed_stage(monkeypatch, tmp_path):
+    from rag_assistant.ingestion.build_index import IndexResult
+
+    monkeypatch.setenv("CORPUS_DIR", str(tmp_path))
+
+    def fake_build_index(*, on_stage=None, **kwargs):
+        if on_stage:
+            on_stage("parsing", "Loading and parsing corpus files...")
+            on_stage("indexing", "Embedding and indexing changed files...")
+        return IndexResult(indexed_chunks=3, changed_files=1, skipped_files=0, removed_files=0)
+
+    monkeypatch.setattr(api, "build_index", fake_build_index)
+    client = TestClient(api.app)
+
+    post_response = client.post(
+        "/api/v1/ingest",
+        files={"file": ("cohere.md", b"Cohere builds enterprise LLMs.", "text/markdown")},
+    )
+    task_id = post_response.json()["task_id"]
+
+    # TestClient runs BackgroundTasks synchronously after the response is returned, so the
+    # task has already reached its terminal stage by the time we poll here.
+    status_response = client.get(f"/api/v1/ingest/{task_id}")
+
+    assert status_response.status_code == 200
+    body = status_response.json()
+    assert body["stage"] == "indexed"
+    assert body["indexed_chunks"] == 3
+    assert "3" in body["message"]
+    assert body["error"] is None
+
+
+def test_ingest_task_status_reflects_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("CORPUS_DIR", str(tmp_path))
+
+    def failing_build_index(*, on_stage=None, **kwargs):
+        if on_stage:
+            on_stage("parsing", "Loading and parsing corpus files...")
+        raise RuntimeError("embedding provider unavailable")
+
+    monkeypatch.setattr(api, "build_index", failing_build_index)
+    client = TestClient(api.app)
+
+    post_response = client.post(
+        "/api/v1/ingest",
+        files={"file": ("cohere.md", b"Cohere builds enterprise LLMs.", "text/markdown")},
+    )
+    task_id = post_response.json()["task_id"]
+
+    status_response = client.get(f"/api/v1/ingest/{task_id}")
+
+    assert status_response.status_code == 200
+    body = status_response.json()
+    assert body["stage"] == "failed"
+    assert body["error"] == "embedding provider unavailable"
 
 
 def test_sigterm_handler_sets_shutdown_event():

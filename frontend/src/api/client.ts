@@ -42,11 +42,24 @@ export interface StreamEvent {
 }
 
 export interface IngestResponse {
+  task_id: string
   filename: string
   original_filename: string
   size_bytes: number
   status: 'queued'
   message: string
+}
+
+export type IngestStage = 'queued' | 'parsing' | 'indexing' | 'indexed' | 'failed'
+
+export interface IngestTaskStatus {
+  task_id: string
+  filename: string
+  original_filename: string
+  stage: IngestStage
+  message: string
+  error?: string | null
+  indexed_chunks?: number | null
 }
 
 export class ResearchApiError extends Error {}
@@ -119,6 +132,17 @@ export async function ingestFile(file: File): Promise<IngestResponse> {
   if (!response.ok) {
     const body = await response.json().catch(() => null)
     throw new ResearchApiError(body?.detail ?? `Upload failed with status ${response.status}`)
+  }
+
+  return response.json()
+}
+
+export async function getIngestStatus(taskId: string): Promise<IngestTaskStatus> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/ingest/${taskId}`)
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => null)
+    throw new ResearchApiError(body?.detail ?? `Status check failed with status ${response.status}`)
   }
 
   return response.json()
