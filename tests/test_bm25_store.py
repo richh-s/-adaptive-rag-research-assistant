@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from rag_assistant.retrieval.bm25_store import bm25_search
+from rag_assistant.retrieval.bm25_store import bm25_search, invalidate_bm25_index
 
 
 @pytest.fixture
@@ -57,3 +57,22 @@ def test_bm25_search_populates_raw_score(small_corpus_dir):
 
     assert results[0].score is not None
     assert results[0].score > 0
+
+
+def test_invalidate_bm25_index_picks_up_newly_added_file(small_corpus_dir):
+    # Warm the lazily-built singleton cache for this corpus dir before adding a new file.
+    bm25_search("anything", k=4, source_dir=small_corpus_dir)
+
+    (small_corpus_dir / "cohere.md").write_text(
+        "Cohere is an enterprise-focused AI company building large language models for business."
+    )
+
+    # Without invalidation the stale cached index would keep answering from the pre-write
+    # corpus for the rest of the process's lifetime.
+    stale_results = bm25_search("Cohere enterprise", k=4, source_dir=small_corpus_dir)
+    assert all(r.source_id != "cohere.md" for r in stale_results)
+
+    invalidate_bm25_index(small_corpus_dir)
+
+    fresh_results = bm25_search("Cohere enterprise", k=4, source_dir=small_corpus_dir)
+    assert fresh_results[0].source_id == "cohere.md"

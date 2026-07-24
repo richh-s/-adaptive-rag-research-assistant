@@ -41,6 +41,14 @@ export interface StreamEvent {
   summary?: ResearchSummary | null
 }
 
+export interface IngestResponse {
+  filename: string
+  original_filename: string
+  size_bytes: number
+  status: 'queued'
+  message: string
+}
+
 export class ResearchApiError extends Error {}
 
 export async function streamResearch(
@@ -94,6 +102,23 @@ export async function research(question: string): Promise<ResearchResponse> {
   if (!response.ok) {
     const body = await response.json().catch(() => null)
     throw new ResearchApiError(body?.detail ?? `Request failed with status ${response.status}`)
+  }
+
+  return response.json()
+}
+
+export async function ingestFile(file: File): Promise<IngestResponse> {
+  const formData = new FormData()
+  formData.append('file', file)
+
+  const response = await fetch(`${API_BASE_URL}/api/v1/ingest`, {
+    method: 'POST',
+    body: formData,
+  })
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => null)
+    throw new ResearchApiError(body?.detail ?? `Upload failed with status ${response.status}`)
   }
 
   return response.json()

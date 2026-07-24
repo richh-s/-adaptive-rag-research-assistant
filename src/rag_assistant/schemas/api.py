@@ -66,6 +66,18 @@ class ResearchResponse(BaseModel):
     summary: ResearchSummary | None = None
 
 
+class IngestResponse(BaseModel):
+    """POST /api/v1/ingest response body. Indexing runs in a BackgroundTask after this
+    response is sent, so this only confirms the upload was validated and persisted to
+    `corpus_dir` -- not that embedding/indexing has finished."""
+
+    filename: str
+    original_filename: str
+    size_bytes: int
+    status: Literal["queued"]
+    message: str
+
+
 class StreamEvent(BaseModel):
     """One SSE frame from POST /research/stream. `type` discriminates which fields are
     populated: "progress" carries node/message, "done" carries the final report fields,

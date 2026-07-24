@@ -7,10 +7,12 @@ import { ResultCard } from './components/ResultCard'
 import { ResearchSummaryPanel } from './components/ResearchSummaryPanel'
 import { ErrorBanner } from './components/ErrorBanner'
 import { GraphVisualization } from './components/GraphVisualization'
+import { CorpusManager } from './components/CorpusManager'
 import './App.css'
 
 function App() {
   const [question, setQuestion] = useState('')
+  const [corpusManagerOpen, setCorpusManagerOpen] = useState(false)
   const backendUp = useHealthStatus()
   const { loading, error, result, visits, submit } = useResearchStream()
 
@@ -21,7 +23,8 @@ function App() {
 
   return (
     <div className="page">
-      <Header backendUp={backendUp} />
+      <Header backendUp={backendUp} onManageCorpus={() => setCorpusManagerOpen(true)} />
+      <CorpusManager open={corpusManagerOpen} onClose={() => setCorpusManagerOpen(false)} />
       <div className="page-content">
         <AskCard
           question={question}

@@ -1,12 +1,15 @@
 import asyncio
 import logging
+import re
 import signal
 import time
+import uuid
 import weakref
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -17,9 +20,11 @@ from slowapi.util import get_remote_address
 from rag_assistant.config import get_settings
 from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.graph.research_summary import build_research_summary
+from rag_assistant.ingestion.build_index import build_index
+from rag_assistant.ingestion.loaders import SUPPORTED_SUFFIXES
 from rag_assistant.logging_conf import configure_logging
 from rag_assistant.readiness import check_chroma, check_web_search
-from rag_assistant.schemas.api import ResearchRequest, ResearchResponse, StreamEvent
+from rag_assistant.schemas.api import IngestResponse, ResearchRequest, ResearchResponse, StreamEvent
 from rag_assistant.tracing import get_trace_id, new_trace_id, trace_id_var
 
 configure_logging()
@@ -182,6 +187,112 @@ def ready() -> JSONResponse:
         "web_search": {"ok": web_search_ok, "error": web_search_err},
     }
     return JSONResponse(content=body, status_code=200 if chroma_ok and web_search_ok else 503)
+
+
+# Generous but bounded -- a stray multi-hundred-page PDF (or a client sending garbage)
+# shouldn't be able to fill the disk or tie up a background worker indefinitely.
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
+_UNSAFE_FILENAME_CHARS_RE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _safe_stem(filename: str) -> str:
+    """Strips everything but alphanumerics/`_`/`-` from the uploaded filename's stem so it
+    can't path-traverse (`../../etc`) or otherwise inject path separators into corpus_dir."""
+    stem = Path(filename).stem
+    cleaned = _UNSAFE_FILENAME_CHARS_RE.sub("_", stem).strip("_")
+    return cleaned or "upload"
+
+
+def _run_ingest_in_background(trace_id: str) -> None:
+    """Runs in FastAPI's threadpool after the response has already been sent (see
+    BackgroundTasks below) -- exceptions here would otherwise vanish silently, so they're
+    caught and logged rather than left to crash the worker thread unobserved."""
+    token = trace_id_var.set(trace_id)
+    try:
+        result = build_index()
+        logger.info(
+            "background ingestion complete",
+            extra={
+                "indexed_chunks": result.indexed_chunks,
+                "changed_files": result.changed_files,
+                "skipped_files": result.skipped_files,
+                "removed_files": result.removed_files,
+            },
+        )
+    except Exception:
+        logger.exception("background ingestion failed")
+    finally:
+        trace_id_var.reset(token)
+
+
+@app.post("/api/v1/ingest", response_model=IngestResponse, status_code=202)
+@limiter.limit(_per_ip_limit)
+@global_limiter.limit(_global_limit)
+async def ingest_document(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+) -> IngestResponse:
+    """Accepts one corpus file (.md/.txt/.pdf), persists it into `corpus_dir`, and schedules
+    a background re-index. The file must be written to disk *before* this handler returns --
+    FastAPI closes and deletes `UploadFile`'s underlying temp file as soon as the response
+    goes out, so the background task is given a durable path, never the UploadFile itself.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Uploaded file has no filename.")
+
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in SUPPORTED_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type {suffix!r}. Supported types: {sorted(SUPPORTED_SUFFIXES)}.",
+        )
+
+    settings = get_settings()
+    settings.corpus_dir.mkdir(parents=True, exist_ok=True)
+
+    # Short UUID suffix avoids collisions between uploads that share a filename (including
+    # two concurrent uploads of the exact same file) without needing to inspect existing
+    # corpus contents first.
+    dest_name = f"{_safe_stem(file.filename)}_{uuid.uuid4().hex[:8]}{suffix}"
+    dest_path = settings.corpus_dir / dest_name
+
+    size_bytes = 0
+    try:
+        with dest_path.open("wb") as out:
+            while chunk := await file.read(_UPLOAD_CHUNK_BYTES):
+                size_bytes += len(chunk)
+                if size_bytes > _MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds the {_MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit.",
+                    )
+                out.write(chunk)
+    except HTTPException:
+        dest_path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        dest_path.unlink(missing_ok=True)
+        logger.exception("failed to persist upload %r", file.filename)
+        raise HTTPException(status_code=500, detail="Failed to save the uploaded file.") from exc
+    finally:
+        await file.close()
+
+    if size_bytes == 0:
+        dest_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    logger.info("upload persisted", extra={"dest_name": dest_name, "size_bytes": size_bytes})
+    background_tasks.add_task(_run_ingest_in_background, get_trace_id())
+
+    return IngestResponse(
+        filename=dest_name,
+        original_filename=file.filename,
+        size_bytes=size_bytes,
+        status="queued",
+        message="File saved; indexing has started in the background.",
+    )
 
 
 @app.post("/research", response_model=ResearchResponse)

@@ -19,7 +19,9 @@ dependencies = [
     "langchain-text-splitters>=1.1.2",
     "langgraph>=1.2.7",
     "pydantic-settings>=2.14.2",
+    "pymupdf4llm>=0.0.28",
     "python-dotenv>=1.2.2",
+    "python-multipart>=0.0.20",
     # Pinned exactly: ragas>=0.4 unconditionally imports ChatVertexAI from langchain_community,
     # which dropped that integration -- this combo is the last verified-working import path.
     "python-json-logger>=4.1.0",

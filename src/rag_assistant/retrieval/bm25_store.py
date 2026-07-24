@@ -48,6 +48,20 @@ def get_bm25_index(source_dir: Path | None = None) -> tuple[BM25Okapi | None, li
     return _index_cache[resolved]
 
 
+def invalidate_bm25_index(source_dir: Path | None = None) -> None:
+    """Drop the cached in-memory index so the next `get_bm25_index`/`bm25_search` call
+    rebuilds it from disk. Call this after ingestion adds, changes, or removes corpus files --
+    the cache above is a lazy singleton with no other way to learn the corpus changed. Popping
+    under the same lock used to build it means a concurrent reader either sees the old index
+    (a plain dict-key read, safe to interleave under the GIL) or triggers a fresh build; it
+    never observes a torn/half-rebuilt one.
+    """
+    settings = get_settings()
+    resolved = str(source_dir or settings.corpus_dir)
+    with _index_lock:
+        _index_cache.pop(resolved, None)
+
+
 def bm25_search(sub_query: str, k: int = 4, source_dir: Path | None = None) -> list[RetrievedDoc]:
     bm25, chunks = get_bm25_index(source_dir)
     if bm25 is None:

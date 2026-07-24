@@ -260,6 +260,84 @@ def test_research_stream_times_out_on_hanging_node(monkeypatch):
     assert "timed out" in events[-1]["detail"]
 
 
+def test_ingest_rejects_unsupported_file_type():
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/v1/ingest", files={"file": ("notes.json", b"{}", "application/json")}
+    )
+
+    assert response.status_code == 400
+    assert "Unsupported file type" in response.json()["detail"]
+
+
+def test_ingest_rejects_empty_file():
+    client = TestClient(api.app)
+
+    response = client.post("/api/v1/ingest", files={"file": ("empty.md", b"", "text/markdown")})
+
+    assert response.status_code == 400
+    assert "empty" in response.json()["detail"].lower()
+
+
+def test_ingest_persists_file_and_schedules_background_index(monkeypatch, tmp_path):
+    monkeypatch.setenv("CORPUS_DIR", str(tmp_path))
+    scheduled = []
+    monkeypatch.setattr(
+        api, "_run_ingest_in_background", lambda trace_id: scheduled.append(trace_id)
+    )
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/v1/ingest",
+        files={"file": ("cohere.md", b"Cohere builds enterprise LLMs.", "text/markdown")},
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["original_filename"] == "cohere.md"
+    assert body["filename"].startswith("cohere_") and body["filename"].endswith(".md")
+    assert body["size_bytes"] == len(b"Cohere builds enterprise LLMs.")
+
+    saved = tmp_path / body["filename"]
+    assert saved.read_bytes() == b"Cohere builds enterprise LLMs."
+    # BackgroundTasks run after the response is returned by TestClient, so by the time we get
+    # here the background callable has already fired.
+    assert scheduled
+
+
+def test_ingest_sanitizes_path_traversal_in_filename(monkeypatch, tmp_path):
+    monkeypatch.setenv("CORPUS_DIR", str(tmp_path))
+    monkeypatch.setattr(api, "_run_ingest_in_background", lambda trace_id: None)
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/v1/ingest",
+        files={"file": ("../../etc/passwd.md", b"malicious", "text/markdown")},
+    )
+
+    assert response.status_code == 202
+    saved_name = response.json()["filename"]
+    assert "/" not in saved_name and ".." not in saved_name
+    assert (tmp_path / saved_name).exists()
+    assert not (tmp_path.parent / "etc").exists()
+
+
+def test_ingest_rejects_file_over_size_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv("CORPUS_DIR", str(tmp_path))
+    monkeypatch.setattr(api, "_MAX_UPLOAD_BYTES", 10)
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/api/v1/ingest",
+        files={"file": ("big.md", b"x" * 1000, "text/markdown")},
+    )
+
+    assert response.status_code == 413
+    assert not any(tmp_path.iterdir())
+
+
 def test_sigterm_handler_sets_shutdown_event():
     assert not api._shutdown_event.is_set()
     try:
