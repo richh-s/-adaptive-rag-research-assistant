@@ -145,9 +145,13 @@ class StreamEvent(BaseModel):
     "error" carries detail. Kept as one flat model (rather than a Union) since the frontend
     parses raw JSON by hand and checks `type` first regardless."""
 
-    type: Literal["progress", "done", "error", "close"]
+    type: Literal["progress", "token", "done", "error", "close"]
     node: str | None = None
     message: str | None = None
+    # "token" frames carry an incremental piece of the answer as the synthesis LLM generates
+    # it; clients append them in order, then replace the whole thing with `report`/`answer`
+    # from the "done" frame (which is authoritative -- cached answers emit no tokens at all).
+    token: str | None = None
     report: str | None = None
     answer: str | None = None
     route: str | None = None

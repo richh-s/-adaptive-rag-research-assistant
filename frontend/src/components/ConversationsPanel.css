@@ -72,3 +72,11 @@
   color: var(--danger);
   background: var(--danger-bg);
 }
+
+.conversation-delete-arming {
+  color: var(--danger);
+  background: var(--danger-bg);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}

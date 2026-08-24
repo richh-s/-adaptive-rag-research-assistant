@@ -34,6 +34,23 @@ export function ConversationsPanel({
 }: ConversationsPanelProps) {
   const [conversations, setConversations] = useState<ConversationSummaryInfo[]>([])
   const [loadError, setLoadError] = useState(false)
+  // Two-step delete: first tap arms the row ("Delete?"), second tap actually deletes.
+  const [confirmingId, setConfirmingId] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, onClose])
+
+  useEffect(() => {
+    if (confirmingId === null) return
+    const timeout = setTimeout(() => setConfirmingId(null), 4000)
+    return () => clearTimeout(timeout)
+  }, [confirmingId])
 
   useEffect(() => {
     if (!open) return
@@ -54,6 +71,11 @@ export function ConversationsPanel({
   }, [open])
 
   async function handleDelete(id: string) {
+    if (confirmingId !== id) {
+      setConfirmingId(id)
+      return
+    }
+    setConfirmingId(null)
     await deleteConversation(id).catch(() => {})
     setConversations((prev) => prev.filter((c) => c.id !== id))
     onDeleted(id)
@@ -108,11 +130,17 @@ export function ConversationsPanel({
               </button>
               <button
                 type="button"
-                className="conversation-delete"
-                aria-label={`Delete conversation ${conversation.title}`}
+                className={`conversation-delete ${
+                  confirmingId === conversation.id ? 'conversation-delete-arming' : ''
+                }`}
+                aria-label={
+                  confirmingId === conversation.id
+                    ? `Confirm deleting conversation ${conversation.title}`
+                    : `Delete conversation ${conversation.title}`
+                }
                 onClick={() => void handleDelete(conversation.id)}
               >
-                🗑
+                {confirmingId === conversation.id ? 'Delete?' : '🗑'}
               </button>
             </li>
           ))}

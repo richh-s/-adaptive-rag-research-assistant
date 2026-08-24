@@ -64,6 +64,15 @@ export function CorpusManager({ open, onClose }: CorpusManagerProps) {
     }
   }, [])
 
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, onClose])
+
   const updateUpload = useCallback((id: string, patch: Partial<UploadEntry>) => {
     setUploads((prev) => prev.map((u) => (u.id === id ? { ...u, ...patch } : u)))
   }, [])

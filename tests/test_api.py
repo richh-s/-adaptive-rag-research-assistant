@@ -528,3 +528,37 @@ def test_research_response_includes_plain_answer(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["answer"] == "answer only"
+
+
+def test_research_stream_relays_synthesis_tokens_only(monkeypatch):
+    """stream_mode=["updates","messages"] yields (mode, payload) tuples; synthesis-node
+    token chunks become "token" frames, other nodes' LLM chatter is dropped, and updates
+    still drive progress frames + the final done frame."""
+
+    class _Chunk:
+        def __init__(self, text):
+            self.text = text
+
+    async def fake_astream(state, config=None, stream_mode=None):
+        yield ("updates", {"route_query": {"route": "vector"}})
+        yield ("messages", (_Chunk("internal router text"), {"langgraph_node": "route_query"}))
+        yield ("messages", (_Chunk("Hello "), {"langgraph_node": "synthesize_answer"}))
+        yield ("messages", (_Chunk("world."), {"langgraph_node": "synthesize_answer"}))
+        yield (
+            "updates",
+            {"synthesize_answer": {"final_answer": "Hello world."}},
+        )
+        yield ("updates", {"format_report": {"research_report": "# Hello world."}})
+
+    monkeypatch.setattr(api._graph, "astream", fake_astream)
+    client = TestClient(api.app)
+
+    with client.stream("POST", "/research/stream", json={"question": "anything"}) as response:
+        assert response.status_code == 200
+        events = _sse_events(response)
+
+    tokens = [e["token"] for e in events if e["type"] == "token"]
+    assert tokens == ["Hello ", "world."]
+    assert events[-1]["type"] == "done"
+    assert events[-1]["answer"] == "Hello world."
+    assert events[-1]["report"] == "# Hello world."

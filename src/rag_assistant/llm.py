@@ -17,14 +17,20 @@ def _gemini_chat_model(temperature: float) -> ChatGoogleGenerativeAI:
     )
 
 
-def _anthropic_chat_model() -> ChatAnthropic:
-    """`temperature` is rejected (HTTP 400) by current Claude models, so it's never passed here."""
+def _anthropic_chat_model(streaming: bool = False) -> ChatAnthropic:
+    """`temperature` is rejected (HTTP 400) by current Claude models, so it's never passed here.
+
+    `streaming=True` makes `.invoke()` consume the streaming API and fire token callbacks --
+    which LangGraph's `stream_mode="messages"` relays to the SSE endpoint as live answer
+    tokens. Only the plain chat model (synthesis path) enables it; structured-output calls
+    keep the default, where token streaming buys nothing."""
     settings = get_settings()
     return ChatAnthropic(
         model=settings.anthropic_chat_model,
         api_key=settings.anthropic_api_key,
         default_request_timeout=settings.llm_request_timeout_seconds,
         max_retries=settings.llm_max_retries,
+        streaming=streaming,
     )
 
 
@@ -42,9 +48,9 @@ def get_chat_model(temperature: float = 0.0) -> BaseChatModel:
     if not settings.anthropic_api_key:
         return _gemini_chat_model(temperature)
     if not settings.google_api_key:
-        return _anthropic_chat_model()
+        return _anthropic_chat_model(streaming=True)
 
-    return _anthropic_chat_model().with_fallbacks([_gemini_chat_model(temperature)])
+    return _anthropic_chat_model(streaming=True).with_fallbacks([_gemini_chat_model(temperature)])
 
 
 def get_structured_llm(schema: type, temperature: float = 0.0) -> Runnable:

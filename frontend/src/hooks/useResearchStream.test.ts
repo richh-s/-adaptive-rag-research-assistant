@@ -169,3 +169,62 @@ describe('useResearchStream', () => {
     expect(options.conversationId).toBeNull()
   })
 })
+
+describe('token streaming and retry', () => {
+  it('accumulates token frames into streamingAnswer, then clears on done', async () => {
+    let release!: () => void
+    streamResearchMock.mockImplementation(async (_q: string, onEvent: (e: StreamEvent) => void) => {
+      onEvent({ type: 'token', token: 'Hel' })
+      onEvent({ type: 'token', token: 'lo' })
+      await new Promise<void>((resolve) => {
+        release = resolve
+      })
+      onEvent(doneEvent({ answer: 'Hello' }))
+    })
+
+    const { result } = renderHook(() => useResearchStream())
+    let submitPromise: Promise<void> = Promise.resolve()
+    await act(async () => {
+      submitPromise = result.current.submit('a question')
+      await Promise.resolve()
+    })
+
+    expect(result.current.streamingAnswer).toBe('Hello')
+    expect(result.current.loading).toBe(true)
+
+    await act(async () => {
+      release()
+      await submitPromise
+    })
+
+    expect(result.current.streamingAnswer).toBe('')
+    expect(result.current.turns).toHaveLength(1)
+    expect(result.current.turns[0].result.answer).toBe('Hello')
+  })
+
+  it('exposes retry after a failure and resubmits the same question', async () => {
+    streamResearchMock.mockImplementation(async (_q: string, onEvent: (e: StreamEvent) => void) => {
+      onEvent({ type: 'error', detail: 'provider down' })
+    })
+
+    const { result } = renderHook(() => useResearchStream())
+    await act(async () => {
+      await result.current.submit('flaky question')
+    })
+
+    expect(result.current.error).toBe('provider down')
+    expect(result.current.retry).not.toBeNull()
+
+    streamResearchMock.mockImplementation(async (_q: string, onEvent: (e: StreamEvent) => void) => {
+      onEvent(doneEvent())
+    })
+    await act(async () => {
+      await result.current.retry!()
+    })
+
+    expect(streamResearchMock).toHaveBeenCalledTimes(2)
+    expect(streamResearchMock.mock.calls[1][0]).toBe('flaky question')
+    expect(result.current.error).toBeNull()
+    expect(result.current.turns).toHaveLength(1)
+  })
+})

@@ -557,6 +557,9 @@ async def _stream_research_events(body: ResearchRequest, history: list[dict]) ->
     _active_streams.add(connection)
     try:
         final_state: dict = {}
+        # Two stream modes at once: "updates" drives the per-node progress frames, and
+        # "messages" relays LLM token callbacks so the answer can render as it's generated.
+        # With a mode list, LangGraph yields (mode, payload) tuples instead of bare updates.
         graph_iter = _graph.astream(
             {
                 "question": question,
@@ -564,7 +567,7 @@ async def _stream_research_events(body: ResearchRequest, history: list[dict]) ->
                 "trace_id": get_trace_id(),
             },
             config={"recursion_limit": _RECURSION_LIMIT},
-            stream_mode="updates",
+            stream_mode=["updates", "messages"],
         ).__aiter__()
         # Bounds total time spent waiting on the graph, not any single node -- each
         # `__anext__()` gets whatever's left of the overall budget, so a hang anywhere
@@ -584,6 +587,23 @@ async def _stream_research_events(body: ResearchRequest, history: list[dict]) ->
                 break
             except TimeoutError:
                 raise TimeoutError(f"research timed out after {timeout_seconds}s") from None
+
+            # Tuple = (mode, payload) from the stream_mode list above. Bare dicts are kept
+            # supported so tests can stub astream with plain "updates" output.
+            if isinstance(update, tuple):
+                mode, payload = update
+                if mode == "messages":
+                    chunk, metadata = payload
+                    # Only the synthesis node's tokens are the user-facing answer -- the
+                    # router/decomposer/grader also make LLM calls, and their output is
+                    # internal machinery, not something to render in the chat bubble.
+                    if metadata.get("langgraph_node") != "synthesize_answer":
+                        continue
+                    text = chunk.text if isinstance(chunk.text, str) else ""
+                    if text:
+                        yield f"data: {StreamEvent(type='token', token=text).model_dump_json()}\n\n"
+                    continue
+                update = payload
 
             for node_name, node_output in update.items():
                 for key, value in node_output.items():

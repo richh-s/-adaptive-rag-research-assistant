@@ -1,4 +1,5 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
+import ReactMarkdown from 'react-markdown'
 import { checkAuth, type AuthStatus } from './api/client'
 import { useHealthStatus } from './hooks/useHealthStatus'
 import { useResearchStream } from './hooks/useResearchStream'
@@ -35,11 +36,22 @@ function App() {
     turns,
     conversationId,
     pendingQuestion,
+    streamingAnswer,
     visits,
     submit,
+    stop,
+    retry,
     openConversation,
     reset,
   } = useResearchStream()
+  const threadEndRef = useRef<HTMLDivElement>(null)
+
+  // Keep the latest activity in view: scroll when a turn completes, a question starts,
+  // or the answer begins streaming in (once -- not on every token).
+  const streamingStarted = streamingAnswer.length > 0
+  useEffect(() => {
+    threadEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [turns.length, pendingQuestion, streamingStarted])
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault()
@@ -95,12 +107,25 @@ function App() {
             {pendingQuestion !== null && (
               <div className="chat-turn">
                 <div className="chat-question">{pendingQuestion}</div>
-                {loading && <GraphVisualization visits={visits} loading={loading} />}
+                {loading && !streamingAnswer && (
+                  <GraphVisualization visits={visits} loading={loading} />
+                )}
+                {streamingAnswer && (
+                  <div className="result streaming-answer" aria-live="polite">
+                    <ReactMarkdown>{streamingAnswer}</ReactMarkdown>
+                  </div>
+                )}
+                {loading && (
+                  <button type="button" className="stop-button" onClick={stop}>
+                    ■ Stop
+                  </button>
+                )}
               </div>
             )}
+            <div ref={threadEndRef} aria-hidden="true" />
           </div>
         )}
-        {error && <ErrorBanner message={error} />}
+        {error && <ErrorBanner message={error} onRetry={retry ?? undefined} />}
         <AskCard
           question={question}
           onQuestionChange={setQuestion}

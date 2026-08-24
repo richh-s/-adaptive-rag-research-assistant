@@ -80,9 +80,11 @@ export interface ResearchResponse {
 }
 
 export interface StreamEvent {
-  type: 'progress' | 'done' | 'error'
+  type: 'progress' | 'token' | 'done' | 'error'
   node?: string | null
   message?: string | null
+  /** Incremental answer text; append in order, then trust the done frame's full answer. */
+  token?: string | null
   report?: string | null
   answer?: string | null
   route?: string | null

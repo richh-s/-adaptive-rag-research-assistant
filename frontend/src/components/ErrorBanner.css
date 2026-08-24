@@ -8,3 +8,27 @@
   color: var(--danger);
   font-size: 14.5px;
 }
+
+.error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+
+.error-retry {
+  flex-shrink: 0;
+  padding: 5px 12px;
+  border: 1px solid var(--danger-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--danger);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.error-retry:hover {
+  background: var(--danger-bg);
+}

@@ -108,3 +108,41 @@
   color: var(--text);
   margin-top: -18px;
 }
+
+.stop-button {
+  align-self: flex-start;
+  padding: 6px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.stop-button:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* Blinking caret on the streaming answer so it reads as "still writing". */
+.streaming-answer > :last-child::after {
+  content: '▍';
+  margin-left: 2px;
+  animation: caret-blink 1s steps(1) infinite;
+}
+
+@keyframes caret-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .streaming-answer > :last-child::after {
+    animation: none;
+  }
+  * {
+    scroll-behavior: auto !important;
+  }
+}
