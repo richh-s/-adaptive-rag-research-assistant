@@ -9,6 +9,7 @@ interface ResearchSummaryPanelProps {
 // run twice on the corrective-retry loop (fuse_results) -- group their latencies under one
 // human-readable stage so the table reads like a single pipeline instead of a raw event log.
 const STAGE_LABELS: Record<string, string> = {
+  condense_question: 'Follow-up Resolution',
   route_query: 'Route',
   decompose_query: 'Decompose',
   retrieve_vector: 'Retrieval',
@@ -50,6 +51,13 @@ export function ResearchSummaryPanel({ summary }: ResearchSummaryPanelProps) {
         <span className="summary-label">Route</span>
         <span className="summary-value">{summary.route ?? 'unknown'}</span>
       </div>
+
+      {summary.condensed_question && (
+        <div className="summary-row">
+          <span className="summary-label">Interpreted As</span>
+          <span className="summary-value">{summary.condensed_question}</span>
+        </div>
+      )}
 
       {summary.sub_queries.length > 0 && (
         <div className="summary-block">

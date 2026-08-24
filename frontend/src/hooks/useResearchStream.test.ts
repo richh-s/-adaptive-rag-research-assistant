@@ -1,14 +1,16 @@
 import { act, renderHook } from '@testing-library/react'
 import { describe, expect, it, vi, beforeEach } from 'vitest'
-import type { StreamEvent } from '../api/client'
+import type { ConversationDetail, StreamEvent, StreamResearchOptions } from '../api/client'
 
 const streamResearchMock = vi.fn()
+const getConversationMock = vi.fn()
 
 vi.mock('../api/client', async () => {
   const actual = await vi.importActual<typeof import('../api/client')>('../api/client')
   return {
     ...actual,
     streamResearch: (...args: Parameters<typeof actual.streamResearch>) => streamResearchMock(...args),
+    getConversation: (...args: Parameters<typeof actual.getConversation>) => getConversationMock(...args),
   }
 })
 
@@ -16,7 +18,21 @@ import { useResearchStream } from './useResearchStream'
 
 beforeEach(() => {
   streamResearchMock.mockReset()
+  getConversationMock.mockReset()
 })
+
+function doneEvent(overrides: Partial<StreamEvent> = {}): StreamEvent {
+  return {
+    type: 'done',
+    report: '# Report',
+    answer: 'The answer.',
+    route: 'vector',
+    confidence_score: 0.9,
+    summary: null,
+    conversation_id: 'conv-1',
+    ...overrides,
+  }
+}
 
 describe('useResearchStream', () => {
   it('starts idle', () => {
@@ -24,21 +40,17 @@ describe('useResearchStream', () => {
 
     expect(result.current.loading).toBe(false)
     expect(result.current.error).toBeNull()
-    expect(result.current.result).toBeNull()
+    expect(result.current.turns).toEqual([])
+    expect(result.current.conversationId).toBeNull()
+    expect(result.current.pendingQuestion).toBeNull()
     expect(result.current.visits).toEqual([])
   })
 
-  it('accumulates progress events into visits and resolves with the final result', async () => {
-    streamResearchMock.mockImplementation(async (_question: string, onEvent: (e: StreamEvent) => void) => {
+  it('accumulates progress events into visits and appends a completed turn', async () => {
+    streamResearchMock.mockImplementation(async (_q: string, onEvent: (e: StreamEvent) => void) => {
       onEvent({ type: 'progress', node: 'route_query', message: 'Routing question...' })
       onEvent({ type: 'progress', node: 'decompose_query', message: 'Decomposing...' })
-      onEvent({
-        type: 'done',
-        report: '# Report',
-        route: 'vector',
-        confidence_score: 0.9,
-        summary: null,
-      })
+      onEvent(doneEvent())
     })
 
     const { result } = renderHook(() => useResearchStream())
@@ -51,19 +63,37 @@ describe('useResearchStream', () => {
       { node: 'route_query', message: 'Routing question...', seq: 1 },
       { node: 'decompose_query', message: 'Decomposing...', seq: 2 },
     ])
-    expect(result.current.result).toEqual({
-      question: 'Who founded Anthropic?',
-      report: '# Report',
-      route: 'vector',
-      confidence_score: 0.9,
-      summary: null,
-    })
+    expect(result.current.turns).toHaveLength(1)
+    expect(result.current.turns[0].question).toBe('Who founded Anthropic?')
+    expect(result.current.turns[0].result.answer).toBe('The answer.')
     expect(result.current.loading).toBe(false)
+    expect(result.current.pendingQuestion).toBeNull()
     expect(result.current.error).toBeNull()
   })
 
-  it('surfaces an error event without setting a result', async () => {
-    streamResearchMock.mockImplementation(async (_question: string, onEvent: (e: StreamEvent) => void) => {
+  it('adopts the server conversation id and sends it on follow-ups', async () => {
+    streamResearchMock.mockImplementation(async (_q: string, onEvent: (e: StreamEvent) => void) => {
+      onEvent(doneEvent({ conversation_id: 'conv-42' }))
+    })
+
+    const { result } = renderHook(() => useResearchStream())
+    await act(async () => {
+      await result.current.submit('first question')
+    })
+    expect(result.current.conversationId).toBe('conv-42')
+
+    await act(async () => {
+      await result.current.submit('a follow-up')
+    })
+
+    const firstOptions = streamResearchMock.mock.calls[0][2] as StreamResearchOptions
+    const secondOptions = streamResearchMock.mock.calls[1][2] as StreamResearchOptions
+    expect(firstOptions.conversationId).toBeNull()
+    expect(secondOptions.conversationId).toBe('conv-42')
+  })
+
+  it('surfaces an error event without appending a turn', async () => {
+    streamResearchMock.mockImplementation(async (_q: string, onEvent: (e: StreamEvent) => void) => {
       onEvent({ type: 'error', detail: 'quota exceeded' })
     })
 
@@ -74,7 +104,7 @@ describe('useResearchStream', () => {
     })
 
     expect(result.current.error).toBe('quota exceeded')
-    expect(result.current.result).toBeNull()
+    expect(result.current.turns).toEqual([])
   })
 
   it('ignores blank questions and never calls the API', async () => {
@@ -88,28 +118,54 @@ describe('useResearchStream', () => {
     expect(result.current.loading).toBe(false)
   })
 
-  it('does not accumulate visits across separate submissions', async () => {
-    streamResearchMock.mockImplementation(async (_question: string, onEvent: (e: StreamEvent) => void) => {
-      onEvent({ type: 'progress', node: 'route_query', message: 'Routing question...' })
-      onEvent({ type: 'done', report: 'r', route: 'vector', confidence_score: 1, summary: null })
+  it('openConversation loads persisted turns and continues under that id', async () => {
+    const detail: ConversationDetail = {
+      id: 'conv-9',
+      title: 'Who founded Anthropic?',
+      created_at: 1,
+      updated_at: 2,
+      messages: [
+        { role: 'user', content: 'Who founded Anthropic?', created_at: 1 },
+        { role: 'assistant', content: 'The Amodeis.', report: '# R1', summary: null, created_at: 1 },
+        { role: 'user', content: 'what about their models?', created_at: 2 },
+        { role: 'assistant', content: 'Claude.', report: '# R2', summary: null, created_at: 2 },
+      ],
+    }
+    getConversationMock.mockResolvedValue(detail)
+
+    const { result } = renderHook(() => useResearchStream())
+    await act(async () => {
+      await result.current.openConversation('conv-9')
+    })
+
+    expect(result.current.conversationId).toBe('conv-9')
+    expect(result.current.turns).toHaveLength(2)
+    expect(result.current.turns[0].question).toBe('Who founded Anthropic?')
+    expect(result.current.turns[0].result.report).toBe('# R1')
+    expect(result.current.turns[1].result.answer).toBe('Claude.')
+  })
+
+  it('reset clears local state so the next submit starts a new server conversation', async () => {
+    streamResearchMock.mockImplementation(async (_q: string, onEvent: (e: StreamEvent) => void) => {
+      onEvent(doneEvent({ conversation_id: 'conv-1' }))
     })
 
     const { result } = renderHook(() => useResearchStream())
     await act(async () => {
       await result.current.submit('first question')
     })
-    expect(result.current.visits).toHaveLength(1)
+    expect(result.current.conversationId).toBe('conv-1')
 
-    streamResearchMock.mockImplementation(async (_question: string, onEvent: (e: StreamEvent) => void) => {
-      onEvent({ type: 'progress', node: 'route_query', message: 'Routing question...' })
-      onEvent({ type: 'progress', node: 'decompose_query', message: 'Decomposing...' })
-      onEvent({ type: 'done', report: 'r2', route: 'web', confidence_score: 1, summary: null })
+    act(() => {
+      result.current.reset()
     })
+    expect(result.current.turns).toEqual([])
+    expect(result.current.conversationId).toBeNull()
+
     await act(async () => {
-      await result.current.submit('second question')
+      await result.current.submit('brand new topic')
     })
-
-    expect(result.current.visits).toHaveLength(2)
-    expect(result.current.result?.report).toBe('r2')
+    const options = streamResearchMock.mock.calls[1][2] as StreamResearchOptions
+    expect(options.conversationId).toBeNull()
   })
 })

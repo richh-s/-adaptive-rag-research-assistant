@@ -1,0 +1,33 @@
+# One-click deployment to Render (https://render.com) -- gives the project a public live
+# demo URL. The Docker image builds the React frontend and serves it from FastAPI itself
+# (see Dockerfile + api.py's STATIC_DIR mount), so a single web service is the whole app.
+#
+# After connecting the repo in the Render dashboard ("New" -> "Blueprint"), set the two
+# secret env vars when prompted. The free instance type sleeps after idle periods and cold
+# starts in ~1 minute -- fine for a portfolio demo.
+services:
+  - type: web
+    name: adaptive-rag-research-assistant
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: GOOGLE_API_KEY
+        sync: false # secret -- set in the Render dashboard
+      - key: ANTHROPIC_API_KEY
+        sync: false # secret -- may be set to an empty string to run Gemini-only
+      - key: API_KEYS
+        sync: false # secret -- `label:key,...` to require auth; empty string = open demo
+      - key: SENTRY_DSN
+        sync: false # secret -- Sentry error tracking; empty string = disabled
+      - key: APP_ENV
+        value: production
+      # No Redis on the free tier: caching degrades gracefully to "no cache" (see cache.py),
+      # so disable it outright rather than pay for a Key Value instance.
+      - key: USE_CACHE
+        value: "false"
+    # Free instances have no persistent disk: the Chroma index and any uploaded corpus files
+    # reset on each deploy/restart. The baseline corpus baked into the image (data/corpus)
+    # is re-indexed at container startup (see Dockerfile CMD), so the demo works out of the
+    # box. Upgrade to a paid instance and attach a disk at /app/chroma_db to persist uploads
+    # across restarts.

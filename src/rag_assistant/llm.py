@@ -33,14 +33,18 @@ def get_chat_model(temperature: float = 0.0) -> BaseChatModel:
 
     Anthropic is primary when ANTHROPIC_API_KEY is configured, with Gemini as an
     automatic fallback on error (rate limit, outage, etc). Falls back to Gemini-only
-    when no Anthropic key is set.
+    when no Anthropic key is set. With only an Anthropic key, Anthropic runs without
+    a fallback rather than crashing on Gemini client construction -- the Gemini client
+    validates its API key eagerly at __init__, so it must not even be built when
+    GOOGLE_API_KEY is blank (chat still works Anthropic-only; embeddings don't).
     """
     settings = get_settings()
-    gemini = _gemini_chat_model(temperature)
     if not settings.anthropic_api_key:
-        return gemini
+        return _gemini_chat_model(temperature)
+    if not settings.google_api_key:
+        return _anthropic_chat_model()
 
-    return _anthropic_chat_model().with_fallbacks([gemini])
+    return _anthropic_chat_model().with_fallbacks([_gemini_chat_model(temperature)])
 
 
 def get_structured_llm(schema: type, temperature: float = 0.0) -> Runnable:
@@ -51,10 +55,14 @@ def get_structured_llm(schema: type, temperature: float = 0.0) -> Runnable:
     wrap the already-structured runnables rather than the raw chat models.
     """
     settings = get_settings()
-    gemini_structured = _gemini_chat_model(temperature).with_structured_output(schema)
     if not settings.anthropic_api_key:
-        return gemini_structured
+        return _gemini_chat_model(temperature).with_structured_output(schema)
+    if not settings.google_api_key:
+        # Same guard as get_chat_model: don't construct a Gemini client that would
+        # raise on a blank key just to serve as a fallback.
+        return _anthropic_chat_model().with_structured_output(schema)
 
+    gemini_structured = _gemini_chat_model(temperature).with_structured_output(schema)
     return _anthropic_chat_model().with_structured_output(schema).with_fallbacks([gemini_structured])
 
 

@@ -32,8 +32,21 @@ class Settings(BaseSettings):
 
     corpus_dir: Path = PROJECT_ROOT / "data" / "corpus"
     chroma_persist_dir: Path = PROJECT_ROOT / "chroma_db"
+    # Server-side conversation history (see conversations/store.py). Lives inside
+    # chroma_persist_dir's sibling default so one mounted volume covers both stores.
+    conversations_db_path: Path = PROJECT_ROOT / "chroma_db" / "conversations.db"
+
+    # When set (STATIC_DIR env var) and the directory exists, the API serves the built
+    # frontend from it at "/" -- used by the Docker image / Render deployment so one
+    # container is the whole demo. Unset in development, where Vite serves the frontend.
+    static_dir: Path | None = None
 
     confidence_threshold: float = 0.6
+
+    # PDF vision ingestion (see ingestion/vision.py): describe embedded figures and
+    # transcribe scanned pages with the chat provider's vision capability. Costs one
+    # vision call per figure/scanned page at ingest time; PDF_VISION=false disables.
+    pdf_vision: bool = True
 
     # caching (Redis) -- see cache.py. `use_cache` lets tests/offline runs disable it outright.
     use_cache: bool = True
@@ -41,6 +54,14 @@ class Settings(BaseSettings):
     cache_ttl_router: int = 300
     cache_ttl_web_search: int = 600
     cache_ttl_synthesis: int = 1800
+
+    # authentication -- see auth.py. Comma-separated `label:key` (or bare `key`) entries;
+    # blank disables auth entirely (open demo mode). Each label is a tenant: conversations
+    # are scoped to it and rate limits are keyed by it.
+    api_keys: str = ""
+
+    # error tracking -- when set, Sentry captures unhandled exceptions (see api.py).
+    sentry_dsn: str = ""
 
     # rate limiting -- see api.py's limiter setup.
     rate_limit_rpm: int = 10

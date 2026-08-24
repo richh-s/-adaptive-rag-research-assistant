@@ -7,6 +7,9 @@ interface AskCardProps {
   onQuestionChange: (question: string) => void
   onSubmit: (e: FormEvent) => void
   loading: boolean
+  /** True once a conversation is underway — switches the card into follow-up mode
+   * (different placeholder/hint, example chips hidden). */
+  followUp?: boolean
 }
 
 function SendIcon() {
@@ -23,18 +26,22 @@ function SendIcon() {
   )
 }
 
-export function AskCard({ question, onQuestionChange, onSubmit, loading }: AskCardProps) {
+export function AskCard({ question, onQuestionChange, onSubmit, loading, followUp = false }: AskCardProps) {
   return (
     <div className="ask-card">
       <form onSubmit={onSubmit} className="ask-form">
         <textarea
           value={question}
           onChange={(e) => onQuestionChange(e.target.value)}
-          placeholder="Ask a research question…"
+          placeholder={followUp ? 'Ask a follow-up…' : 'Ask a research question…'}
           rows={3}
         />
         <div className="ask-form-footer">
-          <span className="ask-hint">Routes automatically to local docs, web search, or both</span>
+          <span className="ask-hint">
+            {followUp
+              ? 'Follow-ups understand the conversation so far'
+              : 'Routes automatically to local docs, web search, or both'}
+          </span>
           <button type="submit" disabled={loading || !question.trim()}>
             {loading ? (
               'Researching…'
@@ -47,22 +54,24 @@ export function AskCard({ question, onQuestionChange, onSubmit, loading }: AskCa
         </div>
       </form>
 
-      <div className="examples">
-        <span className="examples-label">Try an example</span>
-        <div className="example-chips">
-          {EXAMPLE_QUESTIONS.map((example) => (
-            <button
-              key={example.label}
-              type="button"
-              className="example-chip"
-              onClick={() => onQuestionChange(example.question)}
-              disabled={loading}
-            >
-              {example.label}
-            </button>
-          ))}
+      {!followUp && (
+        <div className="examples">
+          <span className="examples-label">Try an example</span>
+          <div className="example-chips">
+            {EXAMPLE_QUESTIONS.map((example) => (
+              <button
+                key={example.label}
+                type="button"
+                className="example-chip"
+                onClick={() => onQuestionChange(example.question)}
+                disabled={loading}
+              >
+                {example.label}
+              </button>
+            ))}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   )
 }

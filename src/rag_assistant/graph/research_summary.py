@@ -11,6 +11,9 @@ def build_research_summary(state: dict) -> ResearchSummary:
     node_timings = state.get("node_timings", [])
     return ResearchSummary(
         route=state.get("route"),
+        # `original_question` is only set when condense_question actually rewrote the
+        # question, at which point state["question"] holds the standalone form.
+        condensed_question=state.get("question") if state.get("original_question") else None,
         sub_queries=state.get("sub_queries", []),
         retrieval_counts=RetrievalCounts(
             vector=_doc_count(state.get("vector_results", [])),

@@ -7,10 +7,32 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _ALNUM_RE = re.compile(r"\w", re.UNICODE)
 
 
+class ChatTurn(BaseModel):
+    """One prior turn of the conversation, supplied by the client with each request -- the
+    server holds no session state, so the client owns the transcript and replays it. For
+    assistant turns, clients should send the answer text (not the full markdown report with
+    its transparency section) to keep follow-up condensation focused on content."""
+
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1, max_length=8000)
+
+
 class ResearchRequest(BaseModel):
-    """POST /research request body."""
+    """POST /research request body.
+
+    Conversation modes, in precedence order:
+    - `conversation_id` set: the server loads the transcript from its own store, answers
+      in-context, and appends the exchange (404 if the id is unknown; `history` is ignored).
+    - `conversation_id` unset, `save` true (the default): the server starts a new persisted
+      conversation and returns its id in the response for the client to reuse.
+    - `save` false: fully stateless -- the optional client-supplied `history` is used for
+      condensation/synthesis and nothing is stored.
+    """
 
     question: str = Field(..., min_length=1, max_length=2000)
+    history: list[ChatTurn] = Field(default_factory=list, max_length=20)
+    conversation_id: str | None = Field(default=None, max_length=64)
+    save: bool = True
 
     @field_validator("question")
     @classmethod
@@ -47,6 +69,9 @@ class ResearchSummary(BaseModel):
     prose."""
 
     route: str | None
+    # Set only when the question arrived as a follow-up and was rewritten into a standalone
+    # form -- lets the UI show "interpreted as: ..." next to what the user literally typed.
+    condensed_question: str | None = None
     sub_queries: list[str]
     retrieval_counts: RetrievalCounts
     fused_document_count: int
@@ -57,13 +82,33 @@ class ResearchSummary(BaseModel):
 
 
 class ResearchResponse(BaseModel):
-    """POST /research response body."""
+    """POST /research response body. `answer` is the synthesized answer text alone (no
+    transparency/citation appendix) -- the piece clients should replay as the assistant's
+    turn in `history` on follow-up requests."""
 
     question: str
     report: str
+    answer: str | None = None
     route: str | None
     confidence_score: float | None
     summary: ResearchSummary | None = None
+    # The persisted conversation this exchange was appended to (None when save=false).
+    # Clients pass it back as `conversation_id` to continue the conversation server-side.
+    conversation_id: str | None = None
+
+
+class IngestUrlRequest(BaseModel):
+    """POST /api/v1/ingest/url request body."""
+
+    url: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("url")
+    @classmethod
+    def _must_be_http(cls, value: str) -> str:
+        value = value.strip()
+        if not value.lower().startswith(("http://", "https://")):
+            raise ValueError("url must start with http:// or https://")
+        return value
 
 
 class IngestResponse(BaseModel):
@@ -104,7 +149,41 @@ class StreamEvent(BaseModel):
     node: str | None = None
     message: str | None = None
     report: str | None = None
+    answer: str | None = None
     route: str | None = None
     confidence_score: float | None = None
     summary: ResearchSummary | None = None
     detail: str | None = None
+    conversation_id: str | None = None
+
+
+class ConversationSummary(BaseModel):
+    """One row of GET /api/v1/conversations -- enough for a history sidebar."""
+
+    id: str
+    title: str
+    created_at: float
+    updated_at: float
+    message_count: int
+
+
+class ConversationMessage(BaseModel):
+    """One message of GET /api/v1/conversations/{id}. Assistant messages carry the full
+    report and research summary they were rendered with, so reopening a conversation
+    restores exactly what the user saw."""
+
+    role: Literal["user", "assistant"]
+    content: str
+    report: str | None = None
+    summary: ResearchSummary | None = None
+    created_at: float
+
+
+class ConversationDetail(BaseModel):
+    """GET /api/v1/conversations/{id} response body."""
+
+    id: str
+    title: str
+    created_at: float
+    updated_at: float
+    messages: list[ConversationMessage]

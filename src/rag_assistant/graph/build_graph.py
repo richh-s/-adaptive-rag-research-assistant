@@ -5,6 +5,7 @@ from typing import Callable
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
+from rag_assistant.graph.nodes.condense import condense_question
 from rag_assistant.graph.nodes.corrective_fallback import corrective_web_search
 from rag_assistant.graph.nodes.decompose import decompose_query, dispatch_retrieval
 from rag_assistant.graph.nodes.fuse import fuse_results
@@ -41,6 +42,7 @@ def _timed(node_name: str, node_fn: Callable[[dict], dict]) -> Callable[[dict], 
 def build_graph() -> CompiledStateGraph:
     graph = StateGraph(ResearchState)
 
+    graph.add_node("condense_question", _timed("condense_question", condense_question))
     graph.add_node("route_query", _timed("route_query", route_query))
     graph.add_node("decompose_query", _timed("decompose_query", decompose_query))
     graph.add_node("retrieve_vector", _timed("retrieve_vector", retrieve_vector))
@@ -52,7 +54,8 @@ def build_graph() -> CompiledStateGraph:
     graph.add_node("synthesize_answer", _timed("synthesize_answer", synthesize_answer))
     graph.add_node("format_report", _timed("format_report", format_report))
 
-    graph.add_edge(START, "route_query")
+    graph.add_edge(START, "condense_question")
+    graph.add_edge("condense_question", "route_query")
     graph.add_conditional_edges(
         "route_query",
         after_route,

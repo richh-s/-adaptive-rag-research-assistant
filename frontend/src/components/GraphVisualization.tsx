@@ -17,6 +17,7 @@ interface Stage {
 // Mirrors the node wiring in graph/build_graph.py. "retrieve" collapses the three
 // Send-fanned nodes into one visual step since they run concurrently for each sub-query.
 const STAGES: Stage[] = [
+  { key: 'condense_question', label: 'Resolve follow-up' },
   { key: 'route_query', label: 'Route question' },
   { key: 'decompose_query', label: 'Decompose into sub-queries' },
   { key: 'retrieve', label: 'Retrieve', group: ['retrieve_vector', 'retrieve_bm25', 'web_search'] },

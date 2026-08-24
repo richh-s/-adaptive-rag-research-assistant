@@ -6,10 +6,11 @@ from langchain_core.embeddings import Embeddings
 
 from rag_assistant import cache
 from rag_assistant.config import get_settings
+from rag_assistant.conversations import store as conversations_store
 
 
 @pytest.fixture(autouse=True)
-def _default_test_env(request, monkeypatch):
+def _default_test_env(request, monkeypatch, tmp_path):
     # `live` tests hit real APIs and need the real keys from .env/the environment,
     # so don't clobber them with fake values here.
     if request.node.get_closest_marker("live"):
@@ -18,15 +19,23 @@ def _default_test_env(request, monkeypatch):
     # Tests run fully offline by default -- no local Redis is assumed to be running, and
     # caching behavior itself is tested separately with an explicit fake client.
     monkeypatch.setenv("USE_CACHE", "false")
+    # Every test gets its own conversation store so persistence tests can't see each
+    # other's rows -- and no test ever writes into the developer's real conversations.db.
+    monkeypatch.setenv("CONVERSATIONS_DB_PATH", str(tmp_path / "conversations.db"))
+    # PDF vision ingestion would otherwise attempt real API calls whenever a test PDF has
+    # an image-only page; tests that exercise the vision path mock describe_image directly.
+    monkeypatch.setenv("PDF_VISION", "false")
 
 
 @pytest.fixture(autouse=True)
 def _clear_settings_cache():
     get_settings.cache_clear()
     cache.reset_client_cache()
+    conversations_store.reset_store_cache()
     yield
     get_settings.cache_clear()
     cache.reset_client_cache()
+    conversations_store.reset_store_cache()
 
 
 class FakeHashingEmbeddings(Embeddings):

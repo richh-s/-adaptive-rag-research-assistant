@@ -1,0 +1,74 @@
+.access-gate {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 16px;
+}
+
+.access-card {
+  width: 100%;
+  max-width: 380px;
+  padding: 28px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.access-card h2 {
+  font-size: 18px;
+  color: var(--text-h);
+  margin: 0;
+}
+
+.access-card p {
+  font-size: 13px;
+  color: var(--text);
+  margin: 0;
+  line-height: 1.5;
+}
+
+.access-card form {
+  display: flex;
+  gap: 8px;
+}
+
+.access-card input {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text-h);
+  font-size: 13px;
+}
+
+.access-card input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.access-card button {
+  padding: 9px 16px;
+  border: 1px solid var(--accent-border);
+  border-radius: 10px;
+  background: var(--accent-bg);
+  color: var(--accent-strong);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.access-card button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.access-error {
+  color: var(--danger);
+}

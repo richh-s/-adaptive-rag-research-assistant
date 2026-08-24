@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import signal
@@ -17,17 +19,24 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
+from rag_assistant import auth
 from rag_assistant.config import get_settings
+from rag_assistant.conversations import store as conversations
 from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.graph.research_summary import build_research_summary
 from rag_assistant.ingestion.build_index import build_index
 from rag_assistant.ingestion.loaders import SUPPORTED_SUFFIXES
 from rag_assistant.ingestion.tasks import create_task, get_task, update_task
+from rag_assistant.ingestion.url_fetch import UrlIngestError, fetch_page, page_to_markdown
 from rag_assistant.logging_conf import configure_logging
 from rag_assistant.readiness import check_chroma, check_web_search
 from rag_assistant.schemas.api import (
+    ConversationDetail,
+    ConversationMessage,
+    ConversationSummary,
     IngestResponse,
     IngestTaskStatus,
+    IngestUrlRequest,
     ResearchRequest,
     ResearchResponse,
     StreamEvent,
@@ -36,6 +45,18 @@ from rag_assistant.tracing import get_trace_id, new_trace_id, trace_id_var
 
 configure_logging()
 logger = logging.getLogger(__name__)
+
+# Error tracking is opt-in: a blank SENTRY_DSN (the default) means no Sentry import, no
+# network calls, no behavior change -- set the DSN in production and unhandled exceptions
+# (including ones inside graph nodes) get captured with the request's context.
+if get_settings().sentry_dsn:
+    import sentry_sdk
+
+    sentry_sdk.init(
+        dsn=get_settings().sentry_dsn,
+        environment=get_settings().app_env,
+        traces_sample_rate=0.0,
+    )
 
 # Graceful shutdown: SIGTERM sets `_shutdown_event`, which every active SSE stream polls each
 # loop iteration so it can send a "close" frame and return cleanly instead of being cut off
@@ -56,6 +77,12 @@ _active_streams: "weakref.WeakSet[_StreamConnection]" = weakref.WeakSet()
 def _handle_sigterm() -> None:
     logger.info("SIGTERM received; signaling %d active stream(s) to close", len(_active_streams))
     _shutdown_event.set()
+    # Registering this handler REPLACED uvicorn's own SIGTERM handling, so without forwarding,
+    # a SIGTERM would leave the process alive but permanently poisoned: `_shutdown_event` never
+    # clears, so every future /research/stream instantly emits a "close" frame while /health
+    # keeps answering 200 -- a half-dead server. Re-raise as SIGINT (whose uvicorn handler we
+    # did not touch) so uvicorn still runs its normal graceful shutdown and actually exits.
+    signal.raise_signal(signal.SIGINT)
 
 
 @asynccontextmanager
@@ -78,12 +105,25 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
-# Per-IP limiter (rate_limit_rpm) and a second limiter keyed on a constant so its bucket is
-# shared across every caller (rate_limit_rpm_global) -- together these cap both "one client
+# Per-caller limiter (rate_limit_rpm) and a second limiter keyed on a constant so its bucket
+# is shared across every caller (rate_limit_rpm_global) -- together these cap both "one client
 # hammering us" and "aggregate load regardless of client" per the production-readiness spec.
 # Limit strings are read from settings on every request (not frozen at import time) so tests
 # that override RATE_LIMIT_RPM/RATE_LIMIT_RPM_GLOBAL via env vars take effect.
-limiter = Limiter(key_func=get_remote_address)
+#
+# Caller identity: authenticated requests are keyed by (a hash of) their API key, so each
+# tenant gets its own budget regardless of network path; anonymous requests fall back to
+# client IP. Behind a proxy/load balancer the IP is only meaningful when uvicorn runs with
+# --proxy-headers and --forwarded-allow-ips (see Dockerfile CMD) -- without that, every
+# visitor arrives as the LB's address and shares one bucket.
+def _caller_identity(request: Request) -> str:
+    key = auth.extract_key({k.lower(): v for k, v in request.scope.get("headers", [])})
+    if key:
+        return "key:" + hashlib.sha256(key.encode()).hexdigest()[:16]
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=_caller_identity)
 global_limiter = Limiter(key_func=lambda request: "global")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -147,6 +187,53 @@ class TraceIdMiddleware:
             trace_id_var.reset(token)
 
 
+class AuthMiddleware:
+    """Raw ASGI middleware (same rationale as TraceIdMiddleware: BaseHTTPMiddleware buffers
+    SSE responses). Guards every data/LLM endpoint; liveness (/health, /ready), the API docs,
+    and the static frontend stay open. With API_KEYS unset this resolves every request to the
+    "public" tenant and never rejects -- open demo mode. OPTIONS passes through so CORS
+    preflights (which never carry credentials) reach the CORS layer."""
+
+    PROTECTED_PREFIXES = ("/research", "/api/v1/")
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or scope["method"] == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if not path.startswith(self.PROTECTED_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        owner = auth.resolve_owner(auth.extract_key(headers))
+        if owner is None:
+            body = json.dumps({"detail": "Missing or invalid API key."}).encode()
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"www-authenticate", b"Bearer"),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+
+        token = auth.owner_var.set(owner)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            auth.owner_var.reset(token)
+
+
+app.add_middleware(AuthMiddleware)
 app.add_middleware(TraceIdMiddleware)
 
 # Building the graph only wires node functions together -- no API calls happen until
@@ -166,6 +253,7 @@ _ACCUMULATING_KEYS = {"vector_results", "bm25_results", "web_results", "node_tim
 # each fire multiple times (once per sub-query) and `fuse_results` can fire twice (corrective
 # retry loop), so this lookup must stay stateless per event rather than assume 1 event/node.
 NODE_MESSAGES: dict[str, str] = {
+    "condense_question": "Resolving follow-up references...",
     "route_query": "Routing question...",
     "decompose_query": "Decomposing into sub-queries...",
     "retrieve_vector": "Retrieving from local knowledge base...",
@@ -321,6 +409,51 @@ async def ingest_document(
     )
 
 
+@app.post("/api/v1/ingest/url", response_model=IngestResponse, status_code=202)
+@limiter.limit(_per_ip_limit)
+@global_limiter.limit(_global_limit)
+def ingest_url(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    body: IngestUrlRequest,
+) -> IngestResponse:
+    """Fetches a public web page, saves its extracted text into `corpus_dir` as markdown, and
+    schedules the same background re-index as a file upload. Sync handler on purpose: FastAPI
+    runs it in the threadpool, and the fetch (bounded by FETCH_TIMEOUT_SECONDS) happens before
+    the 202 goes out so an unreachable/blocked/empty URL fails the request itself instead of
+    a background task the client would have to poll to discover."""
+    try:
+        page = fetch_page(body.url)
+    except UrlIngestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("url ingestion failed for url=%r", body.url)
+        raise HTTPException(status_code=500, detail="Failed to fetch the URL.") from exc
+
+    settings = get_settings()
+    settings.corpus_dir.mkdir(parents=True, exist_ok=True)
+
+    stem_source = page.title or Path(str(page.url)).name or "webpage"
+    dest_name = f"{_safe_stem(stem_source)[:60]}_{uuid.uuid4().hex[:8]}.md"
+    dest_path = settings.corpus_dir / dest_name
+    markdown = page_to_markdown(page)
+    dest_path.write_text(markdown, encoding="utf-8")
+
+    logger.info("url ingested", extra={"dest_name": dest_name, "url": page.url})
+
+    task = create_task(filename=dest_name, original_filename=body.url)
+    background_tasks.add_task(_run_ingest_in_background, get_trace_id(), task.task_id)
+
+    return IngestResponse(
+        task_id=task.task_id,
+        filename=dest_name,
+        original_filename=body.url,
+        size_bytes=len(markdown.encode("utf-8")),
+        status="queued",
+        message="Page fetched; indexing has started in the background.",
+    )
+
+
 @app.get("/api/v1/ingest/{task_id}", response_model=IngestTaskStatus)
 async def get_ingest_task_status(task_id: str) -> IngestTaskStatus:
     """Polled by the frontend every ~1-2s while a drawer entry is non-terminal. Deliberately
@@ -344,29 +477,77 @@ async def get_ingest_task_status(task_id: str) -> IngestTaskStatus:
     )
 
 
+def _resolve_history(body: ResearchRequest) -> list[dict]:
+    """Server-side history wins: with a conversation_id the transcript comes from the store
+    (the client can't forge or truncate it); otherwise the client-supplied stateless
+    `history` is used as-is. 404s on unknown ids *before* any LLM spend."""
+    if body.conversation_id is None:
+        return [turn.model_dump() for turn in body.history]
+    if conversations.get_conversation(body.conversation_id, owner=auth.get_owner()) is None:
+        raise HTTPException(status_code=404, detail="Unknown conversation.")
+    return conversations.get_history(body.conversation_id)
+
+
+def _persist_exchange(body: ResearchRequest, final_state: dict) -> str | None:
+    """Appends the completed exchange to its conversation (creating one titled after the
+    first question when the client didn't supply an id), or does nothing with save=false.
+    Persistence failures are logged, not raised -- the user already has their answer, and
+    losing one history entry beats turning a successful research call into a 500."""
+    if body.conversation_id is None and not body.save:
+        return None
+    try:
+        conversation_id = body.conversation_id
+        if conversation_id is None:
+            conversation_id = conversations.create_conversation(
+                title=body.question, owner=auth.get_owner()
+            ).id
+        summary = build_research_summary(final_state)
+        conversations.append_turn(
+            conversation_id,
+            question=body.question,
+            answer=final_state.get("final_answer") or final_state.get("research_report", ""),
+            report=final_state.get("research_report"),
+            summary=summary.model_dump(),
+        )
+        return conversation_id
+    except Exception:
+        logger.exception("failed to persist conversation exchange")
+        return body.conversation_id
+
+
 @app.post("/research", response_model=ResearchResponse)
 @limiter.limit(_per_ip_limit)
 @global_limiter.limit(_global_limit)
 def research(request: Request, body: ResearchRequest) -> ResearchResponse:
+    history = _resolve_history(body)
     try:
         result = _graph.invoke(
-            {"question": body.question, "trace_id": get_trace_id()},
+            {
+                "question": body.question,
+                "chat_history": history,
+                "trace_id": get_trace_id(),
+            },
             config={"recursion_limit": _RECURSION_LIMIT},
         )
     except Exception as exc:
         logger.exception("research failed for question=%r", body.question)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    conversation_id = _persist_exchange(body, result)
+
     return ResearchResponse(
         question=body.question,
         report=result["research_report"],
+        answer=result.get("final_answer"),
         route=result.get("route"),
         confidence_score=result.get("confidence_score"),
         summary=build_research_summary(result),
+        conversation_id=conversation_id,
     )
 
 
-async def _stream_research_events(question: str) -> AsyncIterator[str]:
+async def _stream_research_events(body: ResearchRequest, history: list[dict]) -> AsyncIterator[str]:
+    question = body.question
     # Once this generator has started, the response is already HTTP 200 with headers flushed
     # -- there is no way to surface an HTTP error status mid-stream. Every failure, including
     # ones from deep inside a graph node (e.g. quota exhaustion), must degrade to a "type":
@@ -377,7 +558,11 @@ async def _stream_research_events(question: str) -> AsyncIterator[str]:
     try:
         final_state: dict = {}
         graph_iter = _graph.astream(
-            {"question": question, "trace_id": get_trace_id()},
+            {
+                "question": question,
+                "chat_history": history,
+                "trace_id": get_trace_id(),
+            },
             config={"recursion_limit": _RECURSION_LIMIT},
             stream_mode="updates",
         ).__aiter__()
@@ -413,12 +598,16 @@ async def _stream_research_events(question: str) -> AsyncIterator[str]:
                 )
                 yield f"data: {event.model_dump_json()}\n\n"
 
+        conversation_id = _persist_exchange(body, final_state)
+
         done_event = StreamEvent(
             type="done",
             report=final_state.get("research_report", ""),
+            answer=final_state.get("final_answer"),
             route=final_state.get("route"),
             confidence_score=final_state.get("confidence_score"),
             summary=build_research_summary(final_state),
+            conversation_id=conversation_id,
         )
         yield f"data: {done_event.model_dump_json()}\n\n"
     except Exception as exc:
@@ -434,8 +623,76 @@ async def _stream_research_events(question: str) -> AsyncIterator[str]:
 @limiter.limit(_per_ip_limit)
 @global_limiter.limit(_global_limit)
 async def research_stream(request: Request, body: ResearchRequest) -> StreamingResponse:
+    # History (and the conversation_id 404) resolves before streaming starts -- once the
+    # generator yields, the status is locked at 200 and errors can only be SSE frames.
+    history = _resolve_history(body)
     return StreamingResponse(
-        _stream_research_events(body.question),
+        _stream_research_events(body, history),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# Conversation CRUD. Like the ingest task-status endpoint, these are cheap local DB reads
+# polled/loaded freely by the UI, so they sit outside the LLM-sized rate-limit budgets.
+
+
+@app.get("/api/v1/auth/check")
+def auth_check() -> dict:
+    """Reached only with a valid key (or with auth disabled) -- the middleware rejects the
+    rest. The frontend calls this at startup to decide whether to show the access gate."""
+    return {"ok": True, "auth_required": auth.auth_enabled(), "owner": auth.get_owner()}
+
+
+@app.get("/api/v1/conversations", response_model=list[ConversationSummary])
+def list_conversations() -> list[ConversationSummary]:
+    return [
+        ConversationSummary(
+            id=c.id,
+            title=c.title,
+            created_at=c.created_at,
+            updated_at=c.updated_at,
+            message_count=c.message_count,
+        )
+        for c in conversations.list_conversations(owner=auth.get_owner())
+    ]
+
+
+@app.get("/api/v1/conversations/{conversation_id}", response_model=ConversationDetail)
+def get_conversation(conversation_id: str) -> ConversationDetail:
+    conversation = conversations.get_conversation(conversation_id, owner=auth.get_owner())
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Unknown conversation.")
+    return ConversationDetail(
+        id=conversation.id,
+        title=conversation.title,
+        created_at=conversation.created_at,
+        updated_at=conversation.updated_at,
+        messages=[
+            ConversationMessage(
+                role=m.role,
+                content=m.content,
+                report=m.report,
+                summary=m.summary,
+                created_at=m.created_at,
+            )
+            for m in conversations.get_messages(conversation_id)
+        ],
+    )
+
+
+@app.delete("/api/v1/conversations/{conversation_id}", status_code=204)
+def delete_conversation(conversation_id: str) -> None:
+    if not conversations.delete_conversation(conversation_id, owner=auth.get_owner()):
+        raise HTTPException(status_code=404, detail="Unknown conversation.")
+
+
+# Single-container deployments (Docker image, Render) bake the built frontend into the image
+# and point STATIC_DIR at it, so the API serves the whole app from one origin. Mounted last:
+# Starlette matches routes in registration order, so every API route above still wins, and
+# `html=True` makes "/" serve index.html. In development this is a no-op (STATIC_DIR unset).
+_static_dir = get_settings().static_dir
+if _static_dir is not None and _static_dir.is_dir():
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/", StaticFiles(directory=_static_dir, html=True), name="frontend")

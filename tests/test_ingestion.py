@@ -120,3 +120,141 @@ def test_split_documents_produces_nonempty_chunks(sample_corpus_dir):
     assert len(chunks) > len(docs)
     assert all(chunk.page_content.strip() for chunk in chunks)
     assert all(chunk.metadata["source"] in {"anthropic.md", "mistral.md"} for chunk in chunks)
+
+
+def test_load_documents_extracts_text_and_tables_from_docx(sample_corpus_dir):
+    import docx
+
+    document = docx.Document()
+    document.add_paragraph("Quarterly revenue grew 40 percent.")
+    table = document.add_table(rows=1, cols=2)
+    table.rows[0].cells[0].text = "Region"
+    table.rows[0].cells[1].text = "EMEA"
+    document.save(str(sample_corpus_dir / "report.docx"))
+
+    docs = load_documents(sample_corpus_dir)
+
+    docx_docs = [d for d in docs if d.metadata["source"] == "report.docx"]
+    assert len(docx_docs) == 1
+    assert "Quarterly revenue grew 40 percent." in docx_docs[0].page_content
+    assert "Region | EMEA" in docx_docs[0].page_content
+
+
+def test_load_documents_extracts_visible_text_from_html(sample_corpus_dir):
+    (sample_corpus_dir / "page.html").write_text(
+        "<html><head><title>My Page</title><style>body{color:red}</style></head>"
+        "<body><nav>menu</nav><p>Visible article text.</p>"
+        "<script>alert('x')</script></body></html>"
+    )
+
+    docs = load_documents(sample_corpus_dir)
+
+    html_docs = [d for d in docs if d.metadata["source"] == "page.html"]
+    assert len(html_docs) == 1
+    assert "Visible article text." in html_docs[0].page_content
+    assert "alert" not in html_docs[0].page_content
+    assert "menu" not in html_docs[0].page_content
+    assert html_docs[0].metadata["title"] == "My Page"
+
+
+def test_load_documents_skips_empty_html(sample_corpus_dir):
+    (sample_corpus_dir / "empty.html").write_text("<html><body><script>x()</script></body></html>")
+
+    docs = load_documents(sample_corpus_dir)
+
+    assert all(d.metadata["source"] != "empty.html" for d in docs)
+
+
+def _png_bytes(width: int = 200, height: int = 150) -> bytes:
+    """Minimal solid-color PNG via pymupdf -- no PIL dependency needed."""
+    import pymupdf
+
+    pixmap = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, width, height))
+    pixmap.clear_with(120)
+    return pixmap.tobytes("png")
+
+
+def _pdf_with_image(path, width: int = 200, height: int = 150, with_text: bool = True) -> None:
+    """Builds a real PDF containing an embedded raster image (and optionally text)."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page()
+    if with_text:
+        page.insert_text((72, 72), "Quarterly report text.")
+    page.insert_image(pymupdf.Rect(72, 100, 72 + width, 100 + height), stream=_png_bytes(width, height))
+    doc.save(str(path))
+    doc.close()
+
+
+def test_pdf_figures_are_described_when_vision_enabled(sample_corpus_dir, monkeypatch):
+    monkeypatch.setenv("PDF_VISION", "true")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        "rag_assistant.ingestion.vision.describe_image",
+        lambda image_bytes, media_type, prompt: "Bar chart of revenue by region.",
+    )
+
+    _pdf_with_image(sample_corpus_dir / "report.pdf")
+    docs = load_documents(sample_corpus_dir)
+
+    pdf_docs = [d for d in docs if d.metadata["source"] == "report.pdf"]
+    assert len(pdf_docs) == 1
+    assert "Quarterly report text." in pdf_docs[0].page_content
+    assert "[Figure on page 1: Bar chart of revenue by region.]" in pdf_docs[0].page_content
+
+
+def test_pdf_tiny_images_are_not_described(sample_corpus_dir, monkeypatch):
+    monkeypatch.setenv("PDF_VISION", "true")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+    calls = []
+    monkeypatch.setattr(
+        "rag_assistant.ingestion.vision.describe_image",
+        lambda image_bytes, media_type, prompt: calls.append(1) or "icon",
+    )
+
+    # 40x40 is below MIN_IMAGE_DIMENSION_PX -- logo/icon territory.
+    _pdf_with_image(sample_corpus_dir / "logo.pdf", width=40, height=40)
+    docs = load_documents(sample_corpus_dir)
+
+    assert calls == []
+    logo_docs = [d for d in docs if d.metadata["source"] == "logo.pdf"]
+    assert "[Figure" not in logo_docs[0].page_content
+
+
+def test_scanned_pdf_is_transcribed_when_vision_enabled(sample_corpus_dir, monkeypatch):
+    monkeypatch.setenv("PDF_VISION", "true")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+    from rag_assistant.ingestion import vision as vision_module
+
+    def _fake_describe(image_bytes, media_type, prompt):
+        if prompt is vision_module.SCANNED_PAGE_PROMPT:
+            return "INVOICE #42 -- Total due: $1,300"
+        return "figure description"
+
+    monkeypatch.setattr("rag_assistant.ingestion.vision.describe_image", _fake_describe)
+
+    # Image-only page: no text layer at all, like a scan.
+    _pdf_with_image(sample_corpus_dir / "scan.pdf", width=400, height=500, with_text=False)
+    docs = load_documents(sample_corpus_dir)
+
+    scan_docs = [d for d in docs if d.metadata["source"] == "scan.pdf"]
+    assert len(scan_docs) == 1
+    assert "INVOICE #42" in scan_docs[0].page_content
+
+
+def test_image_only_pdf_still_skipped_when_vision_disabled(sample_corpus_dir):
+    # PDF_VISION=false (conftest default): behavior matches the pre-vision loader.
+    _pdf_with_image(sample_corpus_dir / "scan2.pdf", with_text=False)
+    docs = load_documents(sample_corpus_dir)
+
+    assert all(d.metadata["source"] != "scan2.pdf" for d in docs)

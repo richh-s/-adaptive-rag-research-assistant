@@ -27,6 +27,18 @@ class RouteDecision(BaseModel):
     reasoning: str = Field(description="One sentence explaining the routing choice.")
 
 
+class CondensedQuestion(BaseModel):
+    """Structured output for the follow-up condensation node."""
+
+    standalone_question: str = Field(
+        description=(
+            "The user's latest message rewritten as one fully self-contained question, with "
+            "every pronoun/reference resolved from the conversation. Unchanged if it was "
+            "already self-contained."
+        )
+    )
+
+
 class SubQueries(BaseModel):
     """Structured output for the decomposition node."""
 

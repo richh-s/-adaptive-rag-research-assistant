@@ -19,7 +19,7 @@ def test_empty_retrieval_uses_empty_retrieval_prompt(monkeypatch):
     )
 
     fake_llm.invoke.assert_called_once_with(
-        EMPTY_RETRIEVAL_PROMPT.format(question="What is the price of Bitcoin?")
+        EMPTY_RETRIEVAL_PROMPT.format(question="What is the price of Bitcoin?", history_block="")
     )
     assert result == {"final_answer": "No sources found.", "citations": []}
 

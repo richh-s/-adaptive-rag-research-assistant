@@ -1,3 +1,6 @@
+# {history_block} is either empty (first turn) or a "Conversation so far" section built by
+# synthesize.py -- it exists so follow-up answers read as a continuation ("Yes, and beyond
+# that...") instead of re-introducing the topic from scratch every turn.
 SYNTHESIS_PROMPT = """Answer the question using ONLY the numbered context below. Cite sources \
 inline using their marker, e.g. [1], right after the claim it supports.
 
@@ -5,7 +8,7 @@ Write in plain, direct language for a non-technical reader, as if you simply kno
 -- never refer to "the context", "the provided documents", or similar meta-commentary about your \
 own sources. If some part of the question isn't covered, say plainly what you don't know (e.g. \
 "I don't have information on X") instead of describing what the documents do or don't contain.
-
+{history_block}
 Question: {question}
 
 Context:
@@ -14,7 +17,7 @@ Context:
 
 NO_CONTEXT_PROMPT = """Answer the question directly using your own general knowledge. This \
 question did not require any document or web retrieval.
-
+{history_block}
 Question: {question}
 """
 
@@ -23,6 +26,6 @@ question but returned no usable results. Start your answer by clearly stating th
 sources were found. Only then, if you are genuinely confident, you may add an answer from your \
 own general knowledge -- explicitly flagged as unverified/not grounded in retrieved sources. If \
 you are not confident, say so instead of guessing.
-
+{history_block}
 Question: {question}
 """

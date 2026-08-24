@@ -407,11 +407,17 @@ def test_ingest_task_status_reflects_failure(monkeypatch, tmp_path):
     assert body["error"] == "embedding provider unavailable"
 
 
-def test_sigterm_handler_sets_shutdown_event():
+def test_sigterm_handler_sets_shutdown_event_and_forwards_shutdown(monkeypatch):
+    # The handler re-raises SIGINT so uvicorn actually exits (see _handle_sigterm's comment);
+    # stub the raise so the forwarding is asserted without interrupting the test process.
+    forwarded = []
+    monkeypatch.setattr(api.signal, "raise_signal", lambda sig: forwarded.append(sig))
+
     assert not api._shutdown_event.is_set()
     try:
         api._handle_sigterm()
         assert api._shutdown_event.is_set()
+        assert forwarded == [api.signal.SIGINT]
     finally:
         api._shutdown_event.clear()
 
@@ -454,3 +460,71 @@ def test_research_stream_yields_error_event_on_failure(monkeypatch):
     assert events[0]["type"] == "progress"
     assert events[-1]["type"] == "error"
     assert "Missing or invalid configuration." in events[-1]["detail"]
+
+
+def test_research_passes_history_into_graph_state(monkeypatch):
+    captured = {}
+
+    def _fake_invoke(state, config=None):
+        captured["chat_history"] = state.get("chat_history")
+        return {"research_report": "ok", "route": "vector", "confidence_score": 0.9}
+
+    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    client = TestClient(api.app)
+
+    history = [
+        {"role": "user", "content": "Tell me about Anthropic."},
+        {"role": "assistant", "content": "Anthropic is an AI safety company."},
+    ]
+    response = client.post(
+        "/research", json={"question": "what about their models?", "history": history}
+    )
+
+    assert response.status_code == 200
+    assert captured["chat_history"] == history
+
+
+def test_research_defaults_to_empty_history(monkeypatch):
+    captured = {}
+
+    def _fake_invoke(state, config=None):
+        captured["chat_history"] = state.get("chat_history")
+        return {"research_report": "ok", "route": "vector", "confidence_score": 0.9}
+
+    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    client = TestClient(api.app)
+
+    response = client.post("/research", json={"question": "anything"})
+
+    assert response.status_code == 200
+    assert captured["chat_history"] == []
+
+
+def test_research_rejects_invalid_history_role(monkeypatch):
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/research",
+        json={"question": "q", "history": [{"role": "system", "content": "x"}]},
+    )
+
+    assert response.status_code == 422
+
+
+def test_research_response_includes_plain_answer(monkeypatch):
+    monkeypatch.setattr(
+        api._graph,
+        "invoke",
+        lambda state, config=None: {
+            "research_report": "# Report\nanswer plus transparency",
+            "final_answer": "answer only",
+            "route": "vector",
+            "confidence_score": 0.9,
+        },
+    )
+    client = TestClient(api.app)
+
+    response = client.post("/research", json={"question": "q"})
+
+    assert response.status_code == 200
+    assert response.json()["answer"] == "answer only"

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from 'react'
-import { getIngestStatus, ingestFile, ResearchApiError, type IngestStage } from '../api/client'
+import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent } from 'react'
+import { getIngestStatus, ingestFile, ingestUrl, ResearchApiError, type IngestStage } from '../api/client'
 import './CorpusManager.css'
 
 interface CorpusManagerProps {
@@ -16,7 +16,7 @@ interface UploadEntry {
   message?: string
 }
 
-const ACCEPTED_EXTENSIONS = ['.pdf', '.md', '.txt']
+const ACCEPTED_EXTENSIONS = ['.pdf', '.md', '.txt', '.docx', '.html', '.htm']
 
 const IN_PROGRESS_STAGES: ReadonlySet<UploadStage> = new Set(['uploading', 'queued', 'parsing', 'indexing'])
 
@@ -48,6 +48,8 @@ function makeUploadId(filename: string): string {
 export function CorpusManager({ open, onClose }: CorpusManagerProps) {
   const [dragActive, setDragActive] = useState(false)
   const [uploads, setUploads] = useState<UploadEntry[]>([])
+  const [urlValue, setUrlValue] = useState('')
+  const [urlSubmitting, setUrlSubmitting] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const mountedRef = useRef(true)
   const pollTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
@@ -134,6 +136,30 @@ export function CorpusManager({ open, onClose }: CorpusManagerProps) {
     [pollTask, updateUpload],
   )
 
+  async function handleUrlSubmit(e: FormEvent) {
+    e.preventDefault()
+    const url = urlValue.trim()
+    if (!url || urlSubmitting) return
+
+    const id = makeUploadId(url)
+    setUrlSubmitting(true)
+    setUploads((prev) => [{ id, filename: url, stage: 'uploading', message: 'Fetching page...' }, ...prev])
+
+    try {
+      const result = await ingestUrl(url)
+      if (!mountedRef.current) return
+      setUrlValue('')
+      updateUpload(id, { stage: 'queued', message: result.message })
+      pollTask(id, result.task_id, Date.now())
+    } catch (err) {
+      if (!mountedRef.current) return
+      const message = err instanceof ResearchApiError ? err.message : 'Could not fetch the URL.'
+      updateUpload(id, { stage: 'failed', message })
+    } finally {
+      if (mountedRef.current) setUrlSubmitting(false)
+    }
+  }
+
   function handleFiles(files: FileList | null) {
     if (!files) return
     Array.from(files).forEach((file) => void uploadFile(file))
@@ -177,9 +203,23 @@ export function CorpusManager({ open, onClose }: CorpusManagerProps) {
         </div>
 
         <p className="corpus-subtitle">
-          Upload PDF, Markdown, or text files to add them to the local knowledge base. Each file
-          is saved immediately and indexed in the background.
+          Upload documents or paste a web page URL to add them to the local knowledge base. Each
+          source is saved immediately and indexed in the background.
         </p>
+
+        <form className="url-form" onSubmit={handleUrlSubmit}>
+          <input
+            type="url"
+            value={urlValue}
+            onChange={(e) => setUrlValue(e.target.value)}
+            placeholder="https://example.com/article"
+            aria-label="Web page URL to ingest"
+            disabled={urlSubmitting}
+          />
+          <button type="submit" disabled={urlSubmitting || !urlValue.trim()}>
+            {urlSubmitting ? 'Fetching...' : 'Add page'}
+          </button>
+        </form>
 
         <div
           className={`dropzone ${dragActive ? 'dropzone-active' : ''}`}
@@ -194,12 +234,12 @@ export function CorpusManager({ open, onClose }: CorpusManagerProps) {
           tabIndex={0}
         >
           <span className="dropzone-title">Drop files here or click to browse</span>
-          <span className="dropzone-hint">PDF, Markdown (.md), or text (.txt)</span>
+          <span className="dropzone-hint">PDF, Word (.docx), HTML, Markdown (.md), or text (.txt)</span>
           <input
             ref={inputRef}
             type="file"
             multiple
-            accept=".pdf,.md,.txt"
+            accept=".pdf,.md,.txt,.docx,.html,.htm"
             onChange={handleInputChange}
             hidden
           />

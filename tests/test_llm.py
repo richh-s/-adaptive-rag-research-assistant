@@ -67,3 +67,25 @@ def test_get_structured_llm_falls_back_to_gemini_without_anthropic_key(monkeypat
     runnable = llm.get_structured_llm(RouteDecision)
 
     assert not isinstance(runnable, RunnableWithFallbacks)
+
+
+def test_get_chat_model_is_anthropic_only_when_google_key_blank(monkeypatch):
+    """A valid Anthropic key with a blank Google key must yield a working chat model, not
+    crash constructing the Gemini fallback (its client validates the key at __init__)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    monkeypatch.setenv("GOOGLE_API_KEY", "")
+
+    model = llm.get_chat_model()
+
+    assert isinstance(model, ChatAnthropic)
+
+
+def test_get_structured_llm_is_anthropic_only_when_google_key_blank(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    monkeypatch.setenv("GOOGLE_API_KEY", "")
+
+    from rag_assistant.schemas.models import RouteDecision
+
+    runnable = llm.get_structured_llm(RouteDecision)
+
+    assert not isinstance(runnable, RunnableWithFallbacks)

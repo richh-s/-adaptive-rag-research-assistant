@@ -26,11 +26,27 @@ def grade_and_score(state: ResearchState) -> dict:
         and state["route"] == "vector"
         and not state.get("correction_attempted", False)
     )
-    return {
+    result = {
         "doc_grades": grades,
         "confidence_score": confidence,
         "needs_correction": needs_correction,
     }
+
+    # Grade-informed rerank/prune: the grades were paid for to compute confidence, so reuse
+    # them to clean up the synthesis context for free -- graded-relevant docs move to the
+    # front ordered by grade score (a semantic judgment, sharper than RRF's rank-consensus),
+    # graded-irrelevant docs are dropped so they can't pollute the answer or earn a citation,
+    # and ungraded tail docs keep their RRF order behind the graded ones. Skipped when
+    # nothing was graded relevant (dropping everything would leave synthesis with an empty
+    # context that reads as "retrieval found nothing") and when a corrective pass is about to
+    # rerun fuse_results and overwrite fused_documents anyway.
+    all_docs = state.get("fused_documents", [])
+    if relevant_scores and not needs_correction:
+        graded_pairs = [(doc, g) for doc, g in zip(all_docs[: len(grades)], grades) if g.relevant]
+        graded_pairs.sort(key=lambda pair: pair[1].score, reverse=True)
+        result["fused_documents"] = [doc for doc, _ in graded_pairs] + all_docs[len(grades):]
+
+    return result
 
 
 def after_grade(state: ResearchState) -> str:

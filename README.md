@@ -1,11 +1,13 @@
 # Adaptive RAG Research Assistant
 
-Ask a research question. The system autonomously decides whether to retrieve from a local
-document store, search the web, or both, decomposes compound questions into sub-queries,
-retrieves with both dense (vector) and sparse (BM25) search, fuses results across every
-retrieval path, checks its own confidence, and falls back to web search when the local
-knowledge base comes up short — then synthesizes a cited, transparency-reported answer,
-streamed live to the browser as each step of the pipeline runs.
+Ask a research question — then keep the conversation going with follow-ups. The system
+resolves follow-up references against the chat history, autonomously decides whether to
+retrieve from a local document store, search the web, or both, decomposes compound questions
+into sub-queries, retrieves with both dense (vector) and sparse (BM25) search, fuses results
+across every retrieval path, checks its own confidence, and falls back to web search when the
+local knowledge base comes up short — then synthesizes a cited, transparency-reported answer,
+streamed live to the browser as each step of the pipeline runs. The knowledge base ingests
+PDF, Word, HTML, Markdown, and text files, or any public web page by URL.
 
 Built with LangGraph, Chroma, and DuckDuckGo web search. Chat/reasoning defaults to Anthropic's Claude when an
 `ANTHROPIC_API_KEY` is set, with automatic fallback to Google Gemini (free tier) on error;
@@ -20,6 +22,15 @@ blank to run entirely on Gemini's free tier.
 
 ## Concepts demonstrated
 
+- **Conversational memory / follow-up condensation** — a `condense_question` node rewrites
+  follow-ups ("what about their pricing?") into standalone questions before routing, preserving
+  what the user literally typed for the transparency panel ("interpreted as: ..."). Synthesis
+  also sees recent turns, so answers read as a continuation instead of restarting the topic.
+- **Persistent conversations** — every exchange is stored server-side (SQLite, WAL) under a
+  conversation id: the server owns the transcript (clients can't forge or truncate history),
+  conversations survive restarts, and `GET/DELETE /api/v1/conversations[/{id}]` powers a
+  history sidebar in the UI where any conversation can be reopened and continued. Stateless
+  callers can pass `save: false` (with an optional inline `history`) to opt out entirely.
 - **Agentic / Self-RAG routing** — an LLM router decides per-query whether to hit the local
   knowledge base, the web, both, or neither, before any retrieval happens.
 - **Query decomposition** — compound questions are broken into focused, self-contained
@@ -33,6 +44,10 @@ blank to run entirely on Gemini's free tier.
 - **Confidence scoring / Corrective-RAG** — retrieved documents are graded for relevance; when
   confidence on a vector-only route falls below threshold, the system automatically falls back to
   a web search before answering.
+- **Grade-informed reranking** — the relevance grades bought for confidence scoring are reused
+  (zero extra LLM calls) to rerank the synthesis context: graded-relevant documents move to the
+  front ordered by semantic relevance, graded-irrelevant ones are pruned so they can't pollute
+  the answer or earn a citation.
 - **Citation-mapped synthesis** — citation markers are assigned deterministically from fused rank
   order in code, not left to the LLM to invent.
 - **LangGraph orchestration** — the whole pipeline is a `StateGraph` with conditional edges and
@@ -55,6 +70,18 @@ blank to run entirely on Gemini's free tier.
 - **Incremental indexing** — `rag-assistant ingest` hashes file contents against a manifest and
   only re-embeds changed or new files, removing chunks for deleted files, instead of rebuilding
   the whole collection every run (`--full` forces a clean rebuild).
+- **Multi-format + URL ingestion** — the corpus accepts PDF (page-aware, markdown-preserving),
+  Word (.docx, paragraphs and tables), HTML, Markdown, and plain text, via CLI, drag-and-drop
+  upload, or `POST /api/v1/ingest/url`, which fetches any public web page server-side with an
+  SSRF guard (every hostname — including each redirect hop's — is resolved and refused if it
+  lands on a private/loopback/link-local address) and a streamed size cap.
+- **Multimodal PDF ingestion (vision)** — charts, diagrams, and photos embedded in PDFs are
+  described by the chat provider's vision capability and indexed as `[Figure on page N: ...]`
+  blocks beside the page text, so data that exists only as pixels ("EMEA revenue $2.1M" in a
+  bar chart) becomes retrievable and citable; pages with no text layer at all (scans) are
+  rendered and transcribed by the same mechanism — OCR without an OCR dependency. One vision
+  call per figure/scanned page at ingest time, never at query time; size/count budgets cap
+  cost, and `PDF_VISION=false` disables it.
 - **Live graph execution visualization** — the web UI renders the LangGraph pipeline as a stepper
   that highlights each node as it runs, sourced from the same per-node SSE progress events the
   streaming endpoint already emits.
@@ -63,7 +90,8 @@ blank to run entirely on Gemini's free tier.
 
 ```mermaid
 flowchart TD
-    START([question]) --> route[route_query]
+    START([question + chat history]) --> condense[condense_question]
+    condense --> route[route_query]
     route -- none --> synth[synthesize_answer]
     route -- vector / web / both --> decompose[decompose_query]
 
@@ -101,6 +129,7 @@ structured summary alongside the prose report:
 ```json
 {
   "route": "vector",
+  "condensed_question": "What safety research does Anthropic do?",
   "sub_queries": ["...", "..."],
   "retrieval_counts": { "vector": 16, "bm25": 16, "web": 0 },
   "fused_document_count": 6,
@@ -191,15 +220,40 @@ curl -N -X POST http://127.0.0.1:8000/research/stream \
 completes, then a final `"done"` frame carrying the report and the Research Summary above (or a
 `"error"` frame on failure, since the HTTP status is already 200 by the time streaming starts).
 
+Conversations are persisted server-side: the first request returns a `conversation_id`, and
+follow-ups just send it back — the server loads its own transcript, condenses the follow-up
+against it, and appends the new exchange:
+
+```bash
+curl -X POST http://127.0.0.1:8000/research \
+  -H "Content-Type: application/json" \
+  -d '{"question": "what about their safety research?", "conversation_id": "<id from the first response>"}'
+```
+
+`GET /api/v1/conversations` lists them, `GET /api/v1/conversations/{id}` returns the full
+transcript (including each answer's report and research summary), and `DELETE` removes one.
+For fully stateless use, pass `"save": false` and (optionally) an inline `history` of
+`{"role", "content"}` turns instead.
+
+Ingest a public web page into the knowledge base by URL:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/ingest/url \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://en.wikipedia.org/wiki/Retrieval-augmented_generation"}'
+```
+
 Interactive API docs at `http://127.0.0.1:8000/docs`.
 
 ### Web UI
 
-A React + Vite single-page app in `frontend/` streams `/research/stream` live. A graph
-visualization stepper highlights each LangGraph node as it runs (grouping the fanned-out
-`retrieve_vector` / `retrieve_bm25` / `web_search` nodes into one "Retrieve" stage with
-per-source counts, and marking `corrective_web_search` as skipped when the confidence gate
-doesn't trigger it), then renders the markdown report and the Research Summary panel.
+A React + Vite single-page app in `frontend/` streams `/research/stream` live as a
+conversation: each turn shows the question, the streamed report, and its own collapsible
+Research Summary, and follow-ups automatically carry the transcript. A graph visualization
+stepper highlights each LangGraph node as it runs (grouping the fanned-out `retrieve_vector`
+/ `retrieve_bm25` / `web_search` nodes into one "Retrieve" stage with per-source counts, and
+marking `corrective_web_search` as skipped when the confidence gate doesn't trigger it). The
+corpus drawer accepts drag-and-drop uploads (PDF/DOCX/HTML/MD/TXT) and web page URLs.
 
 ```bash
 uv run rag-assistant serve       # terminal 1 -- backend on http://127.0.0.1:8000
@@ -211,6 +265,19 @@ npm run dev                      # terminal 2 -- UI on http://localhost:5173
 
 The backend allows CORS from `http://localhost:5173` by default. If the backend runs elsewhere,
 copy `frontend/.env.example` to `frontend/.env` and set `VITE_API_BASE_URL`.
+
+### Deploying a live demo
+
+The Docker image builds the frontend and serves it from FastAPI itself (`STATIC_DIR`), so one
+container is the whole app. `render.yaml` is a ready-made [Render](https://render.com)
+blueprint: connect the repo ("New" → "Blueprint"), set `GOOGLE_API_KEY` (and optionally
+`ANTHROPIC_API_KEY`) when prompted, and the free instance serves the full demo — the baked-in
+sample corpus is indexed at container startup. Any other Docker host works the same way:
+
+```bash
+docker build -t rag-assistant .
+docker run -p 8000:8000 --env-file .env rag-assistant   # full app on http://localhost:8000
+```
 
 ### Evaluation
 
@@ -268,6 +335,18 @@ non-LLM metrics (`NonLLMContextPrecisionWithReference`, `NonLLMContextRecall`) s
 quality against a golden dataset with zero additional LLM calls, so regressions in retrieval can
 be caught without spending quota — LLM-judged metrics (faithfulness, relevancy) are opt-in for
 when that extra cost is worth it.
+
+## Authentication & multi-tenancy
+
+Set `API_KEYS` (comma-separated `label:key` entries) and every data/LLM endpoint requires
+`X-API-Key: <key>` (or `Authorization: Bearer <key>`); the web UI shows an access-key gate.
+Each key's label is a tenant: conversations are stored, listed, and deletable only within it
+(a foreign conversation id 404s identically to a nonexistent one), and rate limits are keyed
+per tenant rather than per IP. Leave `API_KEYS` blank to run fully open (local development /
+public demo mode) — everything then belongs to the shared `public` tenant. `/health`,
+`/ready`, the docs, and the static frontend stay open either way. Behind a load balancer the
+Docker CMD passes `--proxy-headers --forwarded-allow-ips '*'` so anonymous rate limiting keys
+on the real client IP, not the LB's. Set `SENTRY_DSN` to capture unhandled exceptions.
 
 ## Production readiness
 

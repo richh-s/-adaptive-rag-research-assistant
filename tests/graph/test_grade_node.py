@@ -65,6 +65,49 @@ def test_grade_and_score_never_corrects_when_route_is_web_or_both(monkeypatch):
         assert grade_and_score(state)["needs_correction"] is False
 
 
+def test_grade_reranks_relevant_docs_and_drops_irrelevant_ones(monkeypatch):
+    monkeypatch.setattr(
+        "rag_assistant.graph.nodes.grade.grade_documents",
+        lambda question, docs: [
+            DocGrade(relevant=True, score=0.7),
+            DocGrade(relevant=False, score=0.1),
+            DocGrade(relevant=True, score=0.9),
+        ],
+    )
+
+    docs = [_doc("a"), _doc("b"), _doc("c"), _doc("ungraded-tail")]
+    result = grade_and_score({"question": "q", "route": "web", "fused_documents": docs})
+
+    # Relevant docs reordered by grade score (c=0.9 before a=0.7), irrelevant b dropped,
+    # ungraded tail kept behind the graded docs in its original RRF position.
+    assert [d.content for d in result["fused_documents"]] == ["c", "a", "ungraded-tail"]
+
+
+def test_grade_keeps_documents_untouched_when_nothing_relevant(monkeypatch):
+    monkeypatch.setattr(
+        "rag_assistant.graph.nodes.grade.grade_documents",
+        lambda question, docs: [DocGrade(relevant=False, score=0.1)],
+    )
+
+    docs = [_doc("a")]
+    result = grade_and_score({"question": "q", "route": "web", "fused_documents": docs})
+
+    # Pruning everything would make synthesis look like retrieval returned nothing.
+    assert "fused_documents" not in result
+
+
+def test_grade_skips_rerank_when_correction_will_rerun_fusion(monkeypatch):
+    monkeypatch.setattr(
+        "rag_assistant.graph.nodes.grade.grade_documents",
+        lambda question, docs: [DocGrade(relevant=True, score=0.2)],
+    )
+
+    result = grade_and_score({"question": "q", "route": "vector", "fused_documents": [_doc("a")]})
+
+    assert result["needs_correction"] is True
+    assert "fused_documents" not in result
+
+
 def test_after_grade_routes_correctly():
     assert after_grade({"needs_correction": True}) == "corrective_web_search"
     assert after_grade({"needs_correction": False}) == "synthesize_answer"

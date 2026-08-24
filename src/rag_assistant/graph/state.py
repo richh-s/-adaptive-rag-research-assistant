@@ -10,6 +10,14 @@ class ResearchState(TypedDict):
 
     question: str
 
+    # conversational memory -- Concept: follow-up condensation. `chat_history` is the prior
+    # turns supplied by the client ({"role": "user"|"assistant", "content": str} dicts);
+    # when it's non-empty, `condense_question` may rewrite `question` into a self-contained
+    # form and preserve what the user literally typed in `original_question` (None when no
+    # rewrite happened, so its presence doubles as the "was this condensed?" flag).
+    chat_history: list[dict]
+    original_question: str | None
+
     # Set once by the API layer from the request's trace_id (see api.py's TraceIdMiddleware)
     # and read by every node's timing wrapper (build_graph.py's `_timed`) so its per-node log
     # line can be correlated back to the request, independent of contextvar propagation through

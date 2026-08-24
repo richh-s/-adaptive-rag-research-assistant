@@ -3,6 +3,7 @@ import './Header.css'
 interface HeaderProps {
   backendUp: boolean | null
   onManageCorpus: () => void
+  onShowConversations: () => void
 }
 
 function LogoMark() {
@@ -21,7 +22,7 @@ function LogoMark() {
   )
 }
 
-export function Header({ backendUp, onManageCorpus }: HeaderProps) {
+export function Header({ backendUp, onManageCorpus, onShowConversations }: HeaderProps) {
   const statusClass = backendUp ? 'up' : backendUp === false ? 'down' : ''
   const statusLabel = backendUp === null ? 'Checking API…' : backendUp ? 'API connected' : 'API unreachable'
 
@@ -35,6 +36,9 @@ export function Header({ backendUp, onManageCorpus }: HeaderProps) {
           <span className="nav-name">Adaptive RAG</span>
         </div>
         <div className="nav-actions">
+          <button type="button" className="corpus-trigger" onClick={onShowConversations}>
+            Conversations
+          </button>
           <button type="button" className="corpus-trigger" onClick={onManageCorpus}>
             Manage corpus
           </button>
