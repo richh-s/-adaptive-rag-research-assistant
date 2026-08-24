@@ -75,6 +75,9 @@ blank to run entirely on Gemini's free tier.
   upload, or `POST /api/v1/ingest/url`, which fetches any public web page server-side with an
   SSRF guard (every hostname — including each redirect hop's — is resolved and refused if it
   lands on a private/loopback/link-local address) and a streamed size cap.
+- **MCP server** — the pipeline doubles as a Model Context Protocol server
+  (`rag-assistant mcp`), so Claude Desktop/Code and other MCP clients can research against
+  the knowledge base, ingest files/URLs, and browse saved conversations as native tools.
 - **Multimodal PDF ingestion (vision)** — charts, diagrams, and photos embedded in PDFs are
   described by the chat provider's vision capability and indexed as `[Figure on page N: ...]`
   blocks beside the page text, so data that exists only as pixels ("EMEA revenue $2.1M" in a
@@ -265,6 +268,33 @@ npm run dev                      # terminal 2 -- UI on http://localhost:5173
 
 The backend allows CORS from `http://localhost:5173` by default. If the backend runs elsewhere,
 copy `frontend/.env.example` to `frontend/.env` and set `VITE_API_BASE_URL`.
+
+### MCP server (use it from Claude Desktop / Claude Code)
+
+The whole pipeline is also exposed as an [MCP](https://modelcontextprotocol.io) server, so any
+MCP client can use the knowledge base as a tool — ask Claude Desktop a question and it calls
+`research_question` behind the scenes, cited answer and all:
+
+```bash
+uv run rag-assistant mcp   # stdio transport; normally launched by the client, not by hand
+```
+
+Tools exposed: `research_question`, `ingest_file`, `ingest_url`, `list_documents`,
+`list_conversations`. Claude Desktop config (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "adaptive-rag": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/this/repo", "rag-assistant", "mcp"]
+    }
+  }
+}
+```
+
+The server runs in-process on your machine (no HTTP hop, logs on stderr so the stdio protocol
+stream stays clean) under your own `.env` credentials.
 
 ### Deploying a live demo
 

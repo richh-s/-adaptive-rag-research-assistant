@@ -111,6 +111,17 @@ def serve(host: str = "127.0.0.1", port: int = 8000, reload: bool = False) -> No
 
 
 @app.command()
+def mcp() -> None:
+    """Run the MCP server over stdio, exposing the research pipeline as tools for MCP
+    clients (Claude Desktop, Claude Code, agent frameworks). Configure the client to launch
+    this command; logs go to stderr so the protocol stream on stdout stays clean."""
+    configure_logging()
+    from rag_assistant.mcp_server import run
+
+    run()
+
+
+@app.command()
 def ask(question: str) -> None:
     """Run the full adaptive research graph on a question."""
     configure_logging()
