@@ -5,6 +5,22 @@ from rag_assistant.graph.state import ResearchState
 _MARKER_RE = re.compile(r"\[\d+\]")
 
 
+def used_citations(final_answer: str, citations: list) -> list:
+    """The citations the answer actually references.
+
+    `state["citations"]` carries one entry per document that reached the synthesis prompt,
+    whether or not the model referenced it -- markers are assigned positionally before the
+    model has said anything. So its length measures *context size*, not how well grounded the
+    answer is, and the two diverge most precisely where it matters: an honest "no relevant
+    sources were found" still has a full context behind it.
+
+    Shared with the eval harness for exactly that reason. Counting the unfiltered list there
+    made every abstention look like a heavily-cited answer.
+    """
+    used_markers = set(_MARKER_RE.findall(final_answer or ""))
+    return [c for c in citations if c.marker in used_markers]
+
+
 def format_report(state: ResearchState) -> dict:
     """Assembles the final markdown report: the answer plus a source list. Routing/retrieval/
     confidence detail lives only in the structured research summary (see build_research_summary
@@ -17,9 +33,7 @@ def format_report(state: ResearchState) -> dict:
     file -- listing that file three times reads as a bug to a non-technical reader."""
     lines = [state["final_answer"], ""]
 
-    citations = state.get("citations", [])
-    used_markers = set(_MARKER_RE.findall(state["final_answer"]))
-    cited = [c for c in citations if c.marker in used_markers]
+    cited = used_citations(state["final_answer"], state.get("citations", []))
 
     if cited:
         markers_by_source: dict[str, list[str]] = {}

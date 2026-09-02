@@ -23,7 +23,11 @@ from rag_assistant.backup import (
 from rag_assistant.config import get_settings
 from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.ingestion.build_index import build_index
-from rag_assistant.llm import get_chat_model, primary_chat_provider_name
+from rag_assistant.llm import (
+    get_chat_model,
+    primary_chat_provider_name,
+    responding_provider_name,
+)
 from rag_assistant.logging_conf import configure_logging
 from rag_assistant.retrieval.vector_store import get_retriever
 from rag_assistant.retrieval.web_search import WebSearchTool
@@ -47,13 +51,23 @@ def callback() -> None:
 def hello() -> None:
     """Prove end-to-end connectivity to the configured chat model (Anthropic if set, else Gemini)."""
     configure_logging()
-    provider = primary_chat_provider_name()
+    configured = primary_chat_provider_name()
     try:
         response = get_chat_model().invoke("Reply with a short one-sentence greeting.")
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
-    console.print(f"[green]{provider} says:[/green] {response.text}")
+
+    # Report who *answered*, not who was configured to be asked first. The two differ exactly
+    # when the fallback chain fired, which is the case worth knowing about: a dead primary
+    # credential otherwise hides behind a series of successful-looking commands.
+    responder = responding_provider_name(response)
+    console.print(f"[green]{responder or configured} says:[/green] {response.text}")
+    if responder and configured.split()[0].lower() not in responder.lower():
+        console.print(
+            f"[yellow]Note:[/yellow] {configured} is configured as primary but did not answer -- "
+            f"the fallback chain handled this request. Check that provider's credentials."
+        )
 
 
 @app.command()

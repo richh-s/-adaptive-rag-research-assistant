@@ -399,6 +399,12 @@ uv run rag-assistant eval --limit 28 --record-baseline  # record baseline from a
 uv run rag-assistant eval --limit 28 --check            # fail on regression vs. that baseline
 ```
 
+A baseline recorded on Claude Sonnet against the sample corpus is committed at
+`data/golden_eval/baseline.json`: `source_recall` and `mean_reciprocal_rank` at 1.000 (every
+expected document retrieved, and ranked first), `abstention_accuracy` 0.778, `route_accuracy`
+0.786 — see Known limitations for why the last two are lower, which is partly the dataset
+rather than the system.
+
 `--check` compares against `data/golden_eval/baseline.json` with a tolerance (default 0.05),
 rather than against absolute thresholds. Absolute numbers get set to whatever today's run
 produced and then either block unrelated work or get quietly lowered until they block nothing;
@@ -779,6 +785,14 @@ token/context-length cap on however many documents fusion returns.
 Stated plainly, because knowing where a system's edges are is more useful than pretending it
 has none.
 
+- **`route_accuracy` is depressed by label ambiguity, not only by routing errors.** Several
+  questions have more than one defensible route -- asking for a company's private GPU count
+  can reasonably go to `web` alone or to `both` -- and the dataset asserts one. The recorded
+  baseline (0.786) therefore reflects the labels as much as the router. It still functions as
+  a gate: routing is deterministic at temperature 0, so the same questions route the same way
+  run to run, and a real regression moves the number well past the tolerance. Encoding
+  `acceptable_routes` per question rather than a single expected one would make the absolute
+  figure meaningful too.
 - **The eval set is 28 hand-authored questions with no baseline system to compare against.**
   The gate is real, but on a dataset this size one flipped routing decision moves an aggregate
   by roughly four points — which is why it compares against a recorded baseline with a

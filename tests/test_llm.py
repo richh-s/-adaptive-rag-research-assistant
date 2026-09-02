@@ -318,3 +318,73 @@ def test_non_string_reasoning_payload_is_ignored(monkeypatch):
     result = model._create_chat_result(response)
 
     assert result.generations[0].message.content == ""
+
+
+# ---- which provider actually answered ----
+
+
+class _Response:
+    def __init__(self, metadata):
+        self.response_metadata = metadata
+
+
+def test_responding_provider_reads_the_provider_off_the_response():
+    """`primary_chat_provider_name()` reports what is configured to be tried first, which is a
+    different question -- and a misleading answer whenever the fallback chain fired."""
+    from rag_assistant.llm import responding_provider_name
+
+    name = responding_provider_name(
+        _Response({"model_provider": "anthropic", "model_name": "claude-sonnet-5"})
+    )
+
+    assert name == "anthropic (claude-sonnet-5)"
+
+
+def test_responding_provider_falls_back_to_whichever_field_is_present():
+    from rag_assistant.llm import responding_provider_name
+
+    assert responding_provider_name(_Response({"model_name": "gemini-2.5-flash"})) == (
+        "gemini-2.5-flash"
+    )
+    assert responding_provider_name(_Response({"model_provider": "google"})) == "google"
+
+
+def test_responding_provider_is_none_when_nothing_is_reported():
+    """None means "couldn't tell", not "nobody answered" -- providers aren't obliged to
+    populate this."""
+    from rag_assistant.llm import responding_provider_name
+
+    assert responding_provider_name(_Response({})) is None
+    assert responding_provider_name(object()) is None
+
+
+def test_hello_names_the_provider_that_answered_not_the_configured_one(monkeypatch, capsys):
+    """The bug this replaces: an invalid Anthropic key produced correct answers served by
+    Gemini, while the CLI reported "Anthropic says" -- so a dead credential stayed hidden
+    behind three successful-looking commands."""
+    from unittest.mock import MagicMock
+
+    from rag_assistant import cli
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "configured-but-broken")
+    monkeypatch.setenv("GOOGLE_API_KEY", "working")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+
+    answered_by_gemini = MagicMock()
+    answered_by_gemini.text = "Hello!"
+    answered_by_gemini.response_metadata = {
+        "model_provider": "google_genai",
+        "model_name": "gemini-2.5-flash",
+    }
+    fake = MagicMock()
+    fake.invoke.return_value = answered_by_gemini
+    monkeypatch.setattr(cli, "get_chat_model", lambda: fake)
+
+    cli.hello()
+
+    output = capsys.readouterr().out
+    assert "gemini" in output.lower()
+    # And it says so explicitly, rather than leaving the reader to notice.
+    assert "did not answer" in output

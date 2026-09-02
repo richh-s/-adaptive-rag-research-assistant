@@ -240,6 +240,26 @@ def get_raw_chat_model(temperature: float = 0.0) -> BaseChatModel:
     return _provider_chain(temperature, streaming=False)[0]()
 
 
+def responding_provider_name(response) -> str | None:
+    """Which provider actually answered, read off the response.
+
+    `primary_chat_provider_name()` reports what is *configured* to be tried first, which is a
+    different question and a misleading answer whenever the fallback chain fires. An invalid
+    Anthropic key produces correct answers served by Gemini, and a CLI that reports the
+    configured primary will cheerfully claim Anthropic answered them -- which is exactly how a
+    dead credential stays hidden behind three successful-looking commands.
+
+    Best-effort: providers are not obliged to populate this, so None means "couldn't tell"
+    rather than "nobody answered".
+    """
+    metadata = getattr(response, "response_metadata", None) or {}
+    provider = metadata.get("model_provider")
+    model = metadata.get("model_name") or metadata.get("model")
+    if provider and model:
+        return f"{provider} ({model})"
+    return model or provider
+
+
 def primary_chat_provider_name() -> str:
     """Which provider `get_chat_model()`/`get_structured_llm()` calls first."""
     settings = get_settings()

@@ -53,3 +53,34 @@ def test_format_report_dedupes_repeated_source_across_markers():
 
     assert report.count("doc_a.md") == 1
     assert "[1][3] doc_a.md" in report
+
+
+def test_used_citations_counts_only_referenced_markers():
+    """The distinction the eval harness got wrong: `citations` holds one entry per document
+    that reached the prompt, so its length is context size, not groundedness."""
+    from rag_assistant.graph.nodes.report import used_citations
+    from rag_assistant.schemas.models import Citation
+
+    citations = [Citation(marker=f"[{i}]", source_id=f"{i}.md") for i in range(1, 6)]
+
+    used = used_citations("An answer citing [2] and [4].", citations)
+
+    assert [c.marker for c in used] == ["[2]", "[4]"]
+
+
+def test_an_ungrounded_answer_references_nothing_despite_a_full_context():
+    """The case that made every abstention look heavily cited: a refusal still has every
+    retrieved document sitting behind it."""
+    from rag_assistant.graph.nodes.report import used_citations
+    from rag_assistant.schemas.models import Citation
+
+    citations = [Citation(marker=f"[{i}]", source_id=f"{i}.md") for i in range(1, 13)]
+
+    assert used_citations("No relevant sources were found for this question.", citations) == []
+
+
+def test_used_citations_handles_a_missing_answer():
+    from rag_assistant.graph.nodes.report import used_citations
+    from rag_assistant.schemas.models import Citation
+
+    assert used_citations("", [Citation(marker="[1]", source_id="a.md")]) == []

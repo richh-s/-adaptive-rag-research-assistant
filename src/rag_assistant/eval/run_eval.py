@@ -15,6 +15,7 @@ from ragas.metrics import (
 from rag_assistant.eval.golden_dataset import load_golden_dataset
 from rag_assistant.eval.metrics import EvalMetrics, aggregate, score_question
 from rag_assistant.graph.build_graph import build_graph
+from rag_assistant.graph.nodes.report import used_citations
 from rag_assistant.ingestion.ownership import display_source
 from rag_assistant.llm import get_embeddings_model, get_raw_chat_model
 from rag_assistant.schemas.models import GoldenQuestion
@@ -52,7 +53,12 @@ def _run_question(graph, golden_question: GoldenQuestion) -> QuestionResult:
     return QuestionResult(
         question=golden_question.question,
         category=golden_question.category,
-        citation_count=len(result.get("citations", [])),
+        # Only the citations the answer actually references. The raw list is one entry
+        # per document that reached the prompt, so counting it would score every
+        # abstention as a heavily-cited answer.
+        citation_count=len(
+            used_citations(result.get("final_answer") or "", result.get("citations", []))
+        ),
         expected_route=golden_question.expected_route,
         actual_route=result.get("route"),
         route_match=result.get("route") == golden_question.expected_route,

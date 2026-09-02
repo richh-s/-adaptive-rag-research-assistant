@@ -1,0 +1,10 @@
+{
+  "metrics": {
+    "abstention_accuracy": 0.7777777777777778,
+    "mean_reciprocal_rank": 1.0,
+    "route_accuracy": 0.7857142857142857,
+    "source_recall": 1.0
+  },
+  "note": "Recorded by `rag-assistant eval --record-baseline`. Re-record deliberately when a change is a genuine improvement; never to make a failing gate pass.",
+  "question_count": 28
+}

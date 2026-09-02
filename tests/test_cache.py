@@ -85,3 +85,79 @@ def test_get_client_is_none_when_use_cache_false(monkeypatch):
 
     get_settings.cache_clear()
     cache.reset_client_cache()
+
+
+# ---- failure reporting stays quiet after the first occurrence ----
+
+
+def test_a_down_redis_is_reported_once_not_once_per_call(monkeypatch, caplog):
+    """158 stack traces in one eval run is not "degrading silently", which is what this
+    module's docstring promises. The first occurrence keeps its traceback so the cause stays
+    diagnosable; the rest drop to debug."""
+    from rag_assistant import cache
+
+    monkeypatch.setenv("USE_CACHE", "true")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+    cache.reset_client_cache()
+
+    class Dead:
+        def get(self, key):
+            raise ConnectionError("connection refused")
+
+        def setex(self, *args):
+            raise ConnectionError("connection refused")
+
+    monkeypatch.setattr(cache, "_get_client", lambda: Dead())
+
+    with caplog.at_level("WARNING"):
+        for _ in range(10):
+            cache.cache_get(cache.cache_key("router", "q"))
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+
+
+def test_distinct_failure_kinds_are_each_reported_once(monkeypatch, caplog):
+    from rag_assistant import cache
+
+    monkeypatch.setenv("USE_CACHE", "true")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+    cache.reset_client_cache()
+
+    class Dead:
+        def get(self, key):
+            raise ConnectionError("nope")
+
+        def setex(self, *args):
+            raise ConnectionError("nope")
+
+    monkeypatch.setattr(cache, "_get_client", lambda: Dead())
+
+    with caplog.at_level("WARNING"):
+        cache.cache_get(cache.cache_key("router", "q"))
+        cache.cache_set(cache.cache_key("router", "q"), {"a": 1}, 60)
+
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 2
+
+
+def test_a_down_redis_still_returns_a_miss_rather_than_raising(monkeypatch):
+    """The behaviour the quieting must not change."""
+    from rag_assistant import cache
+
+    monkeypatch.setenv("USE_CACHE", "true")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+    cache.reset_client_cache()
+
+    class Dead:
+        def get(self, key):
+            raise ConnectionError("nope")
+
+    monkeypatch.setattr(cache, "_get_client", lambda: Dead())
+
+    assert cache.cache_get(cache.cache_key("router", "q")) is None
