@@ -5,6 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+# A new push to a PR makes the in-flight run obsolete; cancelling it keeps the queue short
+# and the feedback fast. `main` is excluded from cancellation via the ref in the group key,
+# so pushes there each get a complete run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
 jobs:
   backend:
     runs-on: ubuntu-latest
@@ -16,12 +26,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
       - name: Install dependencies
         run: uv sync --frozen
       - name: Lint
         run: uv run ruff check src tests
+      # The threshold sits a few points under the current number so ordinary work isn't
+      # blocked by noise, while a change that drops whole modules out of the suite fails.
       - name: Tests
-        run: uv run pytest -q
+        run: uv run pytest -q --cov --cov-report=term-missing --cov-report=xml --cov-fail-under=85
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: coverage.xml
+          if-no-files-found: ignore
 
   frontend:
     runs-on: ubuntu-latest
@@ -44,9 +65,114 @@ jobs:
       - name: Build
         run: npm run build
 
+  # Dependency vulnerabilities are a supply-chain problem that neither lint nor tests can
+  # see, and the window that matters is "between the advisory and your next deploy". This
+  # job is `continue-on-error` on purpose: a newly published advisory against a transitive
+  # dependency should show up as a warning on every PR, not block unrelated work behind a
+  # fix nobody has released yet. Promote it to blocking once someone owns triage.
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Audit Python dependencies
+        run: uvx pip-audit --disable-pip -r <(uv export --frozen --no-dev --no-emit-project --format requirements-txt)
+        shell: bash
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Audit npm dependencies
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
+  # The RAG quality gate. Separate from `backend` because it needs real API keys and real
+  # model calls, so it cannot run on a fork PR -- the `if` skips it rather than failing it
+  # when secrets aren't available, which keeps outside contributions green while still
+  # gating every push to this repo.
+  #
+  # `eval --check` compares deterministic retrieval metrics against data/golden_eval/
+  # baseline.json and exits non-zero on regression. It is what catches a prompt or chunking
+  # change that quietly makes retrieval worse -- the class of bug that raises no exception
+  # and fails no unit test, because the system keeps returning confident prose about the
+  # wrong documents.
+  eval:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+    env:
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      USE_CACHE: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --frozen
+      # Two preconditions, reported rather than assumed. The gate needs real API keys (the
+      # harness runs the actual graph) and a committed baseline to compare against. A fresh
+      # clone has neither, and failing red on day one would train everyone to ignore this
+      # job -- so it says precisely which precondition is missing and skips.
+      - name: Check preconditions
+        id: guard
+        run: |
+          if [ -z "${{ secrets.GOOGLE_API_KEY }}" ]; then
+            echo "::notice::Eval gate skipped -- no GOOGLE_API_KEY secret configured."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          elif [ ! -f data/golden_eval/baseline.json ]; then
+            echo "::warning::Eval gate skipped -- no baseline recorded. Run 'uv run rag-assistant eval --limit 18 --record-baseline' against a known-good build and commit data/golden_eval/baseline.json to turn the gate on."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Index the corpus
+        if: steps.guard.outputs.enabled == 'true'
+        run: uv run rag-assistant ingest
+      - name: Eval gate
+        if: steps.guard.outputs.enabled == 'true'
+        run: uv run rag-assistant eval --limit 18 --check
+
   docker:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build image
         run: docker build -t rag-assistant:ci .
+      # Scanning the built image catches what a manifest audit can't: vulnerable OS packages
+      # in the base layer. Findings are reported, not enforced, for the same reason as above.
+      - name: Scan image
+        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: true
+        with:
+          image-ref: rag-assistant:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "0"
+      # A container that builds but crashes on boot is a green CI and a broken deploy. This
+      # starts the real image and waits for the health endpoint the orchestrator will use.
+      - name: Smoke-test the container
+        run: |
+          docker run -d --name rag-smoke -p 8000:8000 \
+            -e GOOGLE_API_KEY=ci-test-key -e ANTHROPIC_API_KEY= \
+            -e USE_CACHE=false rag-assistant:ci
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health > /dev/null; then
+              echo "container healthy after ${attempt} attempt(s)"
+              curl -fsS http://127.0.0.1:8000/metrics | head -5
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "container never became healthy; logs follow:"
+          docker logs rag-smoke
+          exit 1
+      - name: Container logs
+        if: always()
+        run: docker logs rag-smoke || true
+      - name: Stop container
+        if: always()
+        run: docker rm -f rag-smoke || true

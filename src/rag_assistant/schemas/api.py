@@ -75,6 +75,11 @@ class ResearchSummary(BaseModel):
     sub_queries: list[str]
     retrieval_counts: RetrievalCounts
     fused_document_count: int
+    # How many fused documents the synthesis context budget dropped (see
+    # graph/context_budget.py). Non-zero means the answer was written from a subset of what
+    # retrieval found -- worth surfacing, since otherwise a budget decision is
+    # indistinguishable from retrieval having found less.
+    context_documents_dropped: int = 0
     confidence_score: float | None
     correction_attempted: bool
     node_latencies_ms: list[NodeLatency]

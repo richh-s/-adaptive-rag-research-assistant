@@ -24,6 +24,11 @@ class ResearchState(TypedDict):
     # LangGraph's own task/thread scheduling.
     trace_id: str | None
 
+    # Which tenant is asking. Set by the API layer from the authenticated key (see auth.py);
+    # defaults to the public tenant for the CLI, MCP server, and eval harness, which have no
+    # request context. Every retrieval path filters on it -- see ingestion/ownership.py.
+    owner: str
+
     # routing -- Concept: Agentic/Self-RAG
     route: Literal["vector", "web", "both", "none"] | None
     route_reasoning: str | None
@@ -50,6 +55,11 @@ class ResearchState(TypedDict):
 
     final_answer: str
     citations: list[Citation]
+
+    # How many fused documents the synthesis context budget dropped (see
+    # graph/context_budget.py). Surfaced in the research summary so a truncated answer is
+    # visible as a budget decision rather than looking like retrieval simply found less.
+    context_documents_dropped: int
 
     # report formatting -- Concept: transparency reporting
     research_report: str

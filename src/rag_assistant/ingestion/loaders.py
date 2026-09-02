@@ -1,4 +1,6 @@
+import hashlib
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 import pymupdf
@@ -7,8 +9,15 @@ from bs4 import BeautifulSoup
 from langchain_core.documents import Document
 
 from rag_assistant.ingestion import vision
+from rag_assistant.ingestion.ownership import owner_of_relative_path
 
 SUPPORTED_SUFFIXES = {".md", ".txt", ".pdf", ".docx", ".html", ".htm"}
+
+# Bumped when a loader's *output* for unchanged bytes changes -- a new PDF extraction path,
+# a different HTML boilerplate rule. Recorded in the ingestion manifest alongside the file
+# fingerprint, so improving a loader re-indexes affected files instead of leaving the
+# collection full of text the old loader produced. Same mechanism as CHUNKING_VERSION.
+LOADER_VERSION = 1
 
 logger = logging.getLogger(__name__)
 
@@ -171,27 +180,99 @@ def _load_pdf(path: Path) -> list[Document]:
     return documents
 
 
-def load_documents(source_dir: Path) -> list[Document]:
-    """Load every supported file in source_dir into one or more Documents, tagging each with
-    its filename (and, for PDFs, page number) as metadata so citations can point back to a
-    source. Returns a flat list -- a multi-page PDF contributes multiple entries sharing the
-    same `metadata["source"]`."""
-    documents = []
-    for path in sorted(source_dir.iterdir()):
+@dataclass(frozen=True)
+class CorpusFile:
+    """One indexable file, identified without parsing it.
+
+    `fingerprint` hashes the raw bytes rather than the parsed text, which is the whole point:
+    deciding whether a file needs re-indexing must not require the expensive step that
+    re-indexing would perform. Parsing a PDF runs pymupdf4llm and, with PDF_VISION on, a
+    vision API call per figure and per scanned page -- so hashing parsed content to decide
+    whether to skip parsing pays the entire cost it was meant to avoid.
+    """
+
+    path: Path
+    source: str
+    owner: str
+    fingerprint: str
+
+
+def _fingerprint(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def iter_corpus_files(source_dir: Path, owner: str | None = None) -> list[CorpusFile]:
+    """Enumerates indexable files and fingerprints them, without parsing any of them.
+
+    `owner` narrows the scan to one tenant's scope -- their subtree, or just the flat public
+    files for the public tenant. `None` scans everything, which is what a CLI `ingest` or a
+    container's startup index wants. Scoping matters because ingestion is triggered per
+    upload: without it, one tenant adding a 2KB note walks, fingerprints, and re-indexes
+    against every other tenant's documents.
+    """
+    files: list[CorpusFile] = []
+    for path in sorted(source_dir.rglob("*")):
         if not path.is_file():
             continue
         if path.suffix not in SUPPORTED_SUFFIXES:
             logger.warning("Skipping unsupported file: %s", path.name)
             continue
 
-        if path.suffix == ".pdf":
-            documents.extend(_load_pdf(path))
-        elif path.suffix == ".docx":
-            documents.extend(_load_docx(path))
-        elif path.suffix in (".html", ".htm"):
-            documents.extend(_load_html(path))
-        else:
-            documents.append(
-                Document(page_content=path.read_text(encoding="utf-8"), metadata={"source": path.name})
+        relative = path.relative_to(source_dir)
+        file_owner = owner_of_relative_path(relative)
+        if owner is not None and file_owner != owner:
+            continue
+        files.append(
+            CorpusFile(
+                path=path,
+                source=relative.as_posix(),
+                owner=file_owner,
+                fingerprint=_fingerprint(path),
             )
+        )
+    return files
+
+
+def load_corpus_file(corpus_file: CorpusFile) -> list[Document]:
+    """Parses one enumerated file. This is the expensive step every caller wants to skip."""
+    path = corpus_file.path
+    if path.suffix == ".pdf":
+        loaded = _load_pdf(path)
+    elif path.suffix == ".docx":
+        loaded = _load_docx(path)
+    elif path.suffix in (".html", ".htm"):
+        loaded = _load_html(path)
+    else:
+        loaded = [Document(page_content=path.read_text(encoding="utf-8"), metadata={})]
+
+    # The per-format loaders set `source` to the bare filename (and PDFs add `page`);
+    # overwrite with the relative path and attach the owner in one place here, so a new
+    # loader can't forget to do it and quietly publish a tenant's file to everyone.
+    for document in loaded:
+        document.metadata = {
+            **document.metadata,
+            "source": corpus_file.source,
+            "owner": corpus_file.owner,
+        }
+    return loaded
+
+
+def load_documents(source_dir: Path, owner: str | None = None) -> list[Document]:
+    """Parse every supported file under source_dir. Convenience wrapper over
+    `iter_corpus_files` + `load_corpus_file` for callers that genuinely want everything;
+    incremental ingestion uses the two-step form so it can skip parsing unchanged files.
+
+    Walks recursively (see ownership.py): flat files are the shared public corpus, files
+    under `_t/<owner>/` belong to that tenant. `source` is the relative POSIX path rather
+    than the bare filename, so two tenants can upload files with the same name without one
+    silently overwriting the other's manifest entry and chunk IDs -- for flat public files
+    the relative path *is* the filename, so nothing about the baseline corpus changes.
+    """
+    documents: list[Document] = []
+    for corpus_file in iter_corpus_files(source_dir, owner=owner):
+        documents.extend(load_corpus_file(corpus_file))
     return documents

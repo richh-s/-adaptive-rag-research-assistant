@@ -1,5 +1,7 @@
 from langgraph.types import Send
 
+from rag_assistant.auth import PUBLIC_OWNER
+
 from rag_assistant.graph.state import ResearchState
 from rag_assistant.llm import get_structured_llm
 from rag_assistant.prompts.decompose_prompt import DECOMPOSE_PROMPT
@@ -23,11 +25,17 @@ def dispatch_retrieval(state: ResearchState) -> list[Send]:
     `web_results` writes are concatenated back together via the `operator.add` reducer
     declared on those state fields."""
     route = state["route"]
+    # A `Send` payload replaces the state for that invocation rather than extending it, so
+    # the owner has to be copied in explicitly -- a retrieval node that read `state["owner"]`
+    # without this would raise KeyError, and one that defaulted to "public" would silently
+    # serve every tenant the shared corpus only.
+    owner = state.get("owner") or PUBLIC_OWNER
     sends = []
     for sub_query in state["sub_queries"]:
+        payload = {"sub_query": sub_query, "owner": owner}
         if route in ("vector", "both"):
-            sends.append(Send("retrieve_vector", {"sub_query": sub_query}))
-            sends.append(Send("retrieve_bm25", {"sub_query": sub_query}))
+            sends.append(Send("retrieve_vector", payload))
+            sends.append(Send("retrieve_bm25", payload))
         if route in ("web", "both"):
-            sends.append(Send("web_search", {"sub_query": sub_query}))
+            sends.append(Send("web_search", payload))
     return sends

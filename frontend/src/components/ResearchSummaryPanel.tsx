@@ -83,7 +83,14 @@ export function ResearchSummaryPanel({ summary }: ResearchSummaryPanelProps) {
 
       <div className="summary-row">
         <span className="summary-label">After Fusion</span>
-        <span className="summary-value">{summary.fused_document_count} unique documents</span>
+        <span className="summary-value">
+          {summary.fused_document_count} unique documents
+          {/* Shown only when the budget actually dropped something, so a truncated answer
+              reads as a deliberate cost decision rather than as retrieval finding less. */}
+          {summary.context_documents_dropped
+            ? ` (${summary.context_documents_dropped} trimmed to fit the context budget)`
+            : ''}
+        </span>
       </div>
 
       <div className="summary-row">

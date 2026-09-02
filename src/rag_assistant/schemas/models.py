@@ -101,3 +101,14 @@ class GoldenQuestion(BaseModel):
     reference_contexts: list[str]
     expected_route: Literal["vector", "web", "both", "none"]
     expected_sources: list[str]
+    # What this row is testing. Defaulted so rows written before categories existed stay
+    # valid, and so adding a category later never invalidates the dataset.
+    #   factual      -- answerable from the local corpus; the happy path
+    #   multi_hop    -- needs decomposition; one retrieval pass shouldn't cover it
+    #   unanswerable -- deliberately outside the corpus: the system must abstain rather than
+    #                   confabulate, which is the failure mode no happy-path row can catch
+    #   current      -- needs fresh information the corpus can't have; should route to web
+    #   no_retrieval -- general knowledge; retrieving at all is wasted spend
+    category: Literal["factual", "multi_hop", "unanswerable", "current", "no_retrieval"] = (
+        "factual"
+    )

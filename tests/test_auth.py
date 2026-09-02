@@ -57,6 +57,32 @@ def test_protected_endpoints_reject_without_key(monkeypatch):
     assert client.get("/health").status_code == 200
 
 
+def test_metrics_endpoint_is_gated_when_auth_is_enabled(monkeypatch):
+    """Route timings and token counts describe usage patterns, so /metrics is treated as a
+    protected route rather than a public one: with API_KEYS set the scraper presents a key
+    like any other client, and with auth disabled (open demo) it stays reachable."""
+    monkeypatch.setenv("API_KEYS", "alice:secret-a")
+    client = TestClient(api.app)
+
+    assert client.get("/metrics").status_code == 401
+    assert client.get("/metrics", headers={"X-API-Key": "secret-a"}).status_code == 200
+
+
+def test_metrics_endpoint_is_open_when_auth_is_disabled():
+    assert TestClient(api.app).get("/metrics").status_code == 200
+
+
+def test_versioned_and_legacy_research_paths_are_both_protected(monkeypatch):
+    """The deprecated alias must not be an unauthenticated way in."""
+    monkeypatch.setenv("API_KEYS", "alice:secret-a")
+    client = TestClient(api.app)
+
+    assert client.post("/api/v1/research", json={"question": "q"}).status_code == 401
+    assert client.post("/research", json={"question": "q"}).status_code == 401
+    assert client.post("/api/v1/research/stream", json={"question": "q"}).status_code == 401
+    assert client.post("/research/stream", json={"question": "q"}).status_code == 401
+
+
 def test_valid_key_via_header_and_bearer(monkeypatch):
     monkeypatch.setenv("API_KEYS", "alice:secret-a")
     monkeypatch.setattr(api._graph, "invoke", _fake_invoke)

@@ -13,7 +13,9 @@ from ragas.metrics import (
 )
 
 from rag_assistant.eval.golden_dataset import load_golden_dataset
+from rag_assistant.eval.metrics import EvalMetrics, aggregate, score_question
 from rag_assistant.graph.build_graph import build_graph
+from rag_assistant.ingestion.ownership import display_source
 from rag_assistant.llm import get_embeddings_model, get_raw_chat_model
 from rag_assistant.schemas.models import GoldenQuestion
 
@@ -26,12 +28,14 @@ class QuestionResult:
     computed independently of whatever RAGAS metrics run alongside it."""
 
     question: str
+    category: str
     expected_route: str
     actual_route: str | None
     route_match: bool
     expected_sources: list[str]
     actual_sources: list[str]
     source_overlap: bool
+    citation_count: int
     response: str
     retrieved_contexts: list[str]
     reference_contexts: list[str]
@@ -42,9 +46,13 @@ def _run_question(graph, golden_question: GoldenQuestion) -> QuestionResult:
     result = graph.invoke(
         {"question": golden_question.question}, config={"recursion_limit": _RECURSION_LIMIT}
     )
-    actual_sources = [d.source_id for d in result.get("fused_documents", [])]
+    # Normalized to bare filenames: `source_id` is a corpus-relative path now that documents
+    # are tenant-scoped, while the dataset's `expected_sources` are filenames.
+    actual_sources = [display_source(d.source_id) for d in result.get("fused_documents", [])]
     return QuestionResult(
         question=golden_question.question,
+        category=golden_question.category,
+        citation_count=len(result.get("citations", [])),
         expected_route=golden_question.expected_route,
         actual_route=result.get("route"),
         route_match=result.get("route") == golden_question.expected_route,
@@ -55,6 +63,24 @@ def _run_question(graph, golden_question: GoldenQuestion) -> QuestionResult:
         retrieved_contexts=[d.content for d in result.get("fused_documents", [])],
         reference_contexts=golden_question.reference_contexts,
         reference=golden_question.ground_truth,
+    )
+
+
+def compute_metrics(results: list[QuestionResult]) -> EvalMetrics:
+    """Deterministic scores from graph output alone -- no judge, no extra model calls."""
+    return aggregate(
+        [
+            score_question(
+                question=r.question,
+                category=r.category,
+                expected_route=r.expected_route,
+                actual_route=r.actual_route,
+                expected_sources=r.expected_sources,
+                actual_sources=r.actual_sources,
+                citation_count=r.citation_count,
+            )
+            for r in results
+        ]
     )
 
 

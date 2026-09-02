@@ -55,4 +55,4 @@ def test_dispatch_retrieval_web_only():
 
     assert len(sends) == 1
     assert sends[0].node == "web_search"
-    assert sends[0].arg == {"sub_query": "q1"}
+    assert sends[0].arg == {"sub_query": "q1", "owner": "public"}

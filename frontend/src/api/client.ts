@@ -64,6 +64,9 @@ export interface ResearchSummary {
   sub_queries: string[]
   retrieval_counts: RetrievalCounts
   fused_document_count: number
+  // How many fused documents the synthesis context budget dropped. Optional so a response
+  // from a backend predating the budget still parses.
+  context_documents_dropped?: number
   confidence_score: number | null
   correction_attempted: boolean
   node_latencies_ms: NodeLatency[]
@@ -165,7 +168,7 @@ export async function streamResearch(
   onEvent: (event: StreamEvent) => void,
   options: StreamResearchOptions = {},
 ): Promise<void> {
-  const response = await fetch(`${API_BASE_URL}/research/stream`, {
+  const response = await fetch(`${API_BASE_URL}/api/v1/research/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({
@@ -206,7 +209,7 @@ export async function streamResearch(
 }
 
 export async function research(question: string, history: ChatTurn[] = []): Promise<ResearchResponse> {
-  const response = await fetch(`${API_BASE_URL}/research`, {
+  const response = await fetch(`${API_BASE_URL}/api/v1/research`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
     body: JSON.stringify({ question, history: trimHistory(history) }),

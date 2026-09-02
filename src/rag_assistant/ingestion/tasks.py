@@ -13,6 +13,8 @@ import uuid
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
+from rag_assistant.metrics import record_ingest_task
+
 IngestStage = Literal["queued", "parsing", "indexing", "indexed", "failed"]
 
 TERMINAL_STAGES: frozenset[IngestStage] = frozenset({"indexed", "failed"})
@@ -63,6 +65,10 @@ def update_task(
         if task is None:
             return
         if stage is not None:
+            # Counted on the transition, not on every update, so a task that reports progress
+            # while already "indexing" doesn't inflate the count.
+            if stage != task.stage and stage in TERMINAL_STAGES:
+                record_ingest_task(stage)
             task.stage = stage
         if message is not None:
             task.message = message

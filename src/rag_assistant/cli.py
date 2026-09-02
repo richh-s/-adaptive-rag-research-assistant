@@ -6,6 +6,14 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
+from rag_assistant.eval.baseline import (
+    DEFAULT_TOLERANCE,
+    BaselineNotFound,
+    compare,
+    load_baseline,
+    save_baseline,
+)
+from rag_assistant.eval.golden_dataset import load_golden_dataset
 from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.ingestion.build_index import build_index
 from rag_assistant.llm import get_chat_model, primary_chat_provider_name
@@ -139,6 +147,17 @@ def eval_(
     llm_judge: bool = False,
     limit: int = 3,
     output: Path | None = None,
+    check: bool = typer.Option(
+        False,
+        "--check",
+        help="Compare against the recorded baseline and exit non-zero on regression.",
+    ),
+    record_baseline: bool = typer.Option(
+        False, "--record-baseline", help="Overwrite the baseline with this run's scores."
+    ),
+    tolerance: float = typer.Option(
+        DEFAULT_TOLERANCE, help="How far a metric may fall below baseline before --check fails."
+    ),
 ) -> None:
     """Run the RAGAS eval harness against the golden dataset. `limit` defaults to 3 (not the
     full dataset) because graph execution alone costs ~4 chat-model calls/question -- the
@@ -161,7 +180,7 @@ def eval_(
         + f" = ~{total} total{quota_note}.[/yellow]"
     )
 
-    from rag_assistant.eval.run_eval import run_eval
+    from rag_assistant.eval.run_eval import compute_metrics, run_eval
 
     try:
         results, eval_result = run_eval(limit=limit, llm_judge=llm_judge)
@@ -171,22 +190,78 @@ def eval_(
 
     table = Table(title="Golden question checks")
     table.add_column("Question")
+    table.add_column("Category")
     table.add_column("Route")
     table.add_column("Sources")
     for r in results:
         route_cell = f"{r.actual_route} ({'✓' if r.route_match else '✗ expected ' + r.expected_route})"
-        sources_cell = "✓" if r.source_overlap else f"✗ expected {r.expected_sources}"
-        table.add_row(r.question, route_cell, sources_cell)
+        if r.expected_sources:
+            sources_cell = "✓" if r.source_overlap else f"✗ expected {r.expected_sources}"
+        else:
+            # Nothing to retrieve: the check is whether it correctly declined to cite.
+            sources_cell = "✓ abstained" if r.citation_count == 0 else f"✗ cited {r.citation_count}"
+        table.add_row(r.question, r.category, route_cell, sources_cell)
     console.print(table)
 
-    metrics = eval_result.to_pandas().mean(numeric_only=True).to_dict()
-    console.print("[bold]RAGAS metrics:[/bold]", metrics)
+    deterministic = compute_metrics(results)
+    scores = deterministic.gated_scores()
+    console.print("[bold]Retrieval metrics (deterministic):[/bold]")
+    for name, value in scores.items():
+        console.print(f"  {name}: {value:.3f}")
+
+    ragas_metrics = eval_result.to_pandas().mean(numeric_only=True).to_dict()
+    console.print("[bold]RAGAS metrics:[/bold]", ragas_metrics)
 
     if output:
         output.write_text(
-            json.dumps({"results": [r.__dict__ for r in results], "metrics": metrics}, indent=2)
+            json.dumps(
+                {
+                    "results": [r.__dict__ for r in results],
+                    "retrieval_metrics": scores,
+                    "ragas_metrics": ragas_metrics,
+                },
+                indent=2,
+            )
         )
         console.print(f"[green]Wrote results to {output}[/green]")
+
+    if record_baseline:
+        written = save_baseline(deterministic)
+        console.print(f"[green]Recorded baseline to {written}[/green]")
+
+    if check:
+        # A partial run can't be compared against a whole-dataset baseline: --limit 3 scores
+        # three questions, and whether those three are the easy ones is luck, not quality.
+        dataset_size = len(load_golden_dataset())
+        if limit < dataset_size:
+            console.print(
+                f"[red]--check needs the full dataset ({dataset_size} questions); "
+                f"--limit is {limit}. Re-run with --limit {dataset_size}.[/red]"
+            )
+            raise typer.Exit(code=2)
+
+        try:
+            baseline = load_baseline()
+        except BaselineNotFound as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=2) from exc
+
+        comparison = compare(deterministic, baseline, tolerance=tolerance)
+        gate = Table(title=f"Baseline comparison (tolerance {tolerance:.2f})")
+        gate.add_column("Metric")
+        gate.add_column("Baseline", justify="right")
+        gate.add_column("Current", justify="right")
+        gate.add_column("Delta", justify="right")
+        for c in comparison.comparisons:
+            marker = "[red]REGRESSED[/red]" if c.regressed else "[green]ok[/green]"
+            gate.add_row(c.name, f"{c.baseline:.3f}", f"{c.current:.3f}", f"{c.delta:+.3f} {marker}")
+        console.print(gate)
+
+        if not comparison.passed:
+            names = ", ".join(c.name for c in comparison.regressions)
+            console.print(f"[red]Eval gate failed -- regressed: {names}[/red]")
+            raise typer.Exit(code=1)
+        console.print("[green]Eval gate passed.[/green]")
 
 
 def main() -> None:

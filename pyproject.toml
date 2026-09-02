@@ -17,9 +17,13 @@ dependencies = [
     "langchain-chroma>=1.1.0",
     "langchain-community<0.4",
     "langchain-google-genai>=4.2.6",
+    # Used only as an OpenAI-compatible client for self-hosted servers (Ollama/vLLM);
+    # no OpenAI account or key is involved. See llm.py's _LocalChatOpenAI.
+    "langchain-openai>=1.3.3",
     "langchain-text-splitters>=1.1.2",
     "langgraph>=1.2.7",
     "mcp>=1.2",
+    "prometheus-client>=0.21",
     "pydantic-settings>=2.14.2",
     "pymupdf4llm>=0.0.28",
     "python-docx>=1.2",
@@ -50,6 +54,7 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-cov>=6.0",
     "ruff>=0.15.20",
 ]
 
@@ -59,3 +64,28 @@ line-length = 100
 [tool.pytest.ini_options]
 markers = ["live: hits real external APIs (Gemini/DuckDuckGo), excluded by default"]
 addopts = "-m 'not live'"
+
+# Coverage is configured here but deliberately NOT in `addopts`: instrumenting every local
+# run slows the edit/test loop for no benefit, and the number that matters is the one CI
+# gates on. Run it explicitly with `uv run pytest --cov`.
+[tool.coverage.run]
+source = ["src/rag_assistant"]
+branch = true
+omit = [
+    # An operator entry point whose body is argument parsing and calls into code that is
+    # itself covered; exercising it would test Typer, not this project.
+    "src/rag_assistant/cli.py",
+    # The RAGAS harness only runs against live models by design (see eval/run_eval.py), so
+    # counting it would mean either a permanently red number or fake tests that mock RAGAS
+    # itself and assert nothing real.
+    "src/rag_assistant/eval/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+]

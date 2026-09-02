@@ -6,7 +6,7 @@ def test_retrieve_bm25_returns_bm25_results_shape(monkeypatch):
     fake_docs = [RetrievedDoc(content="doc a", source_id="a.md", score=1.2)]
     monkeypatch.setattr(
         "rag_assistant.graph.nodes.retrieve.bm25_search",
-        lambda sub_query, k=4: fake_docs,
+        lambda sub_query, k=4, owner="public": fake_docs,
     )
 
     result = retrieve_bm25({"sub_query": "who founded anthropic"})
@@ -19,7 +19,7 @@ def test_retrieve_bm25_returns_bm25_results_shape(monkeypatch):
 def test_retrieve_bm25_handles_no_matches(monkeypatch):
     monkeypatch.setattr(
         "rag_assistant.graph.nodes.retrieve.bm25_search",
-        lambda sub_query, k=4: [],
+        lambda sub_query, k=4, owner="public": [],
     )
 
     result = retrieve_bm25({"sub_query": "no matches here"})

@@ -64,9 +64,15 @@ blank to run entirely on Gemini's free tier.
   It's a small (13-question), hand-curated set with no adversarial cases and no naive-RAG
   baseline to compare against — useful as a regression smoke test, not as proof the adaptive
   pipeline outperforms a simpler one.
-- **Provider fallback** — Anthropic Claude is the primary chat/reasoning model when
-  `ANTHROPIC_API_KEY` is set, with `.with_fallbacks()` to Gemini on error; embeddings always go
-  through Gemini. Falls back to Gemini-only if no Anthropic key is configured.
+- **Provider fallback** — a three-tier chain, tried in priority order and skipping any tier
+  that isn't configured: a self-hosted local model (when `LOCAL_LLM_BASE_URL` is set), then
+  Anthropic Claude (when `ANTHROPIC_API_KEY` is set), then Gemini, wired with
+  `.with_fallbacks()` so a rate limit, an outage, or an unreachable GPU box degrades to the
+  next tier instead of failing the request. Embeddings always go through Gemini.
+- **Self-hosted inference** — the primary tier can be your own hardware on any
+  OpenAI-compatible `/v1` endpoint (Ollama, vLLM, LM Studio, llama.cpp), so every graph node
+  runs at $0 while the box is reachable and silently falls back to Claude when it isn't. See
+  [Running on self-hosted models](#running-on-self-hosted-models).
 - **Incremental indexing** — `rag-assistant ingest` hashes file contents against a manifest and
   only re-embeds changed or new files, removing chunks for deleted files, instead of rebuilding
   the whole collection every run (`--full` forces a clean rebuild).
@@ -208,18 +214,18 @@ uv run rag-assistant serve   # starts FastAPI on http://127.0.0.1:8000
 ```
 
 ```bash
-curl -X POST http://127.0.0.1:8000/research \
+curl -X POST http://127.0.0.1:8000/api/v1/research \
   -H "Content-Type: application/json" \
   -d '{"question": "Who founded Anthropic and what is their safety research called?"}'
 ```
 
 ```bash
-curl -N -X POST http://127.0.0.1:8000/research/stream \
+curl -N -X POST http://127.0.0.1:8000/api/v1/research/stream \
   -H "Content-Type: application/json" \
   -d '{"question": "Who founded Anthropic and what is their safety research called?"}'
 ```
 
-`/research/stream` emits Server-Sent Events — one `"progress"` frame per graph node as it
+`/api/v1/research/stream` emits Server-Sent Events — one `"progress"` frame per graph node as it
 completes, then a final `"done"` frame carrying the report and the Research Summary above (or a
 `"error"` frame on failure, since the HTTP status is already 200 by the time streaming starts).
 
@@ -228,7 +234,7 @@ follow-ups just send it back — the server loads its own transcript, condenses 
 against it, and appends the new exchange:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/research \
+curl -X POST http://127.0.0.1:8000/api/v1/research \
   -H "Content-Type: application/json" \
   -d '{"question": "what about their safety research?", "conversation_id": "<id from the first response>"}'
 ```
@@ -246,11 +252,42 @@ curl -X POST http://127.0.0.1:8000/api/v1/ingest/url \
   -d '{"url": "https://en.wikipedia.org/wiki/Retrieval-augmented_generation"}'
 ```
 
+Every endpoint is under `/api/v1/`. The original unversioned `/research` and
+`/research/stream` remain registered as deprecated aliases so clients written before
+versioning keep working; they are hidden from the OpenAPI schema and carry the same rate
+limits as the versioned paths.
+
 Interactive API docs at `http://127.0.0.1:8000/docs`.
+
+### Observability
+
+```bash
+curl http://127.0.0.1:8000/metrics        # Prometheus exposition
+curl http://127.0.0.1:8000/ready          # dependency-aware readiness (503 when Chroma or web search is down)
+```
+
+Useful queries once a Prometheus is scraping it:
+
+```promql
+# p95 latency of a research call
+histogram_quantile(0.95, sum by (le) (rate(rag_http_request_duration_seconds_bucket{route="/api/v1/research"}[5m])))
+
+# is the primary LLM provider failing over?
+sum by (provider, outcome) (rate(rag_llm_calls_total[5m]))
+
+# output tokens per hour, by model -- the cost signal
+sum by (model) (rate(rag_llm_tokens_total{kind="output"}[1h])) * 3600
+
+# cache hit rate
+sum(rate(rag_cache_operations_total{result="hit"}[5m])) / sum(rate(rag_cache_operations_total{result=~"hit|miss"}[5m]))
+```
+
+With `API_KEYS` set, `/metrics` requires a key like any other protected route — point the
+scraper at it with an `X-API-Key` header, or set `METRICS_ENABLED=false` to remove the route.
 
 ### Web UI
 
-A React + Vite single-page app in `frontend/` streams `/research/stream` live as a
+A React + Vite single-page app in `frontend/` streams `/api/v1/research/stream` live as a
 conversation: each turn shows the question, the streamed report, and its own collapsible
 Research Summary, and follow-ups automatically carry the transcript. A graph visualization
 stepper highlights each LangGraph node as it runs (grouping the fanned-out `retrieve_vector`
@@ -311,17 +348,86 @@ docker run -p 8000:8000 --env-file .env rag-assistant   # full app on http://loc
 
 ### Evaluation
 
+Two layers, because they answer different questions and only one of them can gate a build.
+
+**Deterministic retrieval metrics** — computed from graph output, no judge, no extra model
+calls, identical numbers on identical output:
+
+| Metric | What regressing means |
+| --- | --- |
+| `route_accuracy` | The router started sending questions down the wrong retrieval path |
+| `source_recall` | The right documents stopped being retrieved at all |
+| `mean_reciprocal_rank` | The right documents are still found, but ranked lower |
+| `abstention_accuracy` | The system started answering things it can't support — or refusing things it can |
+
+**RAGAS** (`--llm-judge`) adds faithfulness and answer relevancy. Kept out of the gate on
+purpose: it costs model calls per row and its scores drift slightly between runs on identical
+output, so gating on it would fail builds for reasons unrelated to the change.
+
 ```bash
-uv run rag-assistant eval --limit 3               # non-LLM metrics only (no extra Gemini calls)
-uv run rag-assistant eval --limit 3 --llm-judge    # adds Faithfulness + ResponseRelevancy scoring
-uv run rag-assistant eval --limit 3 --output results.json
+uv run rag-assistant eval --limit 18                    # score the full dataset
+uv run rag-assistant eval --limit 18 --llm-judge        # ...plus RAGAS faithfulness/relevancy
+uv run rag-assistant eval --limit 18 --record-baseline  # record baseline from a known-good build
+uv run rag-assistant eval --limit 18 --check            # fail on regression vs. that baseline
 ```
 
-Runs the graph against a small hand-authored golden dataset (`data/golden_eval/dataset.jsonl`),
-checks route/source expectations for free, and scores retrieval quality with RAGAS
-(`NonLLMContextPrecisionWithReference`, `NonLLMContextRecall` by default). Prints an estimated
-Gemini call count before running, since `limit` — not `--llm-judge` — is the dominant lever
-against the daily quota (graph execution alone is ~4 calls/question).
+`--check` compares against `data/golden_eval/baseline.json` with a tolerance (default 0.05),
+rather than against absolute thresholds. Absolute numbers get set to whatever today's run
+produced and then either block unrelated work or get quietly lowered until they block nothing;
+a baseline asks the question that matters — *did this change make retrieval worse than it was?*
+The tolerance absorbs a single borderline routing flip, since LLM routing isn't deterministic
+even at temperature 0, and a gate that fails on noise is a gate people learn to ignore.
+
+**Record your own baseline before the gate does anything.** No baseline ships with the repo:
+the numbers depend on which chat provider you configured, so a committed one would be a
+fiction on anyone else's setup. Run `--record-baseline` once against a build you trust and
+commit `data/golden_eval/baseline.json` — that is what switches the CI gate on. Until then
+CI reports the gate as skipped with a warning rather than failing, since failing red on a
+fresh clone just teaches everyone to ignore the job. Re-record deliberately when a change is
+a genuine improvement, never to make a failing gate pass.
+
+The dataset (`data/golden_eval/dataset.jsonl`) is 18 questions across five categories —
+`factual`, `multi_hop`, `unanswerable`, `current`, `no_retrieval`. The `unanswerable` rows
+carry the most weight: a dataset of only answerable questions cannot catch the failure that
+matters most in RAG, which is answering confidently from documents that don't contain the
+answer. It is still small and hand-authored, with no baseline system to compare against.
+
+### Running on self-hosted models
+
+Any OpenAI-compatible `/v1` endpoint works — Ollama (`:11434/v1`), vLLM (`:8000/v1`), LM Studio,
+llama.cpp. Setting `LOCAL_LLM_BASE_URL` makes it the primary chat/reasoning provider; Anthropic
+and Gemini stay configured behind it as automatic fallbacks.
+
+Get the real model list from the box rather than guessing at names:
+
+```bash
+curl http://<host>:11434/api/tags | jq -r '.models[].name'   # Ollama
+curl http://<host>:8000/v1/models                            # vLLM
+```
+
+Then:
+
+```bash
+LOCAL_LLM_BASE_URL=http://<host>:11434/v1
+LOCAL_LLM_CHAT_MODEL=<one of the names above>
+```
+
+```bash
+rag-assistant hello     # prints "Local (<model>) says: ..." when it's actually being used
+curl localhost:8000/ready | jq .local_llm
+```
+
+Two things worth knowing:
+
+- **Reachability is a property of the server, not your laptop.** If the box is on a tailnet or a
+  VPN, use the MagicDNS/hostname rather than the raw `100.x` IP — the IP is stable per node but
+  the name survives a node being removed and re-added. And a Render/Fly/Vercel deploy is not on
+  your tailnet: leave `LOCAL_LLM_BASE_URL` blank in those environments, or accept that every
+  call pays a 2s connect timeout before falling through to Claude.
+- **`/ready` reports the local endpoint but doesn't fail on it.** An unreachable box is a cost
+  and latency regression, not an outage — the graph still answers on Claude — so it shouldn't
+  pull a healthy replica out of a load balancer. It's surfaced because "the bill moved because a
+  route dropped" is exactly the failure you want to be able to see.
 
 ## Example questions per concept
 
@@ -334,6 +440,48 @@ against the daily quota (graph execution alone is ~4 calls/question).
 | Corrective fallback | "What safety research did Anthropic publish this week?" (recent/narrow enough that the local corpus alone often scores low, triggering a web search fallback) |
 
 ## Design decisions
+
+**Why is the local model the *primary* provider rather than a fallback behind Claude?**
+Because the point is cost, and a fallback never gets called on the happy path. The order is
+local → Anthropic → Gemini, and every tier that isn't configured is skipped without being
+constructed (the Gemini client validates its key in `__init__`, so merely *building* it as an
+unused fallback crashes an Anthropic-only deployment). The degradation this buys is the useful
+kind: a laptop on the tailnet answers for free, and the same image deployed to a host with no
+route to the box answers on Claude without a config change.
+
+**Why a short connect timeout but a long read timeout on the local provider?** They're solving
+opposite problems. Local generation is genuinely slow — a 26B model on one GPU takes 20-25s for
+a real answer — so the read timeout is 180s. But off the tailnet there is no route to the box
+at all, and a connect that hangs would burn the whole `GRAPH_TIMEOUT_SECONDS` budget before
+Anthropic ever saw the call. A 2s connect timeout is what turns "unreachable box" into a fast
+failover instead of a dead request. One retry, not zero: single-model Ollama returns a transient
+500 while swapping models, and that one is worth absorbing.
+
+**Why can't `with_structured_output(method="json_schema")` be used on a local server?**
+`langchain_openai` routes that method through OpenAI's Structured Outputs parser, which reads a
+`parsed` field only hosted OpenAI populates. Against Ollama or vLLM it raises
+`"response does not have a 'parsed' field"` on *every* call — including calls where the server
+returned perfectly valid JSON — so every structured node in the graph would fail through to the
+paid fallback while looking like a local-model quality problem. The schema is bound as
+`response_format` by hand (the half that matters: the server constrains decoding) and parsed
+back off `content` like every other provider. See `_local_structured_runnable` in `llm.py`.
+
+**Why does the graph tolerate a local model returning an empty answer?** It doesn't — that's the
+bug it's built to avoid. Reasoning models (Qwen3-class) sometimes leave `content` empty and put
+the whole answer in a `reasoning`/`reasoning_content` field, which `langchain_openai` discards
+because it isn't in the OpenAI schema. Downstream that reads as "the model said nothing": an
+empty synthesis, or a structured parse failure. `_LocalChatOpenAI` recovers it from the raw
+payload on both the blocking and the streaming path (the synthesis node streams, so handling
+only one of them would still relay a stream of empty SSE tokens). Truncation at `max_tokens`
+with nothing in `content` is treated differently — that's a config problem, not an answer, so it
+raises and lets the fallback chain answer while the error stays visible in the logs.
+
+**Why do embeddings stay on Gemini when chat can go local?** Chat providers are interchangeable
+mid-flight; embeddings are not. The Chroma collection is built at one provider's vector
+dimension, and pointing queries at a different embedding model doesn't error — it silently
+returns nonsense neighbours. Switching would require a full re-index
+(`rag-assistant ingest --full`), so it's a deliberate one-way decision rather than something the
+graph can fall back into at runtime.
 
 **Why hybrid (vector + BM25) retrieval, not vector-only?** Dense embeddings are strong on
 semantic/paraphrased queries but can under-rank exact keyword matches — model names, acronyms,
@@ -378,6 +526,42 @@ public demo mode) — everything then belongs to the shared `public` tenant. `/h
 Docker CMD passes `--proxy-headers --forwarded-allow-ips '*'` so anonymous rate limiting keys
 on the real client IP, not the LB's. Set `SENTRY_DSN` to capture unhandled exceptions.
 
+**The knowledge base is tenant-scoped too**, not just conversations. Ownership lives in the
+corpus layout rather than a sidecar table, because the layout is the thing that survives — a
+manifest can be deleted, reset by a fresh deploy, or drift from the files on disk, and every
+one of those failures defaults documents to visible-to-everyone, which is the wrong direction
+to fail in:
+
+```
+data/corpus/anthropic.md           # public — the shared baseline corpus, everyone sees it
+data/corpus/_t/alice/report.md     # private to tenant "alice"
+```
+
+Uploads land in the uploading tenant's subtree; flat files stay public, so an open demo's
+on-disk layout is exactly what it was before tenancy existed and the baked-in corpus needs no
+migration. Both retrieval paths filter on ownership — Chroma via a `$in` filter applied
+*during* search (post-filtering would silently shrink `k`, so a tenant whose top hits belong
+to someone else would get fewer documents with no indication why), BM25 by narrowing
+candidates before the top-k cut. The router's corpus description is scoped as well: listing
+another tenant's filenames would leak them through the prompt even though retrieval filters
+them out.
+
+Ingestion is scoped the same way. An upload re-indexes only the uploading tenant's scope, and
+within it only files whose bytes actually changed — decided from a raw-byte fingerprint, so
+the check never runs the parse it exists to avoid. Removal detection is scoped to the same
+slice, since comparing one tenant's scan against the whole manifest would read every other
+tenant's documents as deleted and drop their chunks. A full rebuild (`ingest --full`) refuses
+to be scoped to one owner at all, because resetting the collection would delete everyone else's.
+
+The measured effect on a 8-file corpus, one tenant uploading one file: **16 file parses → 1.**
+Most of that came from a second, less obvious source — the BM25 index used to rebuild by
+re-reading and re-splitting the entire corpus from disk after every ingest. It now builds from
+the chunks already stored in Chroma, which removes the second parse pass and, more usefully,
+makes the two retrieval paths index the identical chunk set *by construction* rather than by
+the convention that both happened to call the same splitter. The tradeoff is that keyword
+search reflects what has been indexed rather than what is on disk — which is the honest
+behaviour, since an un-ingested file was always invisible to vector search.
+
 ## Production readiness
 
 Beyond the core RAG pipeline, the API is hardened for running as an actual service rather than a
@@ -394,6 +578,21 @@ local demo script:
 | Structured logging | JSON logs (`python-json-logger`) with a UUID4 `trace_id` generated per request by an ASGI middleware, propagated through `contextvars` *and* threaded explicitly into the LangGraph state (belt-and-suspenders, since LangGraph's internal scheduling isn't guaranteed to preserve context automatically) — every log line, including each node's completion log, carries `trace_id`/`node`/`route`/`latency_ms`, and the response carries the same trace ID in an `X-Trace-Id` header |
 | Caching | Redis-backed, best-effort (`USE_CACHE=false` or any Redis error both degrade silently to "no cache" — a cache outage is never worse than having no cache): router decisions keyed by question (`CACHE_TTL_ROUTER`, 5min), web search results keyed by query (`CACHE_TTL_WEB_SEARCH`, 10min), synthesized answers keyed by question + route + fused source IDs (`CACHE_TTL_SYNTHESIS`, 30min) — all under a `v1:` key prefix so a payload-shape change can be rolled out by bumping the prefix rather than migrating existing entries |
 | Configuration | All of the above is `pydantic-settings`-driven (`config.py`), reading exclusively from environment variables with fail-fast validation at startup instead of scattered `os.environ.get()` calls with silent defaults |
+| Metrics | Prometheus exposition at `GET /metrics` (`metrics.py`): request rate/latency by *templated* route, LLM calls and **token usage** by provider/model/outcome, cache hit-rate by namespace, per-node graph latency, graph outcomes split `ok`/`error`/`timeout`, and a live SSE-connection gauge. Every label is drawn from a bounded set — the route label is Starlette's path template, never the UUID-bearing real path, and unmatched requests collapse to one sentinel series, so a scanner hitting random URLs can't blow up the registry. The token counter is the one that maps onto money: it's how a provider fallback shows up as a cost change rather than a surprise at the end of the month |
+| Schema migrations | The conversation store applies an ordered, append-only migration list stamped via `PRAGMA user_version` (`conversations/store.py`), each in its own transaction so a failure mid-chain resumes rather than replays. The baseline migration is written to converge all three databases that predate versioning — brand new, pre-`owner`-column, and already-ALTERed — onto one shape |
+| Data retention | Conversations are bounded by both an age cutoff (`CONVERSATION_RETENTION_DAYS`, 90d) and a per-tenant count cap (`CONVERSATION_MAX_PER_OWNER`, 500), pruned inline after each write and scoped to the tenant that wrote, so no cron is needed and the sweep never scans other tenants. Messages follow via `ON DELETE CASCADE` |
+| CORS | Origins come from `CORS_ALLOW_ORIGINS` rather than being hardcoded, so a split deploy (UI on Vercel, API on Render) is configuration rather than a code change; the single-container deploy is same-origin and needs none. `X-Trace-Id` is in `expose_headers` so a cross-origin frontend can actually read the trace ID it's meant to report |
+| API versioning | Everything is under `/api/v1/`; the pre-versioning `/research` and `/research/stream` stay registered as deprecated, schema-hidden aliases carrying the same rate limits, so older clients keep working without the docs showing two ways to do one thing |
+| Supply chain | CI audits Python dependencies (`pip-audit` over the exported lockfile) and npm dependencies, and scans the built image with Trivy. Reported rather than blocking, since a fresh advisory against a transitive dependency shouldn't block unrelated work behind a fix nobody has published yet |
+| Deploy verification | The docker CI job doesn't stop at "the image builds" — it runs the real image and waits on `/health`, so a container that builds and then crashes on boot fails CI instead of failing the deploy. Both the image and compose file carry healthchecks (compose uses `/ready`, which actually pings Chroma and web search) |
+| Single-worker constraint | `--workers 1` is stated explicitly in the Dockerfile CMD with the reasoning, rather than left to uvicorn's default: embedded Chroma locks its SQLite file to one process, and the ingest task registry and conversation write lock are per-process. Made explicit so nobody "optimizes" it into `--workers $WEB_CONCURRENCY` and gets intermittent 404s and database-locked errors |
+| Retrieval quality gate | `rag-assistant eval --check` scores the golden dataset on deterministic, judge-free metrics (route accuracy, source recall, MRR, abstention accuracy) and fails against a recorded baseline. CI runs it on every push where API keys are available. This is the gate for the failure mode nothing else catches: a prompt or chunking change that raises no exception and fails no unit test, because the system keeps returning confident prose about the wrong documents |
+| Adversarial eval coverage | The dataset carries `unanswerable`, `multi_hop`, `no_retrieval` and `current` rows alongside the happy path, so abstention is scored as a first-class metric — a dataset of only answerable questions cannot catch confidently answering something the corpus doesn't contain |
+| Context budget | Synthesis is capped at `SYNTHESIS_CONTEXT_BUDGET_TOKENS` (see `graph/context_budget.py`). Fusion's output scales with (sub-queries x retrieval paths), not with the question, so an uncapped prompt grows with retrieval breadth until it overflows the context window — at the very end of the pipeline, after every retrieval and grading call has been paid for. Documents arrive ranked, so the cap drops what the pipeline already judged least useful, truncates rather than drops the top document, and surfaces the count in the research summary |
+| Structure-aware chunking | Splitting follows markdown headings first and fixed-size only within a section, prepending the heading breadcrumb to every chunk (`ingestion/splitter.py`). A chunk reading "It raised $450M in a Series C" is nearly useless to both retrieval paths — no company in the embedding, no company token for BM25. The breadcrumb is charged against `chunk_size`, so it stays a real bound, and `CHUNKING_VERSION` in the manifest makes a strategy change re-index itself instead of silently serving chunks built by the previous splitter |
+| Corpus tenant isolation | Ownership is encoded in the corpus layout (`ingestion/ownership.py`): flat files are the shared public corpus, `_t/<owner>/` is private to that tenant. Both retrieval paths filter on it — Chroma via a `$in` filter applied *during* search rather than after (post-filtering silently shrinks k), BM25 by narrowing candidates before the top-k cut. The router's corpus description is scoped too, since listing another tenant's filenames leaks them through the prompt even when retrieval filters them out |
+| Incremental ingestion cost | Re-indexing is decided from a raw-byte fingerprint plus `CHUNKING_VERSION`/`LOADER_VERSION`, so unchanged files are never parsed — not merely never re-embedded. That distinction is the whole cost: a parse runs pymupdf4llm and, with `PDF_VISION` on, a vision API call per figure and per scanned page. Ingestion is also scoped to the uploading tenant. One upload into an 8-file corpus went from 16 file parses to 1 |
+| BM25 / vector chunk parity | The keyword index is built from the chunks stored in Chroma rather than by re-reading the corpus. Beyond removing a second full parse pass per ingest, it makes RRF's `SHA256(content)` cross-source dedup correct by construction — previously the two paths produced identical text only by the convention that both called the same splitter, and any drift would have silently double-counted and double-cited the same passage |
 
 ## Self-audit: findings & fixes
 
@@ -429,15 +628,33 @@ needing a concrete driving requirement before they're worth the added complexity
   after the fact. Useful once the corpus grows beyond a handful of hand-picked files.
 - **Qdrant (or another dedicated vector DB) instead of Chroma** — worth it once metadata
   filtering, multi-tenancy, or corpus size actually demand it; Chroma is not the bottleneck today.
-- **Authentication** — no user accounts or API keys today; every request is anonymous. Needed
-  before this could be exposed as a multi-user service.
-- **Multi-tenancy** — one shared corpus/index for everyone; would need per-tenant indexes or
-  namespacing to isolate data between users.
+- **Richer key management** — API keys are static entries in an env var (see
+  [Authentication & multi-tenancy](#authentication--multi-tenancy)). That is enough to gate a
+  demo, but a real multi-user service wants rotation, expiry, per-key rate-limit overrides,
+  scopes, and an audit trail of which key called what — none of which fits in an env var.
+- **Per-tenant embedding cost accounting** — retrieval and ingestion are both tenant-scoped
+  now, but all tenants still share one Chroma collection, so there is no per-tenant view of
+  index size or embedding spend. Separate collections would give that, and are the natural
+  companion to the Qdrant move above.
+- **Semantic / small-to-big chunking** — chunking follows document structure now, but within
+  a section it is still fixed-size. Splitting on semantic boundaries, or indexing small chunks
+  and expanding to their parent section at synthesis time, would help on long prose where a
+  section exceeds one chunk.
+- **A reranker** — grade-informed reranking reuses the Corrective-RAG grades, which is free
+  but coarse. A cross-encoder would rank better, at the cost of another model in the stack.
+- **User feedback signal** — no thumbs up/down, so nothing feeds retrieval quality back into
+  the system. The eval gate catches regressions against a fixed dataset; it can't tell you
+  the dataset stopped resembling what people actually ask.
+- **Horizontal scaling** — the deployment is pinned to a single worker (see the Dockerfile),
+  because embedded Chroma's SQLite backing locks its file to one process and both the ingest
+  task registry and the conversation store's write lock are per-process. Multiple replicas
+  means Chroma in server mode, the task registry in Redis, and conversations in Postgres.
 
 ## Testing
 
 ```bash
 uv run pytest          # offline unit + node + e2e tests (no external API calls)
+uv run pytest --cov    # ...with coverage (CI gates at 85%; currently ~90% with branch coverage)
 uv run pytest -m live  # also exercises real Gemini/DuckDuckGo calls; requires .env and a run of `ingest` first
 uv run ruff check .
 ```
@@ -447,12 +664,25 @@ cd frontend
 npm test               # Vitest + React Testing Library — hooks and components
 ```
 
+Optionally install the pre-commit hooks so lint, lockfile drift, and accidentally-staged
+`.env` files are caught before CI:
+
+```bash
+uv run pre-commit install
+```
+
+CI (`.github/workflows/ci.yml`) runs four jobs on every push and PR: **backend** (ruff +
+pytest with a coverage floor), **frontend** (oxlint, Vitest, production build), **audit**
+(`pip-audit` over the exported lockfile and `npm audit`, non-blocking), and **docker** (build,
+Trivy image scan, then boot the real image and wait on `/health`).
+
 ## Project layout
 
 ```
 src/rag_assistant/
 ├── config.py, llm.py, logging_conf.py   # settings, model factories, structured JSON logging
 ├── tracing.py, cache.py, readiness.py    # trace-ID contextvar, Redis cache, Chroma/web search health checks
+├── metrics.py, auth.py                   # Prometheus collectors + LLM callback handler, API-key auth
 ├── ingestion/                            # load -> split -> embed -> index the sample corpus
 ├── retrieval/                            # Chroma vector store, BM25 keyword store, DuckDuckGo web search
 ├── fusion/rrf.py                         # Reciprocal Rank Fusion (pure function)
@@ -479,3 +709,7 @@ frontend/src/
 ├── App.tsx                               # composition root
 └── index.css                             # shared theme (light/dark)
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

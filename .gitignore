@@ -18,3 +18,12 @@ frontend/.env
 
 # Local data stores
 data/corpus/*_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].*
+# Tenant-uploaded documents (see ingestion/ownership.py) -- private data, never committed
+data/corpus/_t/
+
+# OS / shell artifacts
+.DS_Store
+nul
+.coverage
+coverage.xml
+htmlcov/

@@ -1,10 +1,12 @@
 import re
 from pathlib import Path
 
+from rag_assistant.auth import PUBLIC_OWNER
 from rag_assistant.cache import cache_get, cache_key, cache_set
 from rag_assistant.config import get_settings
 from rag_assistant.graph.state import ResearchState
 from rag_assistant.ingestion.manifest import load_manifest
+from rag_assistant.ingestion.ownership import display_source, visible_owners
 from rag_assistant.llm import get_structured_llm
 from rag_assistant.prompts.router_prompt import ROUTER_PROMPT
 from rag_assistant.schemas.models import RouteDecision
@@ -12,18 +14,29 @@ from rag_assistant.schemas.models import RouteDecision
 _HASH_SUFFIX_RE = re.compile(r"_[0-9a-f]{8}$")
 
 
-def _describe_local_corpus() -> str:
+def _describe_local_corpus(owner: str = PUBLIC_OWNER) -> str:
     """Turns the ingestion manifest's indexed filenames into a human-readable topic list, so
     the router judges routes against what's actually indexed instead of a hardcoded, stale
     description -- otherwise a newly uploaded document outside the original topic set always
-    gets misrouted to web search even though it was correctly indexed locally."""
+    gets misrouted to web search even though it was correctly indexed locally.
+
+    Scoped to what this tenant can retrieve. Listing another tenant's filenames would leak
+    them through the router prompt even though retrieval itself filters them out -- and worse,
+    it would route the question to a local corpus that then returns nothing for this caller.
+    """
     manifest = load_manifest(get_settings().chroma_persist_dir)
-    if not manifest:
+    allowed = set(visible_owners(owner))
+    visible = {
+        source: entry
+        for source, entry in manifest.items()
+        if entry.get("owner", PUBLIC_OWNER) in allowed
+    }
+    if not visible:
         return "(empty -- no documents indexed yet)"
 
     topics = []
-    for filename in sorted(manifest):
-        stem = _HASH_SUFFIX_RE.sub("", Path(filename).stem)
+    for source in sorted(visible):
+        stem = _HASH_SUFFIX_RE.sub("", Path(display_source(source)).stem)
         topics.append(stem.replace("_", " ").replace("-", " ").strip())
     return "; ".join(topics)
 
@@ -34,7 +47,9 @@ def route_query(state: ResearchState) -> dict:
     the current corpus contents, so the cache key covers both -- a freshly uploaded document
     must not be masked by a decision cached before it existed."""
     question = state["question"]
-    corpus_description = _describe_local_corpus()
+    corpus_description = _describe_local_corpus(state.get("owner") or PUBLIC_OWNER)
+    # The corpus description is part of the cache key, so tenants with different visible
+    # corpora can't share a cached routing decision.
     key = cache_key("router", question, corpus_description)
     cached = cache_get(key)
     if cached is not None:

@@ -21,6 +21,7 @@ def build_research_summary(state: dict) -> ResearchSummary:
             web=_doc_count(state.get("web_results", [])),
         ),
         fused_document_count=len(state.get("fused_documents", [])),
+        context_documents_dropped=state.get("context_documents_dropped") or 0,
         confidence_score=state.get("confidence_score"),
         correction_attempted=bool(state.get("correction_attempted")),
         node_latencies_ms=[NodeLatency(**t) for t in node_timings],

@@ -1,0 +1,50 @@
+# Runs the fast checks locally so lint failures don't cost a CI round-trip.
+#
+#   uv run pre-commit install     # once per clone
+#   uv run pre-commit run --all-files
+#
+# Deliberately excludes the test suite: pytest belongs in CI, where it can take its time,
+# not in a hook that has to stay under a second or people start passing --no-verify. Also
+# excludes `ruff format` -- the codebase predates it, so enabling it would mean a repo-wide
+# reformat commit that buries real changes in whitespace. Run `ruff format` first if you
+# want it, then add the hook.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.20
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^(src|tests)/
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      # The secret this repo has actually leaked before is a .env (see the "stop tracking
+      # .env" commit), and .gitignore only helps for paths nobody force-adds.
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: detect-private-key
+
+  - repo: local
+    hooks:
+      # .gitignore covers this, but `git add -f` doesn't care and a leaked key costs a
+      # rotation. Belt and braces on the one mistake that is expensive to undo.
+      - id: no-committed-env-files
+        name: refuse to commit .env files
+        entry: .env files must never be committed -- use .env.example
+        language: fail
+        files: (^|/)\.env$
+
+      # The lockfile is what CI installs from (`uv sync --frozen`); a pyproject change
+      # without it produces a CI failure that looks unrelated to the commit that caused it.
+      - id: uv-lock-in-sync
+        name: uv.lock matches pyproject.toml
+        entry: uv lock --check
+        language: system
+        files: ^(pyproject\.toml|uv\.lock)$
+        pass_filenames: false

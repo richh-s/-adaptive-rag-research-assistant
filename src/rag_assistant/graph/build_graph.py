@@ -16,6 +16,7 @@ from rag_assistant.graph.nodes.router import after_route, route_query
 from rag_assistant.graph.nodes.synthesize import synthesize_answer
 from rag_assistant.graph.nodes.web_search_node import web_search
 from rag_assistant.graph.state import ResearchState
+from rag_assistant.metrics import record_node_timing
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ def _timed(node_name: str, node_fn: Callable[[dict], dict]) -> Callable[[dict], 
         start = time.perf_counter()
         result = node_fn(state)
         elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
+        record_node_timing(node_name, elapsed_ms / 1000)
         logger.info(
             "node completed",
             extra={"trace_id": state.get("trace_id"), "node": node_name, "latency_ms": elapsed_ms},

@@ -85,7 +85,7 @@ def test_multi_page_pdf_indexes_every_page(sample_corpus_dir, fake_embeddings, t
 
     # BM25's lazily-built singleton cache must also have been invalidated by build_index,
     # not just Chroma -- otherwise local-corpus queries silently miss newly ingested PDFs.
-    bm25_results = bm25_search("Cohere rerankers", k=10, source_dir=sample_corpus_dir)
+    bm25_results = bm25_search("Cohere rerankers", k=10, persist_dir=persist_dir)
     assert any(r.source_id == "cohere.pdf" for r in bm25_results)
 
 
@@ -145,7 +145,7 @@ def test_bm25_index_is_eagerly_rebuilt_not_left_stale_after_build_index(
     persist_dir = tmp_path / "chroma"
     build_index(source_dir=sample_corpus_dir, persist_dir=persist_dir, embeddings=fake_embeddings)
     # Warm the cache once so we can prove the *next* build_index() call refreshes it inline.
-    get_bm25_index(sample_corpus_dir)
+    get_bm25_index(persist_dir)
 
     (sample_corpus_dir / "anthropic.md").write_text("Anthropic ships Claude Opus 5 today.")
 
@@ -155,7 +155,7 @@ def test_bm25_index_is_eagerly_rebuilt_not_left_stale_after_build_index(
         build_index(source_dir=sample_corpus_dir, persist_dir=persist_dir, embeddings=fake_embeddings)
         # build_index() itself must trigger the rebuild -- not merely invalidate and leave it
         # for whichever request happens to call get_bm25_index/bm25_search next.
-        spy.assert_called_once_with(sample_corpus_dir)
+        spy.assert_called_once_with(persist_dir)
 
     # Assert against the rebuilt chunks directly rather than through bm25_search's score-filtered
     # results: with only 2 documents in this fixture, BM25Okapi's idf for a term appearing in
@@ -163,5 +163,5 @@ def test_bm25_index_is_eagerly_rebuilt_not_left_stale_after_build_index(
     # legitimately score every result 0 and get filtered out by bm25_search's `score > 0` guard.
     # That's a corpus-size artifact of BM25 scoring, not a signal about whether the rebuild
     # happened -- which is what this test is actually checking.
-    _, chunks = get_bm25_index(sample_corpus_dir)
+    _, chunks = get_bm25_index(persist_dir)
     assert any("Opus 5" in chunk.page_content for chunk in chunks)

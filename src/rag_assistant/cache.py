@@ -17,6 +17,7 @@ from typing import Any
 import redis
 
 from rag_assistant.config import get_settings
+from rag_assistant.metrics import record_cache
 
 logger = logging.getLogger(__name__)
 
@@ -43,15 +44,25 @@ def cache_key(namespace: str, *parts: str) -> str:
     return f"{_KEY_PREFIX}:{namespace}:{digest}"
 
 
+def _namespace_of(key: str) -> str:
+    """The namespace segment of a `v1:<namespace>:<digest>` key, for metric labelling. The
+    digest is deliberately excluded -- one series per cached question would be unbounded."""
+    parts = key.split(":")
+    return parts[1] if len(parts) > 2 else "unknown"
+
+
 def cache_get(key: str) -> Any | None:
     client = _get_client()
     if client is None:
+        record_cache(_namespace_of(key), "disabled")
         return None
     try:
         raw = client.get(key)
     except Exception:
         logger.warning("Redis GET failed for key=%s; treating as cache miss", key, exc_info=True)
+        record_cache(_namespace_of(key), "error")
         return None
+    record_cache(_namespace_of(key), "hit" if raw is not None else "miss")
     return json.loads(raw) if raw is not None else None
 
 

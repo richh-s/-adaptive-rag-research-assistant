@@ -286,7 +286,7 @@ def test_ingest_persists_file_and_schedules_background_index(monkeypatch, tmp_pa
     monkeypatch.setattr(
         api,
         "_run_ingest_in_background",
-        lambda trace_id, task_id: scheduled.append((trace_id, task_id)),
+        lambda trace_id, task_id, owner: scheduled.append((trace_id, task_id, owner)),
     )
     client = TestClient(api.app)
 
@@ -313,7 +313,7 @@ def test_ingest_persists_file_and_schedules_background_index(monkeypatch, tmp_pa
 
 def test_ingest_sanitizes_path_traversal_in_filename(monkeypatch, tmp_path):
     monkeypatch.setenv("CORPUS_DIR", str(tmp_path))
-    monkeypatch.setattr(api, "_run_ingest_in_background", lambda trace_id, task_id: None)
+    monkeypatch.setattr(api, "_run_ingest_in_background", lambda trace_id, task_id, owner: None)
     client = TestClient(api.app)
 
     response = client.post(

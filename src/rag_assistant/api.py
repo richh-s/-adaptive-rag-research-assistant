@@ -13,23 +13,24 @@ from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
-from rag_assistant import auth
+from rag_assistant import auth, metrics
 from rag_assistant.config import get_settings
 from rag_assistant.conversations import store as conversations
 from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.graph.research_summary import build_research_summary
 from rag_assistant.ingestion.build_index import build_index
 from rag_assistant.ingestion.loaders import SUPPORTED_SUFFIXES
+from rag_assistant.ingestion.ownership import owner_corpus_dir
 from rag_assistant.ingestion.tasks import create_task, get_task, update_task
 from rag_assistant.ingestion.url_fetch import UrlIngestError, fetch_page, page_to_markdown
 from rag_assistant.logging_conf import configure_logging
-from rag_assistant.readiness import check_chroma, check_web_search
+from rag_assistant.readiness import check_chroma, check_local_llm, check_web_search
 from rag_assistant.schemas.api import (
     ConversationDetail,
     ConversationMessage,
@@ -55,7 +56,7 @@ if get_settings().sentry_dsn:
     sentry_sdk.init(
         dsn=get_settings().sentry_dsn,
         environment=get_settings().app_env,
-        traces_sample_rate=0.0,
+        traces_sample_rate=get_settings().sentry_traces_sample_rate,
     )
 
 # Graceful shutdown: SIGTERM sets `_shutdown_event`, which every active SSE stream polls each
@@ -139,24 +140,31 @@ def _global_limit() -> str:
 
 # Allows the Vite dev server (and any local frontend build served on another port) to call
 # this API directly from the browser during development.
+# Origins come from CORS_ALLOW_ORIGINS (see config.py) rather than being hardcoded: the
+# defaults cover the Vite dev server, the single-container deploy needs none of them because
+# it serves the frontend same-origin, and a split deploy (UI on Vercel, API on Render) is a
+# config change instead of a code change. Registering the middleware unconditionally -- with
+# an empty list it simply matches no origin -- keeps one code path for every deployment shape.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5175",
-        "http://127.0.0.1:5175",
-    ],
+    allow_origins=get_settings().cors_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Trace-Id"],
 )
 
 
-class TraceIdMiddleware:
+class ObservabilityMiddleware:
     """Raw ASGI middleware (not `BaseHTTPMiddleware`, which buffers/consumes the response body
-    in a way that's unsafe for our SSE streams) -- generates one UUID4 per request, stores it
-    in `trace_id_var` for the lifetime of the request's task, echoes it back as a response
-    header, and logs one structured line per request with route + total latency_ms."""
+    in a way that's unsafe for our SSE streams) carrying all three per-request observability
+    concerns: it generates one UUID4 trace ID and stores it in `trace_id_var` for the lifetime
+    of the request's task, echoes it back as a response header, logs one structured line per
+    request, and records the Prometheus request counter/histogram.
+
+    All three share one timer and one wrapper rather than stacking separate middlewares --
+    a second layer would re-wrap `send` for no reason and report a slightly different latency
+    than the log line, which is exactly the kind of discrepancy that wastes an incident.
+    """
 
     def __init__(self, app):
         self.app = app
@@ -169,9 +177,15 @@ class TraceIdMiddleware:
         trace_id = new_trace_id()
         token = trace_id_var.set(trace_id)
         start = time.perf_counter()
+        # Captured from the response-start message: a request whose connection drops before
+        # any response is sent never sets this, and 499 (nginx's client-closed convention)
+        # keeps those out of the 5xx bucket where they would look like server errors.
+        status_code = 499
 
         async def send_wrapper(message: dict) -> None:
+            nonlocal status_code
             if message["type"] == "http.response.start":
+                status_code = message["status"]
                 headers = message.setdefault("headers", [])
                 headers.append((b"x-trace-id", trace_id.encode()))
             await send(message)
@@ -179,11 +193,17 @@ class TraceIdMiddleware:
         try:
             await self.app(scope, receive, send_wrapper)
         finally:
-            latency_ms = round((time.perf_counter() - start) * 1000, 1)
+            elapsed = time.perf_counter() - start
             logger.info(
                 "request completed",
-                extra={"route": scope.get("path", ""), "latency_ms": latency_ms},
+                extra={"route": scope.get("path", ""), "latency_ms": round(elapsed * 1000, 1)},
             )
+            # Metrics must never break a request that otherwise succeeded, and this runs in a
+            # `finally` that is also unwinding whatever exception the app may have raised.
+            try:
+                metrics.observe_request(scope, status_code, elapsed)
+            except Exception:
+                logger.warning("failed to record request metrics", exc_info=True)
             trace_id_var.reset(token)
 
 
@@ -194,7 +214,9 @@ class AuthMiddleware:
     "public" tenant and never rejects -- open demo mode. OPTIONS passes through so CORS
     preflights (which never carry credentials) reach the CORS layer."""
 
-    PROTECTED_PREFIXES = ("/research", "/api/v1/")
+    # /metrics rides along: with auth enabled a scraper must present a key like any other
+    # client, and with auth disabled (open demo) it stays reachable, same as everything else.
+    PROTECTED_PREFIXES = ("/research", "/api/v1/", "/metrics")
 
     def __init__(self, app):
         self.app = app
@@ -234,7 +256,7 @@ class AuthMiddleware:
 
 
 app.add_middleware(AuthMiddleware)
-app.add_middleware(TraceIdMiddleware)
+app.add_middleware(ObservabilityMiddleware)
 
 # Building the graph only wires node functions together -- no API calls happen until
 # `.invoke(...)` runs, so one compiled graph can be safely reused across every request.
@@ -272,16 +294,34 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+if get_settings().metrics_enabled:
+
+    @app.get("/metrics", include_in_schema=False)
+    def prometheus_metrics() -> Response:
+        """Prometheus exposition. Registered conditionally (METRICS_ENABLED) rather than
+        always-on-and-404ing, so a scraper pointed at a deployment that disabled metrics gets
+        an unambiguous 404 instead of an empty 200 that looks like a healthy zero."""
+        payload, content_type = metrics.render()
+        return Response(content=payload, media_type=content_type)
+
+
 @app.get("/ready")
 def ready() -> JSONResponse:
     chroma_ok, chroma_err = check_chroma()
     web_search_ok, web_search_err = check_web_search()
+    # Reported but deliberately NOT part of the ready/unavailable verdict: an unreachable
+    # self-hosted endpoint is a cost and latency regression (every call falls through to
+    # Anthropic), not an outage, so it shouldn't pull a healthy replica out of a load
+    # balancer -- while still being visible to whoever is looking at why the bill moved.
+    local_llm_ok, local_llm_err = check_local_llm()
+    ready_ok = chroma_ok and web_search_ok
     body = {
-        "status": "ok" if chroma_ok and web_search_ok else "unavailable",
+        "status": "ok" if ready_ok else "unavailable",
         "chroma": {"ok": chroma_ok, "error": chroma_err},
         "web_search": {"ok": web_search_ok, "error": web_search_err},
+        "local_llm": {"ok": local_llm_ok, "error": local_llm_err},
     }
-    return JSONResponse(content=body, status_code=200 if chroma_ok and web_search_ok else 503)
+    return JSONResponse(content=body, status_code=200 if ready_ok else 503)
 
 
 # Generous but bounded -- a stray multi-hundred-page PDF (or a client sending garbage)
@@ -299,7 +339,7 @@ def _safe_stem(filename: str) -> str:
     return cleaned or "upload"
 
 
-def _run_ingest_in_background(trace_id: str, task_id: str) -> None:
+def _run_ingest_in_background(trace_id: str, task_id: str, owner: str) -> None:
     """Runs in FastAPI's threadpool after the response has already been sent (see
     BackgroundTasks below) -- exceptions here would otherwise vanish silently, so they're
     caught, logged, and reflected onto the task record rather than left to crash the worker
@@ -310,8 +350,11 @@ def _run_ingest_in_background(trace_id: str, task_id: str) -> None:
     token = trace_id_var.set(trace_id)
     update_task(task_id, stage="parsing", message="Starting ingestion...")
     try:
+        # Scoped to the uploading tenant: their upload should cost their corpus, not a
+        # scan of every other tenant's documents (see ingestion/loaders.iter_corpus_files).
         result = build_index(
-            on_stage=lambda stage, message: update_task(task_id, stage=stage, message=message)
+            owner=owner,
+            on_stage=lambda stage, message: update_task(task_id, stage=stage, message=message),
         )
         logger.info(
             "background ingestion complete",
@@ -361,13 +404,16 @@ async def ingest_document(
         )
 
     settings = get_settings()
-    settings.corpus_dir.mkdir(parents=True, exist_ok=True)
+    # Written into the uploading tenant's subtree, which is what makes the document private
+    # to them; the public tenant keeps writing flat, so an open demo's layout is unchanged.
+    dest_dir = owner_corpus_dir(settings.corpus_dir, auth.get_owner())
+    dest_dir.mkdir(parents=True, exist_ok=True)
 
     # Short UUID suffix avoids collisions between uploads that share a filename (including
     # two concurrent uploads of the exact same file) without needing to inspect existing
     # corpus contents first.
     dest_name = f"{_safe_stem(file.filename)}_{uuid.uuid4().hex[:8]}{suffix}"
-    dest_path = settings.corpus_dir / dest_name
+    dest_path = dest_dir / dest_name
 
     size_bytes = 0
     try:
@@ -397,7 +443,7 @@ async def ingest_document(
     logger.info("upload persisted", extra={"dest_name": dest_name, "size_bytes": size_bytes})
 
     task = create_task(filename=dest_name, original_filename=file.filename)
-    background_tasks.add_task(_run_ingest_in_background, get_trace_id(), task.task_id)
+    background_tasks.add_task(_run_ingest_in_background, get_trace_id(), task.task_id, auth.get_owner())
 
     return IngestResponse(
         task_id=task.task_id,
@@ -431,18 +477,19 @@ def ingest_url(
         raise HTTPException(status_code=500, detail="Failed to fetch the URL.") from exc
 
     settings = get_settings()
-    settings.corpus_dir.mkdir(parents=True, exist_ok=True)
+    dest_dir = owner_corpus_dir(settings.corpus_dir, auth.get_owner())
+    dest_dir.mkdir(parents=True, exist_ok=True)
 
     stem_source = page.title or Path(str(page.url)).name or "webpage"
     dest_name = f"{_safe_stem(stem_source)[:60]}_{uuid.uuid4().hex[:8]}.md"
-    dest_path = settings.corpus_dir / dest_name
+    dest_path = dest_dir / dest_name
     markdown = page_to_markdown(page)
     dest_path.write_text(markdown, encoding="utf-8")
 
     logger.info("url ingested", extra={"dest_name": dest_name, "url": page.url})
 
     task = create_task(filename=dest_name, original_filename=body.url)
-    background_tasks.add_task(_run_ingest_in_background, get_trace_id(), task.task_id)
+    background_tasks.add_task(_run_ingest_in_background, get_trace_id(), task.task_id, auth.get_owner())
 
     return IngestResponse(
         task_id=task.task_id,
@@ -515,7 +562,14 @@ def _persist_exchange(body: ResearchRequest, final_state: dict) -> str | None:
         return body.conversation_id
 
 
-@app.post("/research", response_model=ResearchResponse)
+# Two paths, one handler. `/api/v1/research` is canonical -- it matches every other endpoint
+# in this app and leaves room to ship a v2 without breaking callers -- while the original
+# unversioned `/research` stays registered so existing clients (and the README's curl
+# examples from before versioning) keep working. The alias is marked deprecated and hidden
+# from the schema so the docs show one obvious path. Decorators apply bottom-up, so both
+# registrations sit above the rate limiters and each route gets both budgets applied.
+@app.post("/api/v1/research", response_model=ResearchResponse)
+@app.post("/research", response_model=ResearchResponse, deprecated=True, include_in_schema=False)
 @limiter.limit(_per_ip_limit)
 @global_limiter.limit(_global_limit)
 def research(request: Request, body: ResearchRequest) -> ResearchResponse:
@@ -526,13 +580,17 @@ def research(request: Request, body: ResearchRequest) -> ResearchResponse:
                 "question": body.question,
                 "chat_history": history,
                 "trace_id": get_trace_id(),
+                # Retrieval is scoped to this tenant -- see ingestion/ownership.py.
+                "owner": auth.get_owner(),
             },
             config={"recursion_limit": _RECURSION_LIMIT},
         )
     except Exception as exc:
         logger.exception("research failed for question=%r", body.question)
+        metrics.record_graph_run(None, "error")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    metrics.record_graph_run(result.get("route"), "ok")
     conversation_id = _persist_exchange(body, result)
 
     return ResearchResponse(
@@ -546,7 +604,9 @@ def research(request: Request, body: ResearchRequest) -> ResearchResponse:
     )
 
 
-async def _stream_research_events(body: ResearchRequest, history: list[dict]) -> AsyncIterator[str]:
+async def _stream_research_events(
+    body: ResearchRequest, history: list[dict], owner: str
+) -> AsyncIterator[str]:
     question = body.question
     # Once this generator has started, the response is already HTTP 200 with headers flushed
     # -- there is no way to surface an HTTP error status mid-stream. Every failure, including
@@ -555,6 +615,7 @@ async def _stream_research_events(body: ResearchRequest, history: list[dict]) ->
     timeout_seconds = get_settings().graph_timeout_seconds
     connection = _StreamConnection()
     _active_streams.add(connection)
+    metrics.sse_streams_active.inc()
     try:
         final_state: dict = {}
         # Two stream modes at once: "updates" drives the per-node progress frames, and
@@ -565,6 +626,7 @@ async def _stream_research_events(body: ResearchRequest, history: list[dict]) ->
                 "question": question,
                 "chat_history": history,
                 "trace_id": get_trace_id(),
+                "owner": owner,
             },
             config={"recursion_limit": _RECURSION_LIMIT},
             stream_mode=["updates", "messages"],
@@ -618,6 +680,7 @@ async def _stream_research_events(body: ResearchRequest, history: list[dict]) ->
                 )
                 yield f"data: {event.model_dump_json()}\n\n"
 
+        metrics.record_graph_run(final_state.get("route"), "ok")
         conversation_id = _persist_exchange(body, final_state)
 
         done_event = StreamEvent(
@@ -632,22 +695,32 @@ async def _stream_research_events(body: ResearchRequest, history: list[dict]) ->
         yield f"data: {done_event.model_dump_json()}\n\n"
     except Exception as exc:
         logger.exception("research_stream failed for question=%r", question)
+        # A timeout is its own outcome, not a generic failure: the two have completely
+        # different responses (raise GRAPH_TIMEOUT_SECONDS vs. go find the broken provider),
+        # and collapsing them into one counter hides which is happening.
+        outcome = "timeout" if isinstance(exc, TimeoutError) else "error"
+        metrics.record_graph_run(None, outcome)
         detail = str(exc) or f"{type(exc).__name__} (no further detail from the underlying service)"
         error_event = StreamEvent(type="error", detail=detail)
         yield f"data: {error_event.model_dump_json()}\n\n"
     finally:
         _active_streams.discard(connection)
+        metrics.sse_streams_active.dec()
 
 
-@app.post("/research/stream")
+@app.post("/api/v1/research/stream")
+@app.post("/research/stream", deprecated=True, include_in_schema=False)
 @limiter.limit(_per_ip_limit)
 @global_limiter.limit(_global_limit)
 async def research_stream(request: Request, body: ResearchRequest) -> StreamingResponse:
     # History (and the conversation_id 404) resolves before streaming starts -- once the
     # generator yields, the status is locked at 200 and errors can only be SSE frames.
     history = _resolve_history(body)
+    # The owner is resolved here rather than inside the generator: `auth.owner_var` is a
+    # contextvar reset when the request handler returns, and the generator runs *after* that,
+    # while the response streams. Reading it lazily would see the default tenant.
     return StreamingResponse(
-        _stream_research_events(body, history),
+        _stream_research_events(body, history, auth.get_owner()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

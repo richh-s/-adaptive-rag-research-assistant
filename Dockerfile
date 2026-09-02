@@ -64,4 +64,13 @@ EXPOSE 8000
 # direct peer is the LB, so without honoring X-Forwarded-For every visitor shares one
 # rate-limit bucket. Trusting all proxies is right for platforms whose LB always sits in
 # front; override FORWARDED_ALLOW_IPS when exposing the container directly.
-CMD ["sh", "-c", "rag-assistant ingest || true; exec uvicorn rag_assistant.api:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips '*'"]
+# --workers 1 is a correctness constraint, not a performance default, so it is stated
+# explicitly rather than left to uvicorn's default: embedded Chroma is SQLite-backed and locks
+# its file to one process, and both the ingest-task registry (ingestion/tasks.py) and the
+# conversation store's write lock are per-process. A second worker doesn't halve latency here,
+# it produces "unknown ingest task" 404s and database-locked errors. Scaling out means moving
+# Chroma to server mode and the task registry to Redis first -- see docker-compose.yml.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8000')+'/health').read()" || exit 1
+
+CMD ["sh", "-c", "rag-assistant ingest || true; exec uvicorn rag_assistant.api:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --proxy-headers --forwarded-allow-ips '*'"]

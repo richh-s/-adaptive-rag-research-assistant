@@ -5,7 +5,9 @@ from langchain_chroma import Chroma
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStoreRetriever
 
+from rag_assistant.auth import PUBLIC_OWNER
 from rag_assistant.config import get_settings
+from rag_assistant.ingestion.ownership import visible_owners
 from rag_assistant.llm import get_embeddings_model
 
 COLLECTION_NAME = "research_corpus"
@@ -39,7 +41,21 @@ def get_vector_store(
 
 
 def get_retriever(
-    k: int = 4, embeddings: Embeddings | None = None, persist_dir: Path | None = None
+    k: int = 4,
+    embeddings: Embeddings | None = None,
+    persist_dir: Path | None = None,
+    owner: str = PUBLIC_OWNER,
 ) -> VectorStoreRetriever:
+    """A retriever scoped to what `owner` is allowed to see: their own documents plus the
+    shared public corpus.
+
+    The filter is applied by Chroma during search rather than by dropping results afterwards.
+    That is not just efficiency -- post-filtering would silently shrink k, so a tenant whose
+    top hits belong to someone else would get fewer documents (sometimes none) with no
+    indication why, and the graph would read that as "the corpus has nothing" and fall back
+    to web search.
+    """
     store = get_vector_store(embeddings=embeddings, persist_dir=persist_dir)
-    return store.as_retriever(search_kwargs={"k": k})
+    return store.as_retriever(
+        search_kwargs={"k": k, "filter": {"owner": {"$in": visible_owners(owner)}}}
+    )

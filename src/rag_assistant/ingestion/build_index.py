@@ -8,9 +8,10 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
 from rag_assistant.config import get_settings
-from rag_assistant.ingestion.loaders import load_documents
-from rag_assistant.ingestion.manifest import hash_content, load_manifest, save_manifest
-from rag_assistant.ingestion.splitter import split_documents
+from rag_assistant.ingestion.loaders import LOADER_VERSION, iter_corpus_files, load_corpus_file
+from rag_assistant.ingestion.manifest import load_manifest, save_manifest
+from rag_assistant.ingestion.splitter import CHUNKING_VERSION, split_documents
+from rag_assistant.ingestion.ownership import owner_of_relative_path
 from rag_assistant.retrieval.bm25_store import get_bm25_index, invalidate_bm25_index
 from rag_assistant.retrieval.vector_store import get_vector_store
 
@@ -32,6 +33,11 @@ class IndexResult:
     changed_files: int
     skipped_files: int
     removed_files: int
+    # How many files were actually parsed. Distinct from `changed_files` only when a parse
+    # produced no indexable content -- it exists so the expensive step is measurable, since
+    # "skipped 40 files" used to be true of embedding while every one of them was still
+    # parsed (and, for PDFs with vision on, paid for) first.
+    parsed_files: int = 0
 
 
 def _chunk_ids(source: str, chunks: list[Document]) -> list[str]:
@@ -54,6 +60,7 @@ def build_index(
     embeddings: Embeddings | None = None,
     incremental: bool = True,
     on_stage: Callable[[str, str], None] | None = None,
+    owner: str | None = None,
 ) -> IndexResult:
     """Load the corpus, chunk it, embed it, and (re)populate the Chroma collection.
 
@@ -72,10 +79,22 @@ def build_index(
     source_dir = source_dir or settings.corpus_dir
     persist_dir = persist_dir or settings.chroma_persist_dir
 
+    if owner is not None and not incremental:
+        # A full rebuild resets the whole collection, which would delete every other
+        # tenant's chunks while only re-indexing this one's. Refuse rather than corrupt.
+        raise ValueError(
+            "A non-incremental rebuild cannot be scoped to one owner -- it resets the "
+            "entire collection. Run build_index(incremental=False) without an owner."
+        )
+
     with INGEST_LOCK:
         if on_stage:
-            on_stage("parsing", "Loading and parsing corpus files...")
-        documents = load_documents(source_dir)
+            on_stage("parsing", "Scanning corpus for changes...")
+        # Enumerate and fingerprint first, parse second. Fingerprinting reads raw bytes;
+        # parsing runs pymupdf4llm and, with PDF_VISION on, a vision API call per figure.
+        # Deciding what to re-index from the cheap signal is the entire point -- it makes an
+        # upload cost the changed files rather than the whole corpus, twice over.
+        corpus_files = iter_corpus_files(source_dir, owner=owner)
         store = get_vector_store(embeddings=embeddings, persist_dir=persist_dir)
 
         if not incremental:
@@ -84,9 +103,17 @@ def build_index(
         else:
             manifest = load_manifest(persist_dir)
 
-        docs_by_source = _group_by_source(documents)
+        files_by_source = {f.source: f for f in corpus_files}
 
-        removed_sources = set(manifest) - set(docs_by_source)
+        # Removal detection is scoped to the same slice that was scanned. Comparing a
+        # single tenant's scan against the whole manifest would read every other tenant's
+        # documents as deleted and drop their chunks.
+        tracked_sources = {
+            source
+            for source in manifest
+            if owner is None or owner_of_relative_path(Path(source)) == owner
+        }
+        removed_sources = tracked_sources - set(files_by_source)
         for source in removed_sources:
             store.delete(ids=manifest[source]["chunk_ids"])
             del manifest[source]
@@ -97,14 +124,26 @@ def build_index(
         indexed_chunks = 0
         changed_files = 0
         skipped_files = 0
-        for source, docs in docs_by_source.items():
-            # Hash every page/Document's content together (order-sensitive) so a change to
-            # any single page of a multi-page PDF is detected, not just whole-file changes.
-            content_hash = hash_content("\x00".join(doc.page_content for doc in docs))
+        parsed_files = 0
+        for source, corpus_file in files_by_source.items():
             existing = manifest.get(source)
-            if existing and existing["hash"] == content_hash:
+            # Three independent reasons to re-index, all checkable without parsing: the bytes
+            # changed, the chunking strategy changed, or a loader changed. The version checks
+            # are what make those changes self-applying migrations -- without them an
+            # unchanged file's fingerprint still matches, the file is skipped, and the
+            # collection keeps serving chunks built by code that no longer exists. Silent,
+            # and visible only as quietly worse retrieval.
+            if (
+                existing
+                and existing.get("file_hash") == corpus_file.fingerprint
+                and existing.get("chunking_version") == CHUNKING_VERSION
+                and existing.get("loader_version") == LOADER_VERSION
+            ):
                 skipped_files += 1
                 continue
+
+            docs = load_corpus_file(corpus_file)
+            parsed_files += 1
 
             if existing:
                 store.delete(ids=existing["chunk_ids"])
@@ -113,14 +152,24 @@ def build_index(
             chunk_ids = _chunk_ids(source, chunks)
             if chunks:
                 store.add_documents(chunks, ids=chunk_ids)
-            manifest[source] = {"hash": content_hash, "chunk_ids": chunk_ids}
+            manifest[source] = {
+                "file_hash": corpus_file.fingerprint,
+                "chunk_ids": chunk_ids,
+                "chunking_version": CHUNKING_VERSION,
+                "loader_version": LOADER_VERSION,
+                # Recorded for the router's corpus description, which must list only what the
+                # asking tenant can actually retrieve. Chunk metadata carries the owner too
+                # (that is what filters retrieval); this copy just saves reading Chroma to
+                # answer "what is in this corpus for me".
+                "owner": corpus_file.owner,
+            }
             indexed_chunks += len(chunks)
             changed_files += 1
 
         save_manifest(persist_dir, manifest)
 
         # Hot-reload, part 1/2 -- BM25: the index is a lazily-built in-memory singleton (see
-        # bm25_store.py) with no awareness of when the corpus on disk changes. Rebuilding it
+        # bm25_store.py) with no awareness of when the collection changes. Rebuilding it
         # *eagerly* here (not just invalidating and leaving it to the next query to rebuild
         # lazily) means that by the time this function returns -- and callers like
         # `/api/v1/ingest`'s background task mark the job "indexed" -- BM25 has already
@@ -136,8 +185,8 @@ def build_index(
         # multi-worker deployment would break this assumption -- see tasks.py's module
         # docstring -- but this project runs a single worker.)
         if changed_files or removed_sources:
-            invalidate_bm25_index(source_dir)
-            get_bm25_index(source_dir)
+            invalidate_bm25_index(persist_dir)
+            get_bm25_index(persist_dir)
             if on_stage:
                 on_stage("indexing", "Refreshing in-memory search indices...")
 
@@ -146,4 +195,5 @@ def build_index(
         changed_files=changed_files,
         skipped_files=skipped_files,
         removed_files=len(removed_sources),
+        parsed_files=parsed_files,
     )

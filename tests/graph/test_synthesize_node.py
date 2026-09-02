@@ -21,7 +21,11 @@ def test_empty_retrieval_uses_empty_retrieval_prompt(monkeypatch):
     fake_llm.invoke.assert_called_once_with(
         EMPTY_RETRIEVAL_PROMPT.format(question="What is the price of Bitcoin?", history_block="")
     )
-    assert result == {"final_answer": "No sources found.", "citations": []}
+    assert result == {
+        "final_answer": "No sources found.",
+        "citations": [],
+        "context_documents_dropped": 0,
+    }
 
 
 def test_synthesize_returns_cached_answer_without_calling_llm(monkeypatch):

@@ -26,6 +26,40 @@ class Settings(BaseSettings):
         ..., description="Anthropic API key; when set, becomes the primary chat model"
     )
 
+    # Self-hosted models on an OpenAI-compatible /v1 endpoint (Ollama, vLLM, LM Studio,
+    # llama.cpp). Setting LOCAL_LLM_BASE_URL promotes the local box to *primary* chat and
+    # reasoning provider, with Anthropic and Gemini demoted to fallbacks behind it -- so every
+    # graph node runs at $0 while the endpoint is reachable, and a host that can't reach it
+    # (a Render/Vercel deploy that isn't on the tailnet) degrades to Claude rather than failing.
+    # Leave blank to disable entirely; nothing about the Anthropic/Gemini path changes.
+    local_llm_base_url: str = ""
+    local_llm_api_key: str = ""
+    local_llm_chat_model: str = "gemma-4-26b"
+    # Deliberately NOT a local embeddings switch: the Chroma collection is built at one
+    # embedding dimension, and swapping providers under an existing index yields silent
+    # garbage retrieval rather than an error. Embeddings stay on Gemini -- see llm.py.
+
+    # Local generation is slow (a 26B on one GPU scores a draft in ~20-25s), so the read
+    # timeout is long -- but the connect timeout is short on purpose. Off the tailnet there is
+    # no route to the box at all, and a fast connect failure is what makes the Anthropic
+    # fallback fire in ~2s instead of burning the whole GRAPH_TIMEOUT_SECONDS budget hanging.
+    local_llm_timeout_seconds: float = 180.0
+    local_llm_connect_timeout_seconds: float = 2.0
+    # Reasoning models spend their budget thinking before answering; without a floor the
+    # response comes back truncated with an empty `content`.
+    local_llm_max_tokens: int = 4096
+    # One retry, not zero: single-model Ollama returns a transient 500 while swapping models.
+    local_llm_max_retries: int = 1
+    # How structured output is requested. "json_schema" binds the schema as `response_format`
+    # so the server constrains decoding, and parses the JSON back off `content` -- see
+    # llm.py's _local_structured_runnable for why LangChain's own json_schema path can't be
+    # used against a self-hosted server. "function_calling" suits servers with tool support
+    # but no guided decoding; "json_mode" suits servers with neither, at the cost of the
+    # model never seeing the schema.
+    local_llm_structured_output_method: Literal[
+        "json_schema", "function_calling", "json_mode"
+    ] = "json_schema"
+
     gemini_chat_model: str = "gemini-2.5-flash"
     gemini_embedding_model: str = "models/gemini-embedding-001"
     anthropic_chat_model: str = "claude-sonnet-5"
@@ -42,6 +76,18 @@ class Settings(BaseSettings):
     static_dir: Path | None = None
 
     confidence_threshold: float = 0.6
+
+    # Ceiling on how much retrieved context reaches the synthesis prompt (see
+    # graph/context_budget.py). Fusion's output size scales with sub-queries x retrieval
+    # paths, not with the question, so without a cap prompt cost and latency grow with
+    # retrieval breadth and eventually overflow the model's context window. Documents arrive
+    # ranked, so the cap drops the ones already judged least useful. 0 disables it.
+    synthesis_context_budget_tokens: int = 6000
+    # Characters per token, for estimating the above. Deliberately an estimate: Anthropic,
+    # Gemini and self-hosted servers don't share a tokenizer, so an exact count for one is
+    # wrong for the others. ~4 is a reasonable English average; lower it to be more
+    # conservative on token-dense content like code or CJK text.
+    synthesis_chars_per_token: float = 4.0
 
     # PDF vision ingestion (see ingestion/vision.py): describe embedded figures and
     # transcribe scanned pages with the chat provider's vision capability. Costs one
@@ -60,8 +106,35 @@ class Settings(BaseSettings):
     # are scoped to it and rate limits are keyed by it.
     api_keys: str = ""
 
+    # Browser origins allowed to call this API cross-origin. The defaults cover the Vite dev
+    # server; the single-container deploy serves the frontend from this same origin, so it
+    # needs none of these. Set CORS_ALLOW_ORIGINS (comma-separated) when the frontend is
+    # hosted separately -- e.g. "https://myapp.vercel.app". "*" is accepted but disables
+    # credentialed requests per the CORS spec, so prefer explicit origins.
+    cors_allow_origins: str = (
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "http://localhost:5175,http://127.0.0.1:5175"
+    )
+
     # error tracking -- when set, Sentry captures unhandled exceptions (see api.py).
     sentry_dsn: str = ""
+    # Fraction of requests sampled for Sentry performance tracing. 0.0 (errors only) is the
+    # default because tracing every request on a low-traffic demo is pure quota burn; raise
+    # it to ~0.1 once there is enough traffic for latency percentiles to mean anything.
+    sentry_traces_sample_rate: float = 0.0
+
+    # Prometheus metrics at GET /metrics (see metrics.py). On by default -- the endpoint is
+    # process-local and cheap; set METRICS_ENABLED=false to remove it entirely if the
+    # deployment exposes the port publicly and you would rather not publish route timings.
+    metrics_enabled: bool = True
+
+    # Conversation retention (see conversations/store.py). Without a ceiling the transcript
+    # table grows forever on a mounted volume -- ingest tasks already cap at 500, this is the
+    # equivalent bound for durable history. Pruning runs after each appended turn, scoped to
+    # the tenant that just wrote, so it costs one indexed DELETE and never scans other owners.
+    # Set either to 0 to disable that half of the policy.
+    conversation_retention_days: int = 90
+    conversation_max_per_owner: int = 500
 
     # rate limiting -- see api.py's limiter setup.
     rate_limit_rpm: int = 10
@@ -77,6 +150,13 @@ class Settings(BaseSettings):
     # a stuck provider from starving the rest of the graph's budget.
     llm_request_timeout_seconds: float = 12.0
     llm_max_retries: int = 1
+
+
+    def cors_origins(self) -> list[str]:
+        """CORS_ALLOW_ORIGINS split into the list CORSMiddleware wants. Blank means no
+        cross-origin browser access at all -- correct for the single-container deploy,
+        where the frontend is same-origin and CORS never enters the picture."""
+        return [origin.strip() for origin in self.cors_allow_origins.split(",") if origin.strip()]
 
 
 @lru_cache

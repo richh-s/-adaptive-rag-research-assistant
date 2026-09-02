@@ -14,8 +14,19 @@ services:
       # local persist_directory to chromadb.HttpClient) instead of sharing this volume.
       - chroma_data:/app/chroma_db
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     restart: unless-stopped
+    # /ready (not /health) on purpose: it pings Chroma and the web-search backend, so a
+    # container that is up but can't actually serve a research request reports unhealthy
+    # instead of sitting in the rotation returning errors. start_period covers the baseline
+    # corpus indexing the image runs at boot.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready').read()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
 
   redis:
     image: redis:7-alpine
@@ -24,6 +35,11 @@ services:
     volumes:
       - redis_data:/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
 volumes:
   chroma_data:

@@ -3,6 +3,7 @@ import json
 
 from rag_assistant.cache import cache_get, cache_key, cache_set
 from rag_assistant.config import get_settings
+from rag_assistant.graph.context_budget import select_context_documents
 from rag_assistant.graph.state import ResearchState
 from rag_assistant.llm import get_chat_model
 from rag_assistant.prompts.synthesis_prompt import (
@@ -10,6 +11,7 @@ from rag_assistant.prompts.synthesis_prompt import (
     NO_CONTEXT_PROMPT,
     SYNTHESIS_PROMPT,
 )
+from rag_assistant.ingestion.ownership import display_source
 from rag_assistant.schemas.models import Citation, FusedDocument
 
 # Mirrors condense.py's window: enough turns for continuity of tone/topic, without pasting
@@ -43,7 +45,17 @@ def synthesize_answer(state: ResearchState) -> dict:
     or answers directly from the model's own knowledge when the router decided no retrieval
     was needed. Citation markers follow fused rank order, so the highest-consensus documents
     get the lowest (most prominent) marker numbers."""
-    docs: list[FusedDocument] = state.get("fused_documents", [])
+    settings = get_settings()
+    all_docs: list[FusedDocument] = state.get("fused_documents", [])
+    # Bound the prompt before anything is built from it -- the cache key, the numbered
+    # context and the citation markers all have to describe the same set of documents, so
+    # the budget is applied once here and everything downstream reads `docs`.
+    budgeted = select_context_documents(
+        all_docs,
+        budget_tokens=settings.synthesis_context_budget_tokens,
+        chars_per_token=settings.synthesis_chars_per_token,
+    )
+    docs = budgeted.documents
     question = state["question"]
     history = state.get("chat_history") or []
     # History changes the rendered prompt, so it must be part of the cache identity -- the
@@ -60,6 +72,7 @@ def synthesize_answer(state: ResearchState) -> dict:
         return {
             "final_answer": cached["final_answer"],
             "citations": [Citation(**c) for c in cached["citations"]],
+            "context_documents_dropped": budgeted.dropped_documents,
         }
 
     history_block = _history_block(history)
@@ -76,17 +89,23 @@ def synthesize_answer(state: ResearchState) -> dict:
         answer = get_chat_model().invoke(prompt)
         result = {"final_answer": answer.text, "citations": []}
     else:
-        context = "\n\n".join(f"[{i + 1}] (source: {d.source_id})\n{d.content}" for i, d in enumerate(docs))
+        context = "\n\n".join(
+            f"[{i + 1}] (source: {display_source(d.source_id)})\n{d.content}"
+            for i, d in enumerate(docs)
+        )
         prompt = SYNTHESIS_PROMPT.format(
             question=question, context=context, history_block=history_block
         )
         answer = get_chat_model().invoke(prompt)
-        citations = [Citation(marker=f"[{i + 1}]", source_id=d.source_id) for i, d in enumerate(docs)]
+        citations = [
+            Citation(marker=f"[{i + 1}]", source_id=display_source(d.source_id))
+            for i, d in enumerate(docs)
+        ]
         result = {"final_answer": answer.text, "citations": citations}
 
     cache_set(
         key,
         {"final_answer": result["final_answer"], "citations": [c.model_dump() for c in result["citations"]]},
-        get_settings().cache_ttl_synthesis,
+        settings.cache_ttl_synthesis,
     )
-    return result
+    return {**result, "context_documents_dropped": budgeted.dropped_documents}
