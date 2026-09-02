@@ -54,7 +54,9 @@ def test_ingest_url_fetches_page_and_queues_indexing(monkeypatch, client, tmp_pa
 
 def test_ingest_url_maps_fetch_errors_to_400(monkeypatch, client):
     def _boom(url):
-        raise UrlIngestError("Refusing to fetch 'localhost': it resolves to a private or local address.")
+        raise UrlIngestError(
+            "Refusing to fetch 'localhost': it resolves to a private or local address."
+        )
 
     monkeypatch.setattr(api, "fetch_page", _boom)
 

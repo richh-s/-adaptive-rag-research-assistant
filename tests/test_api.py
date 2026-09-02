@@ -25,7 +25,11 @@ def test_research_rate_limits_per_ip(monkeypatch):
     monkeypatch.setattr(
         api._graph,
         "invoke",
-        lambda state, config=None: {"research_report": "ok", "route": "vector", "confidence_score": 0.9},
+        lambda state, config=None: {
+            "research_report": "ok",
+            "route": "vector",
+            "confidence_score": 0.9,
+        },
     )
     client = TestClient(api.app)
 
@@ -40,7 +44,11 @@ def test_research_response_includes_trace_id_header(monkeypatch):
     monkeypatch.setattr(
         api._graph,
         "invoke",
-        lambda state, config=None: {"research_report": "ok", "route": "vector", "confidence_score": 0.9},
+        lambda state, config=None: {
+            "research_report": "ok",
+            "route": "vector",
+            "confidence_score": 0.9,
+        },
     )
     client = TestClient(api.app)
 
@@ -213,9 +221,24 @@ def test_research_stream_yields_progress_then_done(monkeypatch):
 
 def test_research_stream_accumulates_send_fanned_fields_across_updates(monkeypatch):
     async def fake_astream(state, config=None, stream_mode=None):
-        yield {"route_query": {"route": "vector", "node_timings": [{"node": "route_query", "latency_ms": 100.0}]}}
-        yield {"retrieve_vector": {"vector_results": [], "node_timings": [{"node": "retrieve_vector", "latency_ms": 50.0}]}}
-        yield {"retrieve_vector": {"vector_results": [], "node_timings": [{"node": "retrieve_vector", "latency_ms": 60.0}]}}
+        yield {
+            "route_query": {
+                "route": "vector",
+                "node_timings": [{"node": "route_query", "latency_ms": 100.0}],
+            }
+        }
+        yield {
+            "retrieve_vector": {
+                "vector_results": [],
+                "node_timings": [{"node": "retrieve_vector", "latency_ms": 50.0}],
+            }
+        }
+        yield {
+            "retrieve_vector": {
+                "vector_results": [],
+                "node_timings": [{"node": "retrieve_vector", "latency_ms": 60.0}],
+            }
+        }
         yield {
             "format_report": {
                 "research_report": "The answer is 42.",
@@ -249,9 +272,7 @@ def test_research_stream_times_out_on_hanging_node(monkeypatch):
     monkeypatch.setattr(api._graph, "astream", fake_astream)
     client = TestClient(api.app)
 
-    with client.stream(
-        "POST", "/research/stream", json={"question": "anything"}
-    ) as response:
+    with client.stream("POST", "/research/stream", json={"question": "anything"}) as response:
         assert response.status_code == 200
         events = _sse_events(response)
 
@@ -329,7 +350,11 @@ def test_ingest_sanitizes_path_traversal_in_filename(monkeypatch, tmp_path):
 
 
 def test_ingest_rejects_file_over_size_limit(monkeypatch, tmp_path):
-    monkeypatch.setenv("CORPUS_DIR", str(tmp_path))
+    # Its own directory rather than tmp_path itself: the assertion below is "the rejected
+    # upload left nothing behind", and tmp_path also holds the per-test isolation dirs.
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    monkeypatch.setenv("CORPUS_DIR", str(corpus))
     monkeypatch.setattr(api, "_MAX_UPLOAD_BYTES", 10)
     client = TestClient(api.app)
 
@@ -339,7 +364,7 @@ def test_ingest_rejects_file_over_size_limit(monkeypatch, tmp_path):
     )
 
     assert response.status_code == 413
-    assert not any(tmp_path.iterdir())
+    assert not any(corpus.iterdir())
 
 
 def test_get_ingest_task_status_returns_404_for_unknown_task():
@@ -432,9 +457,7 @@ def test_research_stream_sends_close_event_on_shutdown(monkeypatch):
     try:
         client = TestClient(api.app)
 
-        with client.stream(
-            "POST", "/research/stream", json={"question": "anything"}
-        ) as response:
+        with client.stream("POST", "/research/stream", json={"question": "anything"}) as response:
             assert response.status_code == 200
             events = _sse_events(response)
 
@@ -451,9 +474,7 @@ def test_research_stream_yields_error_event_on_failure(monkeypatch):
     monkeypatch.setattr(api._graph, "astream", fake_astream)
     client = TestClient(api.app)
 
-    with client.stream(
-        "POST", "/research/stream", json={"question": "anything"}
-    ) as response:
+    with client.stream("POST", "/research/stream", json={"question": "anything"}) as response:
         assert response.status_code == 200
         events = _sse_events(response)
 

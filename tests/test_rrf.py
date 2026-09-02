@@ -43,9 +43,7 @@ def test_score_formula_matches_reciprocal_rank_sum():
 def test_results_sorted_descending_by_score():
     fused = reciprocal_rank_fusion([[_doc("first"), _doc("second"), _doc("third")]])
 
-    assert [d.rrf_score for d in fused] == sorted(
-        [d.rrf_score for d in fused], reverse=True
-    )
+    assert [d.rrf_score for d in fused] == sorted([d.rrf_score for d in fused], reverse=True)
 
 
 def test_document_ranked_in_three_lists_outranks_document_in_one():

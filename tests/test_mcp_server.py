@@ -42,9 +42,7 @@ def test_research_question_returns_report_with_transparency_footer(monkeypatch):
 
 def test_ingest_file_copies_into_corpus_and_indexes(monkeypatch, tmp_path):
     monkeypatch.setenv("CORPUS_DIR", str(tmp_path / "corpus"))
-    monkeypatch.setattr(
-        "rag_assistant.ingestion.build_index.build_index", lambda: _index_result()
-    )
+    monkeypatch.setattr("rag_assistant.ingestion.build_index.build_index", lambda: _index_result())
     source = tmp_path / "notes.md"
     source.write_text("# Meeting notes")
 
@@ -64,9 +62,7 @@ def test_ingest_file_rejects_unsupported_and_missing(monkeypatch, tmp_path):
 
 def test_ingest_url_writes_page_and_indexes(monkeypatch, tmp_path):
     monkeypatch.setenv("CORPUS_DIR", str(tmp_path / "corpus"))
-    monkeypatch.setattr(
-        "rag_assistant.ingestion.build_index.build_index", lambda: _index_result()
-    )
+    monkeypatch.setattr("rag_assistant.ingestion.build_index.build_index", lambda: _index_result())
     monkeypatch.setattr(
         "rag_assistant.ingestion.url_fetch.fetch_page",
         lambda url: FetchedPage(url=url, title="An Article", text="Body."),

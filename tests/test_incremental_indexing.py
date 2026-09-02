@@ -3,7 +3,7 @@ from unittest.mock import patch
 from test_ingestion import _make_minimal_pdf
 
 from rag_assistant.ingestion.build_index import build_index
-from rag_assistant.retrieval.bm25_store import bm25_search, get_bm25_index
+from rag_assistant.retrieval.bm25_store import apply_bm25_delta, bm25_search, get_bm25_index
 from rag_assistant.retrieval.vector_store import get_retriever
 
 
@@ -71,7 +71,9 @@ def test_multi_page_pdf_indexes_every_page(sample_corpus_dir, fake_embeddings, t
         _make_minimal_pdf(["Cohere page one about embeddings.", "Cohere page two about rerankers."])
     )
 
-    result = build_index(source_dir=sample_corpus_dir, persist_dir=persist_dir, embeddings=fake_embeddings)
+    result = build_index(
+        source_dir=sample_corpus_dir, persist_dir=persist_dir, embeddings=fake_embeddings
+    )
 
     # 2 md files (1 chunk each) + 2 PDF pages (1 chunk each) -- proves both pages of the
     # single-source PDF survived grouping, not just the last one written into a dict.
@@ -120,7 +122,9 @@ def test_on_stage_hook_fires_for_parsing_and_indexing(sample_corpus_dir, fake_em
     assert stages[-1] == "indexing"  # the post-index BM25 hot-reload also reports "indexing"
 
 
-def test_on_stage_hook_not_called_again_for_a_no_op_rerun(sample_corpus_dir, fake_embeddings, tmp_path):
+def test_on_stage_hook_not_called_again_for_a_no_op_rerun(
+    sample_corpus_dir, fake_embeddings, tmp_path
+):
     persist_dir = tmp_path / "chroma"
     build_index(source_dir=sample_corpus_dir, persist_dir=persist_dir, embeddings=fake_embeddings)
 
@@ -150,12 +154,18 @@ def test_bm25_index_is_eagerly_rebuilt_not_left_stale_after_build_index(
     (sample_corpus_dir / "anthropic.md").write_text("Anthropic ships Claude Opus 5 today.")
 
     with patch(
-        "rag_assistant.ingestion.build_index.get_bm25_index", wraps=get_bm25_index
+        "rag_assistant.ingestion.build_index.apply_bm25_delta", wraps=apply_bm25_delta
     ) as spy:
-        build_index(source_dir=sample_corpus_dir, persist_dir=persist_dir, embeddings=fake_embeddings)
-        # build_index() itself must trigger the rebuild -- not merely invalidate and leave it
-        # for whichever request happens to call get_bm25_index/bm25_search next.
-        spy.assert_called_once_with(persist_dir)
+        build_index(
+            source_dir=sample_corpus_dir, persist_dir=persist_dir, embeddings=fake_embeddings
+        )
+        # build_index() itself must refresh the keyword index -- not leave it stale for
+        # whichever request happens to call bm25_search next. It now applies a delta rather
+        # than rebuilding, so only the changed chunk ids should be handed over.
+        assert spy.call_count == 1
+        changed = spy.call_args.kwargs
+        assert changed["added_ids"], "the rewritten file's new chunks must be added"
+        assert changed["removed_ids"], "its previous chunks must be removed"
 
     # Assert against the rebuilt chunks directly rather than through bm25_search's score-filtered
     # results: with only 2 documents in this fixture, BM25Okapi's idf for a term appearing in
@@ -163,5 +173,5 @@ def test_bm25_index_is_eagerly_rebuilt_not_left_stale_after_build_index(
     # legitimately score every result 0 and get filtered out by bm25_search's `score > 0` guard.
     # That's a corpus-size artifact of BM25 scoring, not a signal about whether the rebuild
     # happened -- which is what this test is actually checking.
-    _, chunks = get_bm25_index(persist_dir)
-    assert any("Opus 5" in chunk.page_content for chunk in chunks)
+    state = get_bm25_index(persist_dir)
+    assert any("Opus 5" in doc.page_content for doc in state.documents.values())

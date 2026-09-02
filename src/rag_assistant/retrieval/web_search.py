@@ -46,7 +46,9 @@ class WebSearchTool:
             # An outage/rate-limit/network blip shouldn't crash the graph node -- treat it
             # the same as "the web had nothing," and let routing/grading/corrective logic
             # downstream handle a thin result set the way it already does.
-            logger.warning("Web search failed for query=%r; returning no results", query, exc_info=True)
+            logger.warning(
+                "Web search failed for query=%r; returning no results", query, exc_info=True
+            )
             return []
         docs = [
             RetrievedDoc(

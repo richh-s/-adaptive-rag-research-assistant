@@ -41,9 +41,7 @@ def test_route_match_is_scored():
 
 
 def test_source_recall_is_the_fraction_of_expected_sources_retrieved():
-    metrics = scored(
-        expected_sources=["a.md", "b.md"], actual_sources=["a.md", "z.md"]
-    )
+    metrics = scored(expected_sources=["a.md", "b.md"], actual_sources=["a.md", "z.md"])
 
     assert metrics.source_recall == 0.5
 

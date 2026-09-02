@@ -17,7 +17,9 @@ def grade_documents(question: str, docs: list[FusedDocument]) -> list[DocGrade]:
     numbered = "\n\n".join(f"[{i + 1}] {doc.content}" for i, doc in enumerate(docs))
     llm = get_structured_llm(DocGradeBatch)
     try:
-        result: DocGradeBatch = llm.invoke(GRADING_PROMPT.format(question=question, documents=numbered))
+        result: DocGradeBatch = llm.invoke(
+            GRADING_PROMPT.format(question=question, documents=numbered)
+        )
     except Exception:
         # Structured-output parsing occasionally fails when a provider returns malformed
         # tool-call arguments (e.g. a JSON-encoded string instead of a parsed list) -- treat
@@ -27,7 +29,9 @@ def grade_documents(question: str, docs: list[FusedDocument]) -> list[DocGrade]:
         # assuming irrelevance: a provider hiccup here isn't evidence the docs are bad, and
         # scoring them 0.0 was wrongly forcing needs_correction's corrective web search on
         # every ungraded batch, flooding good local results with unnecessary web ones.
-        logger.warning("Document grading failed for question=%r; trusting retrieval", question, exc_info=True)
+        logger.warning(
+            "Document grading failed for question=%r; trusting retrieval", question, exc_info=True
+        )
         return [DocGrade(relevant=True, score=1.0) for _ in docs]
 
     if len(result.grades) != len(docs):

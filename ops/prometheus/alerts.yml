@@ -1,0 +1,143 @@
+# Prometheus alerting rules for the Adaptive RAG Research Assistant.
+#
+# Load alongside your scrape config:
+#
+#   rule_files:
+#     - /etc/prometheus/alerts.yml
+#
+# Every rule is written against a metric this service actually exports (see metrics.py) and
+# every threshold is stated with its reasoning, because an alert whose number nobody can
+# justify is an alert that gets silenced the first time it fires at 3am.
+#
+# Two things are deliberately NOT alerted on. Cache hit rate: a cache outage degrades to "no
+# cache", which is slower and more expensive but never wrong, so it belongs on a dashboard
+# rather than on a pager. And absolute token spend: what matters is a *change* in the rate,
+# which the burn-rate rule below captures without needing anyone to guess a monthly budget.
+
+groups:
+  - name: rag-assistant-availability
+    rules:
+      - alert: RagAssistantDown
+        # `up` comes from Prometheus itself, so this fires when the process is gone entirely
+        # -- the case where none of the service's own metrics can tell you anything.
+        expr: up{job="rag-assistant"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "rag-assistant is not being scraped"
+          description: "The target has been unreachable for 2 minutes."
+
+      - alert: RagAssistantHighErrorRate
+        expr: |
+          sum(rate(rag_http_requests_total{status="5xx"}[5m]))
+            / clamp_min(sum(rate(rag_http_requests_total[5m])), 0.001) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Over 5% of requests are failing"
+          description: "5xx rate is {{ $value | humanizePercentage }} over the last 5 minutes."
+
+  - name: rag-assistant-latency
+    rules:
+      - alert: RagAssistantSlowResearch
+        # GRAPH_TIMEOUT_SECONDS defaults to 45, so a p95 above 30s means a meaningful share of
+        # requests are approaching the point where they get cut off with an error frame.
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(rag_http_request_duration_seconds_bucket{route="/api/v1/research"}[10m]))
+          ) > 30
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 research latency is {{ $value | humanizeDuration }}"
+          description: "Approaching GRAPH_TIMEOUT_SECONDS; requests will start timing out."
+
+      - alert: RagAssistantGraphTimeouts
+        # Timeouts are tracked separately from errors because the response differs: raise the
+        # budget, or find the provider that got slow. Any sustained rate is worth looking at.
+        expr: sum(rate(rag_graph_runs_total{outcome="timeout"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Research requests are timing out"
+          description: "{{ $value | printf \"%.3f\" }} timeouts/sec over 10 minutes."
+
+  - name: rag-assistant-providers
+    rules:
+      - alert: RagAssistantPrimaryProviderFailing
+        # The fallback chain is silent by design: an outage of the primary provider produces
+        # correct answers at a different price, with nothing in the logs. This counter is the
+        # only place that becomes visible.
+        expr: |
+          sum by (provider) (rate(rag_llm_calls_total{outcome="error"}[10m]))
+            / clamp_min(sum by (provider) (rate(rag_llm_calls_total[10m])), 0.001) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.provider }} is failing {{ $value | humanizePercentage }} of calls"
+          description: "Requests are falling through to a secondary provider; check cost."
+
+      - alert: RagAssistantTokenBurnSpike
+        # A relative rule, not a budget: alert when the hourly output-token rate is more than
+        # triple its own trailing daily average. Catches a runaway loop or a prompt-size
+        # regression without anyone having to predict what normal spend looks like.
+        expr: |
+          sum(rate(rag_llm_tokens_total{kind="output"}[1h]))
+            > 3 * sum(rate(rag_llm_tokens_total{kind="output"}[24h]))
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Output token rate is 3x its daily average"
+          description: "Check for a retry loop, a prompt-size regression, or genuine traffic growth."
+
+  - name: rag-assistant-quality
+    rules:
+      - alert: RagAssistantIngestionFailing
+        expr: sum(rate(rag_ingest_tasks_total{stage="failed"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Document ingestion is failing"
+          description: "Uploads are being accepted and then failing to index."
+
+      - alert: RagAssistantUserSatisfactionDropping
+        # The only alert sourced from humans rather than from the system's own behaviour.
+        # Everything else here says whether the service is working; this says whether it is
+        # any good, which no latency or error-rate metric can tell you. Requires a minimum
+        # volume so two downvotes on a quiet afternoon don't page anyone.
+        expr: |
+          sum(rate(rag_feedback_total{rating="down"}[6h]))
+            / clamp_min(sum(rate(rag_feedback_total[6h])), 0.001) > 0.4
+          and sum(rate(rag_feedback_total[6h])) * 21600 > 20
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over 40% of rated answers are being downvoted"
+          description: "Check /api/v1/feedback/summary for the questions being rated down."
+
+  - name: rag-assistant-correctness
+    rules:
+      - alert: RagAssistantNotReady
+        # /ready fails when Chroma is unreachable, web search is down, or -- the silent one --
+        # the configured embedding model no longer matches the model the index was built
+        # with, which returns plausible nonsense rather than an error.
+        expr: probe_success{instance=~".*/ready"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Readiness probe is failing"
+          description: >-
+            Chroma, web search, or the embedding-model check is failing. If it is embeddings,
+            queries are being embedded into a different vector space than the stored
+            documents: answers will look confident and be meaningless until the index is
+            rebuilt with `rag-assistant ingest --full`.

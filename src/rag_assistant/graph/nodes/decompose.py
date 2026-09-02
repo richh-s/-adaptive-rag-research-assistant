@@ -32,7 +32,7 @@ def dispatch_retrieval(state: ResearchState) -> list[Send]:
     owner = state.get("owner") or PUBLIC_OWNER
     sends = []
     for sub_query in state["sub_queries"]:
-        payload = {"sub_query": sub_query, "owner": owner}
+        payload = {"sub_query": sub_query, "owner": owner, "filters": state.get("filters")}
         if route in ("vector", "both"):
             sends.append(Send("retrieve_vector", payload))
             sends.append(Send("retrieve_bm25", payload))

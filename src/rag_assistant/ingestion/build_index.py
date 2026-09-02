@@ -1,4 +1,5 @@
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -9,10 +10,15 @@ from langchain_core.embeddings import Embeddings
 
 from rag_assistant.config import get_settings
 from rag_assistant.ingestion.loaders import LOADER_VERSION, iter_corpus_files, load_corpus_file
+from rag_assistant.ingestion.index_metadata import read_embedding_dimension, save_index_metadata
 from rag_assistant.ingestion.manifest import load_manifest, save_manifest
-from rag_assistant.ingestion.splitter import CHUNKING_VERSION, split_documents
+from rag_assistant.ingestion.splitter import CHUNKING_VERSION, split_with_parents
 from rag_assistant.ingestion.ownership import owner_of_relative_path
-from rag_assistant.retrieval.bm25_store import get_bm25_index, invalidate_bm25_index
+from rag_assistant.retrieval.bm25_store import apply_bm25_delta, get_bm25_index
+from rag_assistant.retrieval.parent_store import (
+    delete_parents_for_source,
+    replace_parents_for_source,
+)
 from rag_assistant.retrieval.vector_store import get_vector_store
 
 # Serializes full build_index() runs. Needed for two reasons: (1) the manifest is a plain
@@ -113,9 +119,16 @@ def build_index(
             for source in manifest
             if owner is None or owner_of_relative_path(Path(source)) == owner
         }
+        # Collected so the keyword index can be updated for exactly these chunks instead of
+        # rebuilt over the whole collection.
+        added_chunk_ids: list[str] = []
+        removed_chunk_ids: list[str] = []
+
         removed_sources = tracked_sources - set(files_by_source)
         for source in removed_sources:
+            removed_chunk_ids.extend(manifest[source]["chunk_ids"])
             store.delete(ids=manifest[source]["chunk_ids"])
+            delete_parents_for_source(persist_dir, source)
             del manifest[source]
 
         if on_stage:
@@ -146,12 +159,25 @@ def build_index(
             parsed_files += 1
 
             if existing:
+                removed_chunk_ids.extend(existing["chunk_ids"])
                 store.delete(ids=existing["chunk_ids"])
 
-            chunks = split_documents(docs)
+            split = split_with_parents(docs, embeddings=embeddings or store.embeddings)
+            chunks = split.chunks
+            # Stored as an epoch float rather than a string: Chroma's `$gte`/`$lte` operators
+            # compare numbers, and lexicographic date strings would only work by accident of
+            # ISO formatting.
+            indexed_at = time.time()
+            for chunk in chunks:
+                chunk.metadata["ingested_at"] = indexed_at
             chunk_ids = _chunk_ids(source, chunks)
             if chunks:
                 store.add_documents(chunks, ids=chunk_ids)
+                added_chunk_ids.extend(chunk_ids)
+            # Written even when PARENT_CONTEXT is off, so enabling it later doesn't require a
+            # re-index -- the sections are cheap to store and useless to reconstruct after
+            # the fact without re-parsing.
+            replace_parents_for_source(persist_dir, source, corpus_file.owner, split.parents)
             manifest[source] = {
                 "file_hash": corpus_file.fingerprint,
                 "chunk_ids": chunk_ids,
@@ -167,6 +193,14 @@ def build_index(
             changed_files += 1
 
         save_manifest(persist_dir, manifest)
+        # Recorded on every run, not only when something changed: the point is to describe
+        # what the collection currently holds, and a run that changed nothing still confirms
+        # the configured model matches what is stored.
+        save_index_metadata(
+            persist_dir,
+            embedding_model=get_settings().gemini_embedding_model,
+            embedding_dimension=read_embedding_dimension(store),
+        )
 
         # Hot-reload, part 1/2 -- BM25: the index is a lazily-built in-memory singleton (see
         # bm25_store.py) with no awareness of when the collection changes. Rebuilding it
@@ -185,8 +219,14 @@ def build_index(
         # multi-worker deployment would break this assumption -- see tasks.py's module
         # docstring -- but this project runs a single worker.)
         if changed_files or removed_sources:
-            invalidate_bm25_index(persist_dir)
-            get_bm25_index(persist_dir)
+            # Apply just the delta. `apply_bm25_delta` reports False when no index is cached
+            # yet, in which case building one now keeps the eager-refresh guarantee: by the
+            # time this returns, keyword search already reflects the new corpus, so a query
+            # landing immediately after an ingest doesn't pay a rebuild inline.
+            if not apply_bm25_delta(
+                persist_dir, added_ids=added_chunk_ids, removed_ids=removed_chunk_ids
+            ):
+                get_bm25_index(persist_dir)
             if on_stage:
                 on_stage("indexing", "Refreshing in-memory search indices...")
 

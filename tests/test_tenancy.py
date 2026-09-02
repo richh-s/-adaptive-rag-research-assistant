@@ -143,8 +143,12 @@ def test_bm25_retrieval_is_scoped_to_the_tenant(tenant_corpus, fake_embeddings, 
     build_index(source_dir=tenant_corpus, persist_dir=persist_dir, embeddings=fake_embeddings)
     invalidate_bm25_index(persist_dir)
 
-    alice_hits = bm25_search("confidential quarterly revenue", k=10, persist_dir=persist_dir, owner="alice")
-    bob_hits = bm25_search("confidential quarterly revenue", k=10, persist_dir=persist_dir, owner="bob")
+    alice_hits = bm25_search(
+        "confidential quarterly revenue", k=10, persist_dir=persist_dir, owner="alice"
+    )
+    bob_hits = bm25_search(
+        "confidential quarterly revenue", k=10, persist_dir=persist_dir, owner="bob"
+    )
 
     assert any("alice_secret" in h.source_id for h in alice_hits)
     assert not any("bob_secret" in h.source_id for h in alice_hits)

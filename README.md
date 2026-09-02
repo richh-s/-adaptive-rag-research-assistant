@@ -365,10 +365,10 @@ purpose: it costs model calls per row and its scores drift slightly between runs
 output, so gating on it would fail builds for reasons unrelated to the change.
 
 ```bash
-uv run rag-assistant eval --limit 18                    # score the full dataset
-uv run rag-assistant eval --limit 18 --llm-judge        # ...plus RAGAS faithfulness/relevancy
-uv run rag-assistant eval --limit 18 --record-baseline  # record baseline from a known-good build
-uv run rag-assistant eval --limit 18 --check            # fail on regression vs. that baseline
+uv run rag-assistant eval --limit 28                    # score the full dataset
+uv run rag-assistant eval --limit 28 --llm-judge        # ...plus RAGAS faithfulness/relevancy
+uv run rag-assistant eval --limit 28 --record-baseline  # record baseline from a known-good build
+uv run rag-assistant eval --limit 28 --check            # fail on regression vs. that baseline
 ```
 
 `--check` compares against `data/golden_eval/baseline.json` with a tolerance (default 0.05),
@@ -386,7 +386,7 @@ CI reports the gate as skipped with a warning rather than failing, since failing
 fresh clone just teaches everyone to ignore the job. Re-record deliberately when a change is
 a genuine improvement, never to make a failing gate pass.
 
-The dataset (`data/golden_eval/dataset.jsonl`) is 18 questions across five categories —
+The dataset (`data/golden_eval/dataset.jsonl`) is 28 questions across five categories —
 `factual`, `multi_hop`, `unanswerable`, `current`, `no_retrieval`. The `unanswerable` rows
 carry the most weight: a dataset of only answerable questions cannot catch the failure that
 matters most in RAG, which is answering confidently from documents that don't contain the

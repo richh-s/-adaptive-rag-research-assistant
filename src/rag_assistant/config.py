@@ -56,9 +56,9 @@ class Settings(BaseSettings):
     # used against a self-hosted server. "function_calling" suits servers with tool support
     # but no guided decoding; "json_mode" suits servers with neither, at the cost of the
     # model never seeing the schema.
-    local_llm_structured_output_method: Literal[
-        "json_schema", "function_calling", "json_mode"
-    ] = "json_schema"
+    local_llm_structured_output_method: Literal["json_schema", "function_calling", "json_mode"] = (
+        "json_schema"
+    )
 
     gemini_chat_model: str = "gemini-2.5-flash"
     gemini_embedding_model: str = "models/gemini-embedding-001"
@@ -66,9 +66,21 @@ class Settings(BaseSettings):
 
     corpus_dir: Path = PROJECT_ROOT / "data" / "corpus"
     chroma_persist_dir: Path = PROJECT_ROOT / "chroma_db"
+    # Point at a Chroma server to share the index across replicas. Embedded Chroma is
+    # SQLite-backed and locks its file to one process, which is the single hardest constraint
+    # on running more than one worker; server mode removes it. Blank keeps the embedded,
+    # zero-infrastructure default.
+    chroma_server_host: str = ""
+    chroma_server_port: int = 8000
+    chroma_server_ssl: bool = False
     # Server-side conversation history (see conversations/store.py). Lives inside
     # chroma_persist_dir's sibling default so one mounted volume covers both stores.
     conversations_db_path: Path = PROJECT_ROOT / "chroma_db" / "conversations.db"
+    # Where conversations and feedback live. SQLite is the default and is correct for one
+    # container; "postgres" (with DATABASE_URL) is what lets several replicas write, since
+    # SQLite's single-writer constraint is the main thing preventing a second one.
+    conversations_backend: Literal["sqlite", "postgres"] = "sqlite"
+    database_url: str = ""
 
     # When set (STATIC_DIR env var) and the directory exists, the API serves the built
     # frontend from it at "/" -- used by the Docker image / Render deployment so one
@@ -76,6 +88,33 @@ class Settings(BaseSettings):
     static_dir: Path | None = None
 
     confidence_threshold: float = 0.6
+
+    # Chunking strategy within a section (see ingestion/semantic_splitter.py). "structural"
+    # is fixed-size inside each heading section -- free and deterministic. "semantic" embeds
+    # sentences and breaks where similarity drops, which cuts at topic shifts instead of at
+    # an arbitrary character offset, at the cost of one embedding call per section at ingest.
+    chunking_strategy: Literal["structural", "semantic"] = "structural"
+    # Percentile of within-section sentence distances above which a break is placed. Higher
+    # means fewer, larger chunks. A percentile rather than an absolute distance because
+    # cosine distances aren't comparable across embedding models or prose styles.
+    semantic_chunk_percentile: float = 85.0
+
+    # Cross-encoder reranking of fused documents (see retrieval/reranker.py). RRF ranks by
+    # retriever consensus and never compares a document against the question; a cross-encoder
+    # does. "cohere" needs COHERE_API_KEY and a network call, "cross_encoder" needs the
+    # `rerank-local` extra (sentence-transformers + torch). Both are optional extras, so a
+    # default install carries neither and a misconfiguration degrades to no reranking.
+    reranker: Literal["none", "cohere", "cross_encoder"] = "none"
+    cohere_api_key: str = ""
+    cohere_rerank_model: str = "rerank-v3.5"
+    cross_encoder_rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    # Reranking is per-pair work, so only a shortlist is scored; the tail keeps RRF order.
+    rerank_top_n: int = 12
+
+    # Small-to-big retrieval (see retrieval/parent_store.py): retrieve on precise chunks,
+    # then hand synthesis the whole section each winner came from. Off by default because it
+    # spends noticeably more of the context budget per document.
+    parent_context: bool = False
 
     # Ceiling on how much retrieved context reaches the synthesis prompt (see
     # graph/context_budget.py). Fusion's output size scales with sub-queries x retrieval
@@ -96,6 +135,11 @@ class Settings(BaseSettings):
 
     # caching (Redis) -- see cache.py. `use_cache` lets tests/offline runs disable it outright.
     use_cache: bool = True
+    # Where background ingest task state lives (see ingestion/tasks.py). "memory" is correct
+    # and free for a single worker; "redis" makes task state visible across replicas, without
+    # which a client polling a load-balanced deployment gets 404s from every worker that
+    # didn't happen to accept the upload.
+    task_backend: Literal["memory", "redis"] = "memory"
     redis_url: str = "redis://localhost:6379/0"
     cache_ttl_router: int = 300
     cache_ttl_web_search: int = 600
@@ -105,6 +149,9 @@ class Settings(BaseSettings):
     # blank disables auth entirely (open demo mode). Each label is a tenant: conversations
     # are scoped to it and rate limits are keyed by it.
     api_keys: str = ""
+    # Richer key definitions -- scopes, expiry, per-key rate limits (see auth.py). Keeps
+    # secrets out of the process listing and lets a key be revoked by editing one file.
+    api_keys_file: Path | None = None
 
     # Browser origins allowed to call this API cross-origin. The defaults cover the Vite dev
     # server; the single-container deploy serves the frontend from this same origin, so it
@@ -112,8 +159,7 @@ class Settings(BaseSettings):
     # hosted separately -- e.g. "https://myapp.vercel.app". "*" is accepted but disables
     # credentialed requests per the CORS spec, so prefer explicit origins.
     cors_allow_origins: str = (
-        "http://localhost:5173,http://127.0.0.1:5173,"
-        "http://localhost:5175,http://127.0.0.1:5175"
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:5175,http://127.0.0.1:5175"
     )
 
     # error tracking -- when set, Sentry captures unhandled exceptions (see api.py).
@@ -150,7 +196,6 @@ class Settings(BaseSettings):
     # a stuck provider from starving the rest of the graph's budget.
     llm_request_timeout_seconds: float = 12.0
     llm_max_retries: int = 1
-
 
     def cors_origins(self) -> list[str]:
         """CORS_ALLOW_ORIGINS split into the list CORSMiddleware wants. Blank means no

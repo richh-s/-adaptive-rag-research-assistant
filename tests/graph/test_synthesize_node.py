@@ -39,9 +39,7 @@ def test_synthesize_returns_cached_answer_without_calling_llm(monkeypatch):
         },
     )
 
-    result = synthesize_answer(
-        {"question": "What is X?", "route": "vector", "fused_documents": []}
-    )
+    result = synthesize_answer({"question": "What is X?", "route": "vector", "fused_documents": []})
 
     fake_llm.invoke.assert_not_called()
     assert result["final_answer"] == "Cached answer."
@@ -59,7 +57,9 @@ def test_synthesize_caches_result_after_llm_call(monkeypatch):
         lambda key, value, ttl: captured.update(key=key, value=value, ttl=ttl),
     )
 
-    synthesize_answer({"question": "What is the price of Bitcoin?", "route": "web", "fused_documents": []})
+    synthesize_answer(
+        {"question": "What is the price of Bitcoin?", "route": "web", "fused_documents": []}
+    )
 
     assert captured["value"] == {"final_answer": "No sources found.", "citations": []}
     assert captured["ttl"] == 1800

@@ -30,11 +30,19 @@ from rag_assistant.ingestion.ownership import owner_corpus_dir
 from rag_assistant.ingestion.tasks import create_task, get_task, update_task
 from rag_assistant.ingestion.url_fetch import UrlIngestError, fetch_page, page_to_markdown
 from rag_assistant.logging_conf import configure_logging
-from rag_assistant.readiness import check_chroma, check_local_llm, check_web_search
+from rag_assistant.readiness import (
+    check_chroma,
+    check_embeddings,
+    check_local_llm,
+    check_web_search,
+)
 from rag_assistant.schemas.api import (
     ConversationDetail,
     ConversationMessage,
     ConversationSummary,
+    FeedbackRequest,
+    FeedbackResponse,
+    FeedbackSummary,
     IngestResponse,
     IngestTaskStatus,
     IngestUrlRequest,
@@ -106,6 +114,7 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+
 # Per-caller limiter (rate_limit_rpm) and a second limiter keyed on a constant so its bucket
 # is shared across every caller (rate_limit_rpm_global) -- together these cap both "one client
 # hammering us" and "aggregate load regardless of client" per the production-readiness spec.
@@ -131,12 +140,19 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
 
-def _per_ip_limit() -> str:
-    return f"{get_settings().rate_limit_rpm}/minute"
+def _per_ip_limit(key: str) -> str:
+    """Per-caller limit, honouring a key's own override when it has one.
+
+    slowapi passes the bucket key to a provider that declares a `key` parameter -- that key is
+    a fingerprint, never the secret, so the override lookup goes through fingerprints too.
+    """
+    override = auth.rate_limit_for_identity(key)
+    return f"{override or get_settings().rate_limit_rpm}/minute"
 
 
 def _global_limit() -> str:
     return f"{get_settings().rate_limit_rpm_global}/minute"
+
 
 # Allows the Vite dev server (and any local frontend build served on another port) to call
 # this API directly from the browser during development.
@@ -232,27 +248,46 @@ class AuthMiddleware:
             return
 
         headers = {k.lower(): v for k, v in scope.get("headers", [])}
-        owner = auth.resolve_owner(auth.extract_key(headers))
-        if owner is None:
-            body = json.dumps({"detail": "Missing or invalid API key."}).encode()
+        method = scope["method"]
+
+        async def reject(status: int, detail: str) -> None:
+            response_headers = [(b"content-type", b"application/json")]
+            if status == 401:
+                response_headers.append((b"www-authenticate", b"Bearer"))
             await send(
-                {
-                    "type": "http.response.start",
-                    "status": 401,
-                    "headers": [
-                        (b"content-type", b"application/json"),
-                        (b"www-authenticate", b"Bearer"),
-                    ],
-                }
+                {"type": "http.response.start", "status": status, "headers": response_headers}
             )
-            await send({"type": "http.response.body", "body": body})
+            await send(
+                {"type": "http.response.body", "body": json.dumps({"detail": detail}).encode()}
+            )
+
+        if not auth.auth_enabled():
+            # Open demo mode: every request is the public tenant and nothing is rejected.
+            await self.app(scope, receive, send)
             return
 
-        token = auth.owner_var.set(owner)
+        record = auth.resolve_key(auth.extract_key(headers))
+        if record is None:
+            auth.audit("auth rejected", path=path, method=method, outcome="invalid_key")
+            await reject(401, "Missing, invalid, or expired API key.")
+            return
+
+        owner_token = auth.owner_var.set(record.owner)
+        key_token = auth.api_key_var.set(record)
         try:
+            # 403 rather than 401: the credential is valid, it simply isn't allowed to do
+            # this. Returning 401 would tell a read-only client to go re-authenticate, which
+            # it cannot fix by presenting the same key again.
+            needed = auth.required_scope(method, path)
+            if not record.has_scope(needed):
+                auth.audit("auth forbidden", path=path, method=method, outcome=f"missing:{needed}")
+                await reject(403, f"This API key lacks the {needed!r} scope.")
+                return
+            auth.audit("auth accepted", path=path, method=method, outcome="ok")
             await self.app(scope, receive, send)
         finally:
-            auth.owner_var.reset(token)
+            auth.api_key_var.reset(key_token)
+            auth.owner_var.reset(owner_token)
 
 
 app.add_middleware(AuthMiddleware)
@@ -309,15 +344,20 @@ if get_settings().metrics_enabled:
 def ready() -> JSONResponse:
     chroma_ok, chroma_err = check_chroma()
     web_search_ok, web_search_err = check_web_search()
+    # Part of the verdict, unlike local_llm below: a replica whose configured embedding model
+    # doesn't match its index cannot serve a correct answer, only a confident wrong one, so
+    # it should be pulled from the load balancer rather than merely reported on.
+    embeddings_ok, embeddings_err = check_embeddings()
     # Reported but deliberately NOT part of the ready/unavailable verdict: an unreachable
     # self-hosted endpoint is a cost and latency regression (every call falls through to
     # Anthropic), not an outage, so it shouldn't pull a healthy replica out of a load
     # balancer -- while still being visible to whoever is looking at why the bill moved.
     local_llm_ok, local_llm_err = check_local_llm()
-    ready_ok = chroma_ok and web_search_ok
+    ready_ok = chroma_ok and web_search_ok and embeddings_ok
     body = {
         "status": "ok" if ready_ok else "unavailable",
         "chroma": {"ok": chroma_ok, "error": chroma_err},
+        "embeddings": {"ok": embeddings_ok, "error": embeddings_err},
         "web_search": {"ok": web_search_ok, "error": web_search_err},
         "local_llm": {"ok": local_llm_ok, "error": local_llm_err},
     }
@@ -443,7 +483,9 @@ async def ingest_document(
     logger.info("upload persisted", extra={"dest_name": dest_name, "size_bytes": size_bytes})
 
     task = create_task(filename=dest_name, original_filename=file.filename)
-    background_tasks.add_task(_run_ingest_in_background, get_trace_id(), task.task_id, auth.get_owner())
+    background_tasks.add_task(
+        _run_ingest_in_background, get_trace_id(), task.task_id, auth.get_owner()
+    )
 
     return IngestResponse(
         task_id=task.task_id,
@@ -489,7 +531,9 @@ def ingest_url(
     logger.info("url ingested", extra={"dest_name": dest_name, "url": page.url})
 
     task = create_task(filename=dest_name, original_filename=body.url)
-    background_tasks.add_task(_run_ingest_in_background, get_trace_id(), task.task_id, auth.get_owner())
+    background_tasks.add_task(
+        _run_ingest_in_background, get_trace_id(), task.task_id, auth.get_owner()
+    )
 
     return IngestResponse(
         task_id=task.task_id,
@@ -582,6 +626,7 @@ def research(request: Request, body: ResearchRequest) -> ResearchResponse:
                 "trace_id": get_trace_id(),
                 # Retrieval is scoped to this tenant -- see ingestion/ownership.py.
                 "owner": auth.get_owner(),
+                "filters": body.filters,
             },
             config={"recursion_limit": _RECURSION_LIMIT},
         )
@@ -627,6 +672,7 @@ async def _stream_research_events(
                 "chat_history": history,
                 "trace_id": get_trace_id(),
                 "owner": owner,
+                "filters": body.filters,
             },
             config={"recursion_limit": _RECURSION_LIMIT},
             stream_mode=["updates", "messages"],
@@ -735,6 +781,38 @@ def auth_check() -> dict:
     """Reached only with a valid key (or with auth disabled) -- the middleware rejects the
     rest. The frontend calls this at startup to decide whether to show the access gate."""
     return {"ok": True, "auth_required": auth.auth_enabled(), "owner": auth.get_owner()}
+
+
+@app.post("/api/v1/feedback", response_model=FeedbackResponse, status_code=201)
+def submit_feedback(body: FeedbackRequest) -> FeedbackResponse:
+    """Records one user rating of an answer.
+
+    Outside the LLM rate-limit budgets like the other cheap local writes -- a user clicking
+    thumbs-down twice should never be told to slow down, and rate-limiting the one channel
+    that reports the system is answering badly is the wrong thing to throttle.
+    """
+    feedback_id = conversations.record_feedback(
+        question=body.question,
+        rating=body.rating,
+        owner=auth.get_owner(),
+        conversation_id=body.conversation_id,
+        note=body.note,
+        route=body.route,
+        confidence_score=body.confidence_score,
+    )
+    metrics.record_feedback(body.rating)
+    logger.info(
+        "feedback recorded",
+        extra={"route": body.route or "", "node": f"rating={body.rating}"},
+    )
+    return FeedbackResponse(id=feedback_id)
+
+
+@app.get("/api/v1/feedback/summary", response_model=FeedbackSummary)
+def get_feedback_summary() -> FeedbackSummary:
+    """Aggregate ratings for this tenant, plus recently downvoted questions -- the material
+    for keeping the golden eval dataset resembling what people actually ask."""
+    return FeedbackSummary(**conversations.feedback_summary(owner=auth.get_owner()))
 
 
 @app.get("/api/v1/conversations", response_model=list[ConversationSummary])

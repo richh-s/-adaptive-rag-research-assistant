@@ -112,6 +112,20 @@ ingest_tasks_total = Counter(
 )
 
 
+# The only metric sourced from a human rather than from the system's own behaviour. Everything
+# else here measures whether the service is working; this measures whether it is any *good*,
+# which no amount of latency and error-rate data can tell you.
+feedback_total = Counter(
+    "rag_feedback_total",
+    "User ratings of answers, by rating.",
+    ["rating"],
+)
+
+
+def record_feedback(rating: str) -> None:
+    feedback_total.labels(rating=rating).inc()
+
+
 def render() -> tuple[bytes, str]:
     """The exposition payload plus its content type, for the /metrics handler."""
     return generate_latest(), CONTENT_TYPE_LATEST
@@ -200,7 +214,9 @@ class MetricsCallbackHandler(BaseCallbackHandler):
     def on_llm_start(self, serialized: dict, prompts: list[str], *, run_id: UUID, **kwargs) -> None:
         self._starts[run_id] = time.perf_counter()
 
-    def on_chat_model_start(self, serialized: dict, messages: list, *, run_id: UUID, **kwargs) -> None:
+    def on_chat_model_start(
+        self, serialized: dict, messages: list, *, run_id: UUID, **kwargs
+    ) -> None:
         self._starts[run_id] = time.perf_counter()
 
     def on_llm_end(self, response: LLMResult, *, run_id: UUID, **kwargs) -> None:
@@ -208,9 +224,9 @@ class MetricsCallbackHandler(BaseCallbackHandler):
             self._finish(run_id, "ok")
             input_tokens, output_tokens = _extract_token_usage(response)
             if input_tokens:
-                llm_tokens_total.labels(
-                    provider=self.provider, model=self.model, kind="input"
-                ).inc(input_tokens)
+                llm_tokens_total.labels(provider=self.provider, model=self.model, kind="input").inc(
+                    input_tokens
+                )
             if output_tokens:
                 llm_tokens_total.labels(
                     provider=self.provider, model=self.model, kind="output"

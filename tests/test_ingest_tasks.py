@@ -59,7 +59,9 @@ def test_get_task_returns_a_snapshot_not_the_live_object():
 def test_registry_evicts_oldest_task_once_full(monkeypatch):
     monkeypatch.setattr(tasks, "_MAX_TASKS", 3)
 
-    created = [tasks.create_task(filename=f"f{i}.md", original_filename=f"f{i}.md") for i in range(5)]
+    created = [
+        tasks.create_task(filename=f"f{i}.md", original_filename=f"f{i}.md") for i in range(5)
+    ]
 
     assert tasks.get_task(created[0].task_id) is None
     assert tasks.get_task(created[1].task_id) is None

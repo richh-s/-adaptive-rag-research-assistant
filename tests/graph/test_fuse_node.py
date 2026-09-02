@@ -5,17 +5,11 @@ from rag_assistant.schemas.models import RetrievedDoc, SubQueryResult
 def test_fuse_results_merges_and_ranks_across_subqueries_and_sources():
     state = {
         "vector_results": [
-            SubQueryResult(
-                sub_query="q1", docs=[RetrievedDoc(content="doc a", source_id="a.md")]
-            ),
-            SubQueryResult(
-                sub_query="q2", docs=[RetrievedDoc(content="doc b", source_id="b.md")]
-            ),
+            SubQueryResult(sub_query="q1", docs=[RetrievedDoc(content="doc a", source_id="a.md")]),
+            SubQueryResult(sub_query="q2", docs=[RetrievedDoc(content="doc b", source_id="b.md")]),
         ],
         "web_results": [
-            SubQueryResult(
-                sub_query="q1", docs=[RetrievedDoc(content="doc a", source_id="a.md")]
-            ),
+            SubQueryResult(sub_query="q1", docs=[RetrievedDoc(content="doc a", source_id="a.md")]),
         ],
     }
 
@@ -29,9 +23,7 @@ def test_fuse_results_merges_and_ranks_across_subqueries_and_sources():
 def test_fuse_results_includes_bm25_results_as_a_third_ranked_list():
     state = {
         "vector_results": [
-            SubQueryResult(
-                sub_query="q1", docs=[RetrievedDoc(content="doc a", source_id="a.md")]
-            ),
+            SubQueryResult(sub_query="q1", docs=[RetrievedDoc(content="doc a", source_id="a.md")]),
         ],
         "bm25_results": [
             SubQueryResult(

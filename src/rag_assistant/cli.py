@@ -14,6 +14,13 @@ from rag_assistant.eval.baseline import (
     save_baseline,
 )
 from rag_assistant.eval.golden_dataset import load_golden_dataset
+from rag_assistant.backup import (
+    create_backup,
+    prune_backups,
+    read_backup_metadata,
+    restore_backup,
+)
+from rag_assistant.config import get_settings
 from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.ingestion.build_index import build_index
 from rag_assistant.llm import get_chat_model, primary_chat_provider_name
@@ -109,6 +116,169 @@ def search(query: str, max_results: int = 5) -> None:
         console.print()
 
 
+@app.command(name="loadtest")
+def loadtest_(
+    url: str = typer.Option("http://127.0.0.1:8000", help="Base URL of a running server."),
+    path: str = typer.Option("/health", help="Path to hit."),
+    requests: int = typer.Option(200, help="Total requests to send."),
+    concurrency: int = typer.Option(10, help="Requests in flight at once."),
+    question: str | None = typer.Option(
+        None, help="Send this question to /api/v1/research instead (costs LLM calls)."
+    ),
+    api_key: str | None = typer.Option(None, help="X-API-Key, if the server requires one."),
+) -> None:
+    """Measure latency and throughput under concurrency against a running server.
+
+    Defaults to /health, which exercises the HTTP stack, middleware chain and event loop for
+    free. Passing --question points it at the research endpoint instead, which costs several
+    LLM calls per request -- the estimate is printed before anything is sent.
+    """
+    configure_logging()
+    method, payload = "GET", None
+    target = path
+    if question:
+        method, target = "POST", "/api/v1/research"
+        payload = {"question": question, "save": False}
+        console.print(
+            f"[yellow]This sends {requests} research requests -- roughly "
+            f"{requests * _GRAPH_CALLS_PER_QUESTION} model calls. Ctrl-C now if that isn't "
+            f"what you want.[/yellow]"
+        )
+
+    headers = {"X-API-Key": api_key} if api_key else None
+    console.print(f"[bold]{method} {url}{target}[/bold] x{requests} at concurrency {concurrency}")
+
+    import asyncio
+
+    from rag_assistant.loadtest import run_load_test
+
+    result = asyncio.run(
+        run_load_test(
+            base_url=url,
+            path=target,
+            method=method,
+            total_requests=requests,
+            concurrency=concurrency,
+            payload=payload,
+            headers=headers,
+        )
+    )
+
+    summary = result.summary()
+    table = Table(title="Load test")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    for key in ("total_requests", "concurrency", "wall_seconds", "throughput_rps", "error_rate"):
+        table.add_row(key, str(summary[key]))
+    for key in ("p50_ms", "p95_ms", "p99_ms", "max_ms"):
+        table.add_row(key, str(summary[key]))
+    table.add_row("status_counts", str(summary["status_counts"]))
+    console.print(table)
+
+    if result.errors:
+        console.print(
+            f"[red]{len(result.errors)} connection error(s)[/red]; first: {result.errors[0]}"
+        )
+    if summary["error_rate"] > 0:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def backup(
+    output: Path | None = typer.Option(None, help="Directory to write the archive into."),
+    keep: int = typer.Option(0, help="Delete all but this many newest archives (0 = keep all)."),
+) -> None:
+    """Snapshot the Chroma index, the ingestion manifest, the conversation database, and the
+    corpus into one timestamped archive. SQLite files are captured with SQLite's online backup
+    API, so the archive is consistent even if the server is running."""
+    configure_logging()
+    try:
+        archive = create_backup(output_dir=output)
+    except Exception as exc:
+        console.print(f"[red]Backup failed: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    metadata = read_backup_metadata(archive)
+    size_mb = archive.stat().st_size / (1024 * 1024)
+    console.print(f"[green]Wrote[/green] {archive} ({size_mb:.1f} MB)")
+    console.print(
+        f"  {metadata.indexed_sources} indexed source(s), {metadata.corpus_files} corpus file(s), "
+        f"{metadata.conversations} conversation(s), embeddings={metadata.embedding_model}"
+    )
+
+    if keep:
+        removed = prune_backups(archive.parent, keep=keep)
+        if removed:
+            console.print(f"[yellow]Pruned {len(removed)} older archive(s).[/yellow]")
+
+
+@app.command()
+def restore(
+    archive: Path = typer.Argument(..., help="Backup archive produced by `backup`."),
+    yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt."),
+    discard_previous: bool = typer.Option(
+        False, "--discard-previous", help="Delete the current data instead of moving it aside."
+    ),
+) -> None:
+    """Replace the index and corpus with a backup's contents.
+
+    The current data is moved aside (not deleted) unless --discard-previous, and the swap
+    happens only after the archive extracts cleanly -- a corrupt archive fails with the live
+    data untouched.
+    """
+    configure_logging()
+    if not archive.exists():
+        console.print(f"[red]No such archive: {archive}[/red]")
+        raise typer.Exit(code=1)
+
+    try:
+        metadata = read_backup_metadata(archive)
+    except Exception as exc:
+        console.print(f"[red]Not a readable rag-assistant backup: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[bold]Archive:[/bold] {archive}")
+    console.print(f"  created {metadata.created_at}")
+    console.print(
+        f"  {metadata.indexed_sources} indexed source(s), {metadata.corpus_files} corpus file(s), "
+        f"{metadata.conversations} conversation(s)"
+    )
+    console.print(f"  embeddings: {metadata.embedding_model}")
+
+    if not yes:
+        settings = get_settings()
+        console.print(
+            f"\n[yellow]This replaces {settings.chroma_persist_dir} and {settings.corpus_dir}."
+            "[/yellow]"
+        )
+        typer.confirm("Continue?", abort=True)
+
+    try:
+        result = restore_backup(archive, keep_previous=not discard_previous)
+    except Exception as exc:
+        console.print(f"[red]Restore failed (live data left in place): {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"[green]Restored[/green] index={result.restored_chroma} corpus={result.restored_corpus}"
+    )
+    if result.previous_kept_at:
+        console.print(f"  previous data kept alongside it in {result.previous_kept_at}")
+    if result.embedding_model_changed:
+        # Restoring an index built with a different embedding model is the silent-corruption
+        # case index_metadata.py exists to catch -- say so now rather than let /ready say it.
+        console.print(
+            f"[red]Warning:[/red] this backup was built with embeddings "
+            f"{metadata.embedding_model!r} but {get_settings().gemini_embedding_model!r} is "
+            f"configured. /ready will report unavailable until you re-index with "
+            f"`rag-assistant ingest --full` or restore the previous model setting."
+        )
+    console.print(
+        "[yellow]Restart the server[/yellow] -- the index, BM25 and conversation "
+        "caches are process-local and still hold pre-restore state."
+    )
+
+
 @app.command()
 def serve(host: str = "127.0.0.1", port: int = 8000, reload: bool = False) -> None:
     """Run the FastAPI server exposing POST /research."""
@@ -170,7 +340,9 @@ def eval_(
     judge_calls = limit * _LLM_JUDGE_CALLS_PER_QUESTION if llm_judge else 0
     total = graph_calls + judge_calls
     quota_note = (
-        " against the 20/day free-tier quota" if provider == "Gemini" else " (Gemini free-tier"
+        " against the 20/day free-tier quota"
+        if provider == "Gemini"
+        else " (Gemini free-tier"
         " quota no longer applies since Anthropic is primary; embeddings still call Gemini"
         " separately)"
     )
@@ -194,7 +366,9 @@ def eval_(
     table.add_column("Route")
     table.add_column("Sources")
     for r in results:
-        route_cell = f"{r.actual_route} ({'✓' if r.route_match else '✗ expected ' + r.expected_route})"
+        route_cell = (
+            f"{r.actual_route} ({'✓' if r.route_match else '✗ expected ' + r.expected_route})"
+        )
         if r.expected_sources:
             sources_cell = "✓" if r.source_overlap else f"✗ expected {r.expected_sources}"
         else:
@@ -254,7 +428,9 @@ def eval_(
         gate.add_column("Delta", justify="right")
         for c in comparison.comparisons:
             marker = "[red]REGRESSED[/red]" if c.regressed else "[green]ok[/green]"
-            gate.add_row(c.name, f"{c.baseline:.3f}", f"{c.current:.3f}", f"{c.delta:+.3f} {marker}")
+            gate.add_row(
+                c.name, f"{c.baseline:.3f}", f"{c.current:.3f}", f"{c.delta:+.3f} {marker}"
+            )
         console.print(gate)
 
         if not comparison.passed:

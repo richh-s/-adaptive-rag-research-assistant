@@ -5,6 +5,7 @@ these run on every `/ready` poll from a load balancer/orchestrator, so cost has 
 import httpx
 
 from rag_assistant.config import get_settings
+from rag_assistant.ingestion.index_metadata import check_embedding_model
 from rag_assistant.retrieval.vector_store import get_vector_store
 
 
@@ -14,6 +15,19 @@ def check_chroma() -> tuple[bool, str | None]:
     except Exception as exc:
         return False, str(exc)
     return True, None
+
+
+def check_embeddings() -> tuple[bool, str | None]:
+    """Whether the configured embedding model matches the one the index was built with.
+
+    A pure file read -- no embedding call, so it stays free enough to run on every `/ready`
+    poll. This is the one readiness check whose failure mode is *silent*: the other
+    dependencies error when they're broken, whereas a mismatched embedding model keeps
+    answering, plausibly and wrongly. That is exactly why it belongs in readiness rather
+    than in a log line somebody might notice later.
+    """
+    settings = get_settings()
+    return check_embedding_model(settings.chroma_persist_dir, settings.gemini_embedding_model)
 
 
 def check_web_search() -> tuple[bool, str | None]:

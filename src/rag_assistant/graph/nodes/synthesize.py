@@ -12,6 +12,7 @@ from rag_assistant.prompts.synthesis_prompt import (
     SYNTHESIS_PROMPT,
 )
 from rag_assistant.ingestion.ownership import display_source
+from rag_assistant.retrieval.parent_store import get_parents
 from rag_assistant.schemas.models import Citation, FusedDocument
 
 # Mirrors condense.py's window: enough turns for continuity of tone/topic, without pasting
@@ -40,6 +41,33 @@ def _history_block(history: list[dict]) -> str:
     )
 
 
+def expand_to_parents(docs: list[FusedDocument], persist_dir) -> list[FusedDocument]:
+    """Small-to-big: swap each retrieved chunk for the section it came from.
+
+    Deduplicated by `parent_id` while preserving rank, because several chunks of one section
+    routinely all match -- without collapsing them the same section would occupy three slots
+    of the context budget and earn three citation markers pointing at one passage.
+
+    A chunk whose parent is missing (indexed before parents were recorded, or a stale store)
+    keeps its own content. The feature degrades to ordinary chunk retrieval rather than
+    dropping a document that retrieval legitimately found.
+    """
+    parent_ids = [d.metadata.get("parent_id") for d in docs]
+    parents = get_parents(persist_dir, [pid for pid in parent_ids if pid])
+    expanded: list[FusedDocument] = []
+    seen: set[str] = set()
+    for doc in docs:
+        parent_id = doc.metadata.get("parent_id")
+        if not parent_id or parent_id not in parents:
+            expanded.append(doc)
+            continue
+        if parent_id in seen:
+            continue
+        seen.add(parent_id)
+        expanded.append(doc.model_copy(update={"content": parents[parent_id]}))
+    return expanded
+
+
 def synthesize_answer(state: ResearchState) -> dict:
     """Builds the final cited answer from the fused, deduplicated, rank-ordered documents,
     or answers directly from the model's own knowledge when the router decided no retrieval
@@ -50,6 +78,10 @@ def synthesize_answer(state: ResearchState) -> dict:
     # Bound the prompt before anything is built from it -- the cache key, the numbered
     # context and the citation markers all have to describe the same set of documents, so
     # the budget is applied once here and everything downstream reads `docs`.
+    # Expansion happens before the budget, never after: the budget must measure the text that
+    # actually reaches the prompt, and a section is several times the size of its chunk.
+    if settings.parent_context and all_docs:
+        all_docs = expand_to_parents(all_docs, settings.chroma_persist_dir)
     budgeted = select_context_documents(
         all_docs,
         budget_tokens=settings.synthesis_context_budget_tokens,
@@ -61,9 +93,9 @@ def synthesize_answer(state: ResearchState) -> dict:
     # History changes the rendered prompt, so it must be part of the cache identity -- the
     # same standalone question asked in two different conversations may legitimately get
     # differently-phrased answers.
-    history_digest = hashlib.sha256(
-        json.dumps(history, sort_keys=True).encode()
-    ).hexdigest() if history else ""
+    history_digest = (
+        hashlib.sha256(json.dumps(history, sort_keys=True).encode()).hexdigest() if history else ""
+    )
     key = cache_key(
         "synthesis", question, state.get("route", ""), history_digest, *(d.source_id for d in docs)
     )
@@ -105,7 +137,10 @@ def synthesize_answer(state: ResearchState) -> dict:
 
     cache_set(
         key,
-        {"final_answer": result["final_answer"], "citations": [c.model_dump() for c in result["citations"]]},
+        {
+            "final_answer": result["final_answer"],
+            "citations": [c.model_dump() for c in result["citations"]],
+        },
         settings.cache_ttl_synthesis,
     )
     return {**result, "context_documents_dropped": budgeted.dropped_documents}

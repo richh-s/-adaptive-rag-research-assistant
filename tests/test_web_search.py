@@ -93,7 +93,9 @@ def test_search_returns_cached_results_without_calling_client(monkeypatch):
         def search(self, query: str, max_results: int, timeout: float = 60) -> list[dict]:
             raise AssertionError("client should not be called on a cache hit")
 
-    cached_doc = RetrievedDoc(content="cached", metadata={}, source_id="https://cached.com", score=None)
+    cached_doc = RetrievedDoc(
+        content="cached", metadata={}, source_id="https://cached.com", score=None
+    )
     monkeypatch.setattr(
         "rag_assistant.retrieval.web_search.cache_get", lambda key: [cached_doc.model_dump()]
     )

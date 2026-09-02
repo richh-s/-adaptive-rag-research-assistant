@@ -127,11 +127,8 @@ def test_conversations_are_scoped_per_tenant(monkeypatch):
         ).status_code
         == 404
     )
-    assert (
-        client.delete(f"/api/v1/conversations/{conversation_id}", headers=bob).status_code == 404
-    )
+    assert client.delete(f"/api/v1/conversations/{conversation_id}", headers=bob).status_code == 404
     # Alice still can.
     assert (
-        client.delete(f"/api/v1/conversations/{conversation_id}", headers=alice).status_code
-        == 204
+        client.delete(f"/api/v1/conversations/{conversation_id}", headers=alice).status_code == 204
     )

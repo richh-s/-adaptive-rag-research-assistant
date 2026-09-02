@@ -32,6 +32,8 @@ jobs:
         run: uv sync --frozen
       - name: Lint
         run: uv run ruff check src tests
+      - name: Format check
+        run: uv run ruff format --check src tests
       # The threshold sits a few points under the current number so ordinary work isn't
       # blocked by noise, while a change that drops whole modules out of the suite fails.
       - name: Tests
@@ -123,7 +125,7 @@ jobs:
             echo "::notice::Eval gate skipped -- no GOOGLE_API_KEY secret configured."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           elif [ ! -f data/golden_eval/baseline.json ]; then
-            echo "::warning::Eval gate skipped -- no baseline recorded. Run 'uv run rag-assistant eval --limit 18 --record-baseline' against a known-good build and commit data/golden_eval/baseline.json to turn the gate on."
+            echo "::warning::Eval gate skipped -- no baseline recorded. Run 'uv run rag-assistant eval --limit 28 --record-baseline' against a known-good build and commit data/golden_eval/baseline.json to turn the gate on."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
@@ -133,7 +135,7 @@ jobs:
         run: uv run rag-assistant ingest
       - name: Eval gate
         if: steps.guard.outputs.enabled == 'true'
-        run: uv run rag-assistant eval --limit 18 --check
+        run: uv run rag-assistant eval --limit 28 --check
 
   docker:
     runs-on: ubuntu-latest

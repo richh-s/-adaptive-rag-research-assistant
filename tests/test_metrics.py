@@ -111,15 +111,21 @@ def test_unmatched_paths_collapse_to_one_series(client: TestClient):
         assert client.get(path).status_code == 404
 
     assert sample("rag_http_requests_total", labels) == before + 3
-    assert REGISTRY.get_sample_value("rag_http_requests_total", {**labels, "route": "/.env"}) is None
+    assert (
+        REGISTRY.get_sample_value("rag_http_requests_total", {**labels, "route": "/.env"}) is None
+    )
 
 
 def test_status_is_recorded_as_a_class_not_an_exact_code(client: TestClient):
-    before = sample("rag_http_requests_total", {"route": "/health", "method": "GET", "status": "2xx"})
+    before = sample(
+        "rag_http_requests_total", {"route": "/health", "method": "GET", "status": "2xx"}
+    )
 
     client.get("/health")
 
-    after = sample("rag_http_requests_total", {"route": "/health", "method": "GET", "status": "2xx"})
+    after = sample(
+        "rag_http_requests_total", {"route": "/health", "method": "GET", "status": "2xx"}
+    )
     assert after == before + 1
     assert (
         REGISTRY.get_sample_value(

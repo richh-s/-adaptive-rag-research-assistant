@@ -25,6 +25,21 @@ from rag_assistant.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+
+def _postgres():
+    """The Postgres implementation when configured, else None.
+
+    Dispatch lives at the top of each public function rather than behind a class or a module
+    swap, so the SQLite path -- which is what almost every deployment and every test runs --
+    stays a plain function call with nothing indirected.
+    """
+    if get_settings().conversations_backend != "postgres":
+        return None
+    from rag_assistant.conversations import postgres_store
+
+    return postgres_store
+
+
 _LOCK = threading.Lock()
 _conn: sqlite3.Connection | None = None
 _conn_path: Path | None = None
@@ -73,12 +88,41 @@ def _migration_001_baseline(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_002_feedback(conn: sqlite3.Connection) -> None:
+    """Per-answer user feedback.
+
+    Kept in the conversations database rather than its own store because feedback is only
+    meaningful next to the exchange it judges, and because it inherits the same backup,
+    retention and tenancy story for free. `conversation_id` is intentionally *not* a foreign
+    key: retention deletes old conversations, and losing the quality signal because the
+    transcript aged out would defeat the point of collecting it.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT,
+            owner TEXT NOT NULL DEFAULT 'public',
+            question TEXT NOT NULL,
+            rating TEXT NOT NULL CHECK (rating IN ('up', 'down')),
+            note TEXT,
+            route TEXT,
+            confidence_score REAL,
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_feedback_owner ON feedback(owner, created_at);
+        CREATE INDEX IF NOT EXISTS idx_feedback_rating ON feedback(rating);
+        """
+    )
+
+
 # Ordered, append-only. Index i in this list is migration number i+1, and `PRAGMA user_version`
 # records how many have been applied -- the standard SQLite idiom, and the reason a schema
 # change from here on is "append a function" rather than "hope CREATE TABLE IF NOT EXISTS
 # happens to cover it". Never edit or reorder an entry that has shipped; append a new one.
 _MIGRATIONS: list = [
     _migration_001_baseline,
+    _migration_002_feedback,
 ]
 
 MAX_TITLE_CHARS = 80
@@ -149,7 +193,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
 def reset_store_cache() -> None:
     """Tests point CONVERSATIONS_DB_PATH at tmp dirs per-test; this drops the cached
     connection so the next call reopens against the current settings (mirrors
-    cache.reset_client_cache)."""
+    cache.reset_client_cache).
+
+    Deliberately does not read settings. It is called from test teardown immediately after
+    the settings cache is cleared, and calling `get_settings()` here would rebuild that cache
+    from whatever the environment looked like at that instant -- which is how every test ends
+    up sharing one conversations database. Both backends are reset unconditionally instead,
+    and the Postgres one only if its module was ever imported.
+    """
+    import sys
+
+    postgres_store = sys.modules.get("rag_assistant.conversations.postgres_store")
+    if postgres_store is not None:
+        postgres_store.reset_store_cache()
     global _conn, _conn_path
     if _conn is not None:
         _conn.close()
@@ -157,6 +213,8 @@ def reset_store_cache() -> None:
 
 
 def create_conversation(title: str, owner: str = "public") -> ConversationRow:
+    if (backend := _postgres()) is not None:
+        return backend.create_conversation(title, owner)
     now = time.time()
     conversation_id = uuid.uuid4().hex
     clean_title = (title or "New conversation").strip()[:MAX_TITLE_CHARS] or "New conversation"
@@ -173,16 +231,22 @@ def create_conversation(title: str, owner: str = "public") -> ConversationRow:
 
 
 def list_conversations(owner: str = "public", limit: int = 100) -> list[ConversationRow]:
+    if (backend := _postgres()) is not None:
+        return backend.list_conversations(owner, limit)
     with _LOCK:
-        rows = _get_conn().execute(
-            """
+        rows = (
+            _get_conn()
+            .execute(
+                """
             SELECT c.id, c.title, c.created_at, c.updated_at, COUNT(m.id)
             FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id
             WHERE c.owner = ?
             GROUP BY c.id ORDER BY c.updated_at DESC LIMIT ?
             """,
-            (owner, limit),
-        ).fetchall()
+                (owner, limit),
+            )
+            .fetchall()
+        )
     return [
         ConversationRow(id=r[0], title=r[1], created_at=r[2], updated_at=r[3], message_count=r[4])
         for r in rows
@@ -192,15 +256,21 @@ def list_conversations(owner: str = "public", limit: int = 100) -> list[Conversa
 def get_conversation(conversation_id: str, owner: str = "public") -> ConversationRow | None:
     """Owner-scoped on purpose: a valid id belonging to another tenant returns None, which
     the API surfaces as the same 404 as a nonexistent id -- no cross-tenant existence oracle."""
+    if (backend := _postgres()) is not None:
+        return backend.get_conversation(conversation_id, owner)
     with _LOCK:
-        row = _get_conn().execute(
-            """
+        row = (
+            _get_conn()
+            .execute(
+                """
             SELECT c.id, c.title, c.created_at, c.updated_at, COUNT(m.id)
             FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id
             WHERE c.id = ? AND c.owner = ? GROUP BY c.id
             """,
-            (conversation_id, owner),
-        ).fetchone()
+                (conversation_id, owner),
+            )
+            .fetchone()
+        )
     if row is None:
         return None
     return ConversationRow(
@@ -209,14 +279,20 @@ def get_conversation(conversation_id: str, owner: str = "public") -> Conversatio
 
 
 def get_messages(conversation_id: str) -> list[MessageRow]:
+    if (backend := _postgres()) is not None:
+        return backend.get_messages(conversation_id)
     with _LOCK:
-        rows = _get_conn().execute(
-            """
+        rows = (
+            _get_conn()
+            .execute(
+                """
             SELECT role, content, report, summary_json, created_at
             FROM messages WHERE conversation_id = ? ORDER BY id
             """,
-            (conversation_id,),
-        ).fetchall()
+                (conversation_id,),
+            )
+            .fetchall()
+        )
     return [
         MessageRow(
             role=r[0],
@@ -232,6 +308,8 @@ def get_messages(conversation_id: str) -> list[MessageRow]:
 def get_history(conversation_id: str) -> list[dict]:
     """The transcript in the {"role", "content"} shape the graph's chat_history expects,
     capped to the most recent HISTORY_TURN_LIMIT messages."""
+    if (backend := _postgres()) is not None:
+        return backend.get_history(conversation_id)
     messages = get_messages(conversation_id)
     return [{"role": m.role, "content": m.content} for m in messages[-HISTORY_TURN_LIMIT:]]
 
@@ -246,6 +324,9 @@ def append_turn(
     """Persists one completed exchange (user question + assistant answer) atomically, so a
     crash between the two writes can't leave a dangling user message that would skew the
     next request's condensation history."""
+    if (backend := _postgres()) is not None:
+        backend.append_turn(conversation_id, question, answer, report, summary)
+        return
     now = time.time()
     with _LOCK:
         conn = _get_conn()
@@ -260,9 +341,7 @@ def append_turn(
             """,
             (conversation_id, answer, report, json.dumps(summary) if summary else None, now),
         )
-        conn.execute(
-            "UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id)
-        )
+        conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
         conn.commit()
         # Pruned here rather than on a timer: the only moment the table can grow is a write,
         # and this scopes the work to the one tenant that just wrote instead of sweeping the
@@ -323,11 +402,15 @@ def _prune_locked(conn: sqlite3.Connection, owner: str, now: float | None = None
 def prune_conversations(owner: str = "public") -> int:
     """Public entry point for the retention policy -- used by tests and available for an
     operator-triggered sweep. `append_turn` prunes inline and does not go through here."""
+    if (backend := _postgres()) is not None:
+        return backend.prune_conversations(owner)
     with _LOCK:
         return _prune_locked(_get_conn(), owner)
 
 
 def delete_conversation(conversation_id: str, owner: str = "public") -> bool:
+    if (backend := _postgres()) is not None:
+        return backend.delete_conversation(conversation_id, owner)
     with _LOCK:
         conn = _get_conn()
         cursor = conn.execute(
@@ -335,3 +418,102 @@ def delete_conversation(conversation_id: str, owner: str = "public") -> bool:
         )
         conn.commit()
     return cursor.rowcount > 0
+
+
+@dataclass
+class FeedbackRow:
+    id: int
+    conversation_id: str | None
+    question: str
+    rating: str
+    note: str | None
+    route: str | None
+    confidence_score: float | None
+    created_at: float
+
+
+def record_feedback(
+    question: str,
+    rating: str,
+    owner: str = "public",
+    conversation_id: str | None = None,
+    note: str | None = None,
+    route: str | None = None,
+    confidence_score: float | None = None,
+) -> int:
+    """Stores one rating and returns its id."""
+    if (backend := _postgres()) is not None:
+        return backend.record_feedback(
+            question, rating, owner, conversation_id, note, route, confidence_score
+        )
+    now = time.time()
+    with _LOCK:
+        conn = _get_conn()
+        cursor = conn.execute(
+            """
+            INSERT INTO feedback
+                (conversation_id, owner, question, rating, note, route, confidence_score, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (conversation_id, owner, question, rating, note, route, confidence_score, now),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def list_feedback(owner: str = "public", limit: int = 100) -> list[FeedbackRow]:
+    if (backend := _postgres()) is not None:
+        return backend.list_feedback(owner, limit)
+    with _LOCK:
+        rows = (
+            _get_conn()
+            .execute(
+                """
+            SELECT id, conversation_id, question, rating, note, route, confidence_score, created_at
+            FROM feedback WHERE owner = ? ORDER BY created_at DESC LIMIT ?
+            """,
+                (owner, limit),
+            )
+            .fetchall()
+        )
+    return [FeedbackRow(*row) for row in rows]
+
+
+def feedback_summary(owner: str = "public") -> dict:
+    """Counts and the negatively-rated questions.
+
+    The downvoted questions are the actually useful output: they are the questions real users
+    asked that the system answered badly, which is exactly the material a golden eval dataset
+    goes stale for lack of. A satisfaction percentage alone tells you something is wrong
+    without telling you what to add to the dataset.
+    """
+    if (backend := _postgres()) is not None:
+        return backend.feedback_summary(owner)
+    with _LOCK:
+        conn = _get_conn()
+        counts = dict(
+            conn.execute(
+                "SELECT rating, COUNT(*) FROM feedback WHERE owner = ? GROUP BY rating",
+                (owner,),
+            ).fetchall()
+        )
+        downvoted = [
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT question FROM feedback
+                WHERE owner = ? AND rating = 'down'
+                ORDER BY created_at DESC LIMIT 20
+                """,
+                (owner,),
+            ).fetchall()
+        ]
+    up, down = counts.get("up", 0), counts.get("down", 0)
+    total = up + down
+    return {
+        "up": up,
+        "down": down,
+        "total": total,
+        "satisfaction": (up / total) if total else None,
+        "recent_downvoted_questions": downvoted,
+    }

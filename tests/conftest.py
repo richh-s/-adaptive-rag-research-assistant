@@ -4,9 +4,10 @@ from pathlib import Path
 import pytest
 from langchain_core.embeddings import Embeddings
 
-from rag_assistant import cache
+from rag_assistant import auth, cache
 from rag_assistant.config import get_settings
 from rag_assistant.conversations import store as conversations_store
+from rag_assistant.retrieval import parent_store, reranker
 
 
 @pytest.fixture(autouse=True)
@@ -22,6 +23,16 @@ def _default_test_env(request, monkeypatch, tmp_path):
     # Every test gets its own conversation store so persistence tests can't see each
     # other's rows -- and no test ever writes into the developer's real conversations.db.
     monkeypatch.setenv("CONVERSATIONS_DB_PATH", str(tmp_path / "conversations.db"))
+    # Same reasoning for the corpus, and it is not hypothetical: before this, every test that
+    # exercised an upload endpoint without overriding CORPUS_DIR wrote a file into the real
+    # data/corpus -- which then got indexed, described to the router, and scored by the eval
+    # harness. The repo had accumulated `passwd_*.md` from the path-traversal test.
+    # Distinctly named so they can't collide with the `tmp_path / "corpus"` and
+    # `tmp_path / "chroma"` that individual tests create for themselves.
+    default_corpus = tmp_path / "_isolated_corpus"
+    default_corpus.mkdir(exist_ok=True)
+    monkeypatch.setenv("CORPUS_DIR", str(default_corpus))
+    monkeypatch.setenv("CHROMA_PERSIST_DIR", str(tmp_path / "_isolated_chroma"))
     # PDF vision ingestion would otherwise attempt real API calls whenever a test PDF has
     # an image-only page; tests that exercise the vision path mock describe_image directly.
     monkeypatch.setenv("PDF_VISION", "false")
@@ -31,11 +42,17 @@ def _default_test_env(request, monkeypatch, tmp_path):
 def _clear_settings_cache():
     get_settings.cache_clear()
     cache.reset_client_cache()
+    auth.reset_api_key_cache()
     conversations_store.reset_store_cache()
+    parent_store.reset_parent_store_cache()
+    reranker.reset_reranker_cache()
     yield
     get_settings.cache_clear()
     cache.reset_client_cache()
+    auth.reset_api_key_cache()
     conversations_store.reset_store_cache()
+    parent_store.reset_parent_store_cache()
+    reranker.reset_reranker_cache()
 
 
 class FakeHashingEmbeddings(Embeddings):

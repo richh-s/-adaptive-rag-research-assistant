@@ -1,7 +1,8 @@
 import re
+from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _ALNUM_RE = re.compile(r"\w", re.UNICODE)
@@ -15,6 +16,43 @@ class ChatTurn(BaseModel):
 
     role: Literal["user", "assistant"]
     content: str = Field(..., min_length=1, max_length=8000)
+
+
+class RetrievalFilters(BaseModel):
+    """Narrows local retrieval before fusion, rather than reranking after it.
+
+    Post-filtering is the tempting shortcut and it is wrong for the same reason it is wrong
+    for tenancy: `k` is applied by the store, so filtering the results afterwards silently
+    returns fewer documents than asked for -- sometimes none -- and the graph reads that as
+    "the corpus has nothing" and falls back to web search. These are pushed into the query.
+
+    Web results are unaffected: a filter on indexed sources has no meaning for a live search.
+    """
+
+    sources: list[str] = Field(
+        default_factory=list,
+        max_length=50,
+        description="Restrict to these source filenames. Empty means no source restriction.",
+    )
+    ingested_after: datetime | None = Field(
+        None, description="Only documents indexed at or after this instant."
+    )
+    ingested_before: datetime | None = Field(
+        None, description="Only documents indexed at or before this instant."
+    )
+
+    def is_empty(self) -> bool:
+        return not self.sources and self.ingested_after is None and self.ingested_before is None
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "RetrievalFilters":
+        if (
+            self.ingested_after
+            and self.ingested_before
+            and self.ingested_after > self.ingested_before
+        ):
+            raise ValueError("ingested_after must not be later than ingested_before.")
+        return self
 
 
 class ResearchRequest(BaseModel):
@@ -33,6 +71,10 @@ class ResearchRequest(BaseModel):
     history: list[ChatTurn] = Field(default_factory=list, max_length=20)
     conversation_id: str | None = Field(default=None, max_length=64)
     save: bool = True
+    filters: RetrievalFilters = Field(
+        default_factory=RetrievalFilters,
+        description="Narrows local retrieval. Has no effect on web search results.",
+    )
 
     @field_validator("question")
     @classmethod
@@ -196,3 +238,29 @@ class ConversationDetail(BaseModel):
     created_at: float
     updated_at: float
     messages: list[ConversationMessage]
+
+
+class FeedbackRequest(BaseModel):
+    """POST /api/v1/feedback body -- one user rating of one answer."""
+
+    question: str = Field(..., min_length=1, max_length=2000)
+    rating: Literal["up", "down"]
+    conversation_id: str | None = Field(default=None, max_length=64)
+    note: str | None = Field(default=None, max_length=2000)
+    route: str | None = Field(default=None, max_length=32)
+    confidence_score: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class FeedbackResponse(BaseModel):
+    id: int
+    recorded: bool = True
+
+
+class FeedbackSummary(BaseModel):
+    """Aggregate signal, plus the questions worth adding to the eval dataset."""
+
+    up: int
+    down: int
+    total: int
+    satisfaction: float | None
+    recent_downvoted_questions: list[str]

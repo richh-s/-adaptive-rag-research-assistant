@@ -43,6 +43,19 @@ dependencies = [
     "uvicorn[standard]>=0.49.0",
 ]
 
+[project.optional-dependencies]
+# Cross-encoder reranking backends. Neither is installed by default: `rerank-local` pulls in
+# torch (hundreds of MB) and `rerank-cohere` needs an API key, and RERANKER=none means the
+# code path is never reached. Install with `uv sync --extra rerank-cohere`.
+rerank-cohere = ["cohere>=5.13"]
+rerank-local = ["sentence-transformers>=3.3"]
+# Postgres-backed conversations, for running more than one replica (see
+# conversations/postgres_store.py). SQLite remains the default.
+postgres = [
+    "psycopg-pool>=3.2",
+    "psycopg[binary]>=3.2",
+]
+
 [project.scripts]
 rag-assistant = "rag_assistant.cli:main"
 
@@ -55,6 +68,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=6.0",
+    "pyyaml>=6",
     "ruff>=0.15.20",
 ]
 

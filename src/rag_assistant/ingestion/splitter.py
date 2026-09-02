@@ -16,17 +16,23 @@ SHA256(content), so vector chunks and BM25 chunks must be byte-identical or the 
 retrieved by both paths shows up twice, splits its own rank votes, and gets cited twice.
 """
 
+import hashlib
 import re
+from dataclasses import dataclass, field
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Bumped whenever the chunking strategy changes. The ingestion manifest records this next to
+from rag_assistant.config import get_settings
+from rag_assistant.ingestion.semantic_splitter import semantic_split
+
+# Bumped whenever anything about what is stored per chunk changes -- the splitting
+# strategy or the metadata attached to each chunk. The ingestion manifest records this next to
 # each file's content hash, so a strategy change invalidates every entry and forces a
 # re-index -- without it, `build_index` would compare unchanged file hashes, skip every file,
 # and leave the collection full of chunks built by the previous strategy while the code
 # assumes the new one. Silent, and only visible as quietly worse retrieval.
-CHUNKING_VERSION = 2
+CHUNKING_VERSION = 4
 
 _HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*$")
 # A "#" inside a fenced code block is a comment, not a heading. Tracking fences costs one
@@ -94,31 +100,92 @@ def _split_into_sections(text: str) -> list[tuple[str, str]]:
     return sections
 
 
-def split_documents(
-    documents: list[Document], chunk_size: int = 800, chunk_overlap: int = 100
-) -> list[Document]:
-    """Structure-aware chunking: split on headings, then fixed-size within each section, with
-    the heading breadcrumb prepended to every chunk.
+@dataclass
+class SplitResult:
+    """Chunks plus the section text each one came from.
+
+    The parents are carried separately rather than duplicated into every chunk's metadata:
+    a section can produce many chunks, and copying the whole section into each of them would
+    multiply the stored corpus by the chunks-per-section factor for a feature
+    (`PARENT_CONTEXT`) that is off by default.
+    """
+
+    chunks: list[Document] = field(default_factory=list)
+    parents: dict[str, str] = field(default_factory=dict)
+
+
+def _parent_id(source: str, breadcrumb: str, ordinal: int) -> str:
+    """Stable id for one section of one document. Derived from content-independent
+    coordinates so re-indexing an unchanged file reproduces the same ids."""
+    digest = hashlib.sha256(f"{source}\x00{breadcrumb}\x00{ordinal}".encode()).hexdigest()
+    return digest[:16]
+
+
+def _split_section_body(
+    body: str, available: int, chunk_overlap: int, strategy: str, embeddings
+) -> list[str]:
+    """One section's body into chunk-sized pieces, by the configured strategy."""
+    if strategy == "semantic" and embeddings is not None:
+        pieces = semantic_split(
+            body,
+            embeddings,
+            percentile=get_settings().semantic_chunk_percentile,
+            min_chunk_chars=max(available // 4, 1),
+            max_chunk_chars=max(available, 1),
+        )
+        if pieces:
+            return pieces
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=available,
+        chunk_overlap=min(chunk_overlap, max(available - 1, 0)),
+    )
+    return splitter.split_text(body)
+
+
+def split_with_parents(
+    documents: list[Document],
+    chunk_size: int = 800,
+    chunk_overlap: int = 100,
+    strategy: str | None = None,
+    embeddings=None,
+) -> SplitResult:
+    """Structure-aware chunking: split on headings, then within each section by the configured
+    strategy, with the heading breadcrumb prepended to every chunk.
 
     The breadcrumb is charged against `chunk_size` rather than added on top of it, so the
     caller's budget stays a real bound on chunk length -- a downstream context budget that
     trusts `chunk_size` would otherwise be quietly wrong by the length of the headings.
+
+    Every chunk records the `parent_id` of the section it came from, and the section bodies
+    come back alongside. That is what makes small-to-big retrieval possible: retrieve on the
+    precise chunk, then synthesise from the whole section (see retrieval/parent_store.py).
     """
-    chunks: list[Document] = []
+    strategy = strategy or get_settings().chunking_strategy
+    result = SplitResult()
     for document in documents:
-        for section_breadcrumb, body in _split_into_sections(document.page_content):
+        source = document.metadata.get("source", "")
+        for ordinal, (section_breadcrumb, body) in enumerate(
+            _split_into_sections(document.page_content)
+        ):
             prefix = f"{section_breadcrumb}\n\n" if section_breadcrumb else ""
             available = chunk_size - len(prefix)
             if available < _MIN_BODY_CHARS:
                 prefix, available = "", chunk_size
 
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=available,
-                chunk_overlap=min(chunk_overlap, max(available - 1, 0)),
-            )
-            for piece in splitter.split_text(body):
+            parent_id = _parent_id(source, section_breadcrumb, ordinal)
+            result.parents[parent_id] = prefix + body
+
+            for piece in _split_section_body(body, available, chunk_overlap, strategy, embeddings):
                 metadata = dict(document.metadata)
+                metadata["parent_id"] = parent_id
                 if section_breadcrumb:
                     metadata["section"] = section_breadcrumb
-                chunks.append(Document(page_content=prefix + piece, metadata=metadata))
-    return chunks
+                result.chunks.append(Document(page_content=prefix + piece, metadata=metadata))
+    return result
+
+
+def split_documents(
+    documents: list[Document], chunk_size: int = 800, chunk_overlap: int = 100
+) -> list[Document]:
+    """Chunks only, for callers that don't need parent sections."""
+    return split_with_parents(documents, chunk_size=chunk_size, chunk_overlap=chunk_overlap).chunks

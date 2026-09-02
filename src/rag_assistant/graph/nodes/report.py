@@ -31,7 +31,9 @@ def format_report(state: ResearchState) -> dict:
             markers_by_source[c.source_id].append(c.marker)
 
         lines.append("**Sources:**")
-        lines.extend(f"- {''.join(markers_by_source[source_id])} {source_id}" for source_id in order)
+        lines.extend(
+            f"- {''.join(markers_by_source[source_id])} {source_id}" for source_id in order
+        )
         lines.append("")
 
     return {"research_report": "\n".join(lines)}

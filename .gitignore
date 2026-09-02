@@ -17,9 +17,20 @@ temp_interactive_push.bat
 frontend/.env
 
 # Local data stores
-data/corpus/*_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f].*
+# Ingested documents. The five baseline files are tracked; anything else in here arrived
+# through an upload (or a stray test run) and is local data, not source.
+data/corpus/*
+!data/corpus/anthropic.md
+!data/corpus/google_deepmind.md
+!data/corpus/meta_ai.md
+!data/corpus/mistral_ai.md
+!data/corpus/openai.md
 # Tenant-uploaded documents (see ingestion/ownership.py) -- private data, never committed
 data/corpus/_t/
+
+# Directories `restore` moves aside instead of deleting (see backup.py). Local recovery
+# state, never source.
+*.pre-restore-*
 
 # OS / shell artifacts
 .DS_Store

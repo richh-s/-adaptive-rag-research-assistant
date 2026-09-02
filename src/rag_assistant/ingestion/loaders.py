@@ -62,7 +62,9 @@ def _transcribe_scanned_page(doc: "pymupdf.Document", page_index: int) -> str:
     """A page with no text layer is a scan/photo: render it to PNG and let the vision model
     transcribe it -- same mechanism as figure description, no OCR dependency."""
     try:
-        pixmap = doc[page_index].get_pixmap(matrix=pymupdf.Matrix(_SCAN_RENDER_ZOOM, _SCAN_RENDER_ZOOM))
+        pixmap = doc[page_index].get_pixmap(
+            matrix=pymupdf.Matrix(_SCAN_RENDER_ZOOM, _SCAN_RENDER_ZOOM)
+        )
         png_bytes = pixmap.tobytes("png")
     except Exception:
         logger.warning("Could not render page %d for transcription", page_index + 1, exc_info=True)
@@ -105,7 +107,9 @@ def extract_html_text(html: str) -> tuple[str | None, str]:
     Boilerplate tags (nav/script/style/etc.) are dropped wholesale rather than running a
     full readability pass -- good enough for docs/articles, and dependency-free beyond bs4."""
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript", "template", "nav", "footer", "header", "aside"]):
+    for tag in soup(
+        ["script", "style", "noscript", "template", "nav", "footer", "header", "aside"]
+    ):
         tag.decompose()
     title = soup.title.get_text(strip=True) if soup.title else None
     lines = [line.strip() for line in soup.get_text(separator="\n").splitlines()]

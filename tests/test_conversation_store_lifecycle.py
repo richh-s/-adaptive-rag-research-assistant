@@ -116,22 +116,21 @@ def test_a_newly_appended_migration_runs_on_an_existing_database(db_path, monkey
     store.reset_store_cache()
     applied: list[str] = []
 
-    def _migration_002_example(conn: sqlite3.Connection) -> None:
-        applied.append("002")
+    def _migration_appended_example(conn: sqlite3.Connection) -> None:
+        applied.append("appended")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_example ON conversations(created_at)")
 
-    monkeypatch.setattr(
-        store, "_MIGRATIONS", [*store._MIGRATIONS, _migration_002_example]
-    )
+    expected_version = len(store._MIGRATIONS) + 1
+    monkeypatch.setattr(store, "_MIGRATIONS", [*store._MIGRATIONS, _migration_appended_example])
 
     assert len(store.list_conversations()) == 1
-    assert applied == ["002"]
-    assert user_version(db_path) == 2
+    assert applied == ["appended"]
+    assert user_version(db_path) == expected_version
 
     # And it is not applied a second time on the next connect.
     store.reset_store_cache()
     assert len(store.list_conversations()) == 1
-    assert applied == ["002"]
+    assert applied == ["appended"]
 
 
 # ---- retention ----

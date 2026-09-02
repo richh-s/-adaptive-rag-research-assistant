@@ -23,14 +23,15 @@ honest behaviour, since it was already invisible to vector search.
 
 import re
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from langchain_core.documents import Document
-from rank_bm25 import BM25Okapi
 
 from rag_assistant.auth import PUBLIC_OWNER
 from rag_assistant.config import get_settings
 from rag_assistant.ingestion.ownership import visible_owners
+from rag_assistant.retrieval.incremental_bm25 import IncrementalBM25
 from rag_assistant.retrieval.vector_store import get_vector_store
 from rag_assistant.schemas.models import RetrievedDoc
 
@@ -47,39 +48,51 @@ def _tokenize(text: str) -> list[str]:
 # rank_bm25 has no persistence API, so the index is rebuilt in-memory once per process and
 # cached -- same lazy-singleton shape as vector_store.py's Chroma cache, now keyed by the
 # persist directory it reads from rather than by a corpus directory.
-_index_cache: dict[str, tuple[BM25Okapi | None, list]] = {}
+@dataclass
+class Bm25State:
+    """The in-memory keyword index plus the chunks it scores, keyed by Chroma chunk id."""
+
+    index: IncrementalBM25 = field(default_factory=IncrementalBM25)
+    documents: dict[str, Document] = field(default_factory=dict)
+
+
+_index_cache: dict[str, Bm25State] = {}
 _index_lock = threading.Lock()
 
 
-def _build_index(persist_dir: Path) -> tuple[BM25Okapi | None, list[Document]]:
+def _fetch_chunks(persist_dir: Path, ids: list[str] | None = None) -> list[tuple[str, Document]]:
+    """Chunks from the collection: all of them, or just the given ids."""
     store = get_vector_store(persist_dir=persist_dir)
     try:
-        stored = store.get(include=["documents", "metadatas"])
+        stored = store.get(ids=ids, include=["documents", "metadatas"])
     except Exception:
         # A collection that doesn't exist yet (nothing ingested) is not an error condition --
         # keyword search simply has nothing to match, exactly as before ingestion.
-        return None, []
+        return []
 
-    ids = stored.get("ids") or []
+    fetched_ids = stored.get("ids") or []
     documents = stored.get("documents") or []
     metadatas = stored.get("metadatas") or []
-    if not documents:
-        return None, []
-
-    # Sorted by chunk id so the index order (and therefore tie-breaking among equal BM25
-    # scores) is stable across rebuilds; Chroma makes no ordering guarantee.
-    rows = sorted(
-        zip(ids, documents, metadatas),
+    # Sorted by chunk id so index order -- and therefore tie-breaking among equal BM25 scores
+    # -- is stable across rebuilds; Chroma makes no ordering guarantee.
+    return sorted(
+        (
+            (chunk_id, Document(page_content=content, metadata=dict(metadata or {})))
+            for chunk_id, content, metadata in zip(fetched_ids, documents, metadatas)
+        ),
         key=lambda row: row[0] or "",
     )
-    chunks = [
-        Document(page_content=content, metadata=dict(metadata or {}))
-        for _, content, metadata in rows
-    ]
-    return BM25Okapi([_tokenize(chunk.page_content) for chunk in chunks]), chunks
 
 
-def get_bm25_index(persist_dir: Path | None = None) -> tuple[BM25Okapi | None, list]:
+def _build_index(persist_dir: Path) -> Bm25State:
+    state = Bm25State()
+    for chunk_id, document in _fetch_chunks(persist_dir):
+        state.index.add(chunk_id, _tokenize(document.page_content))
+        state.documents[chunk_id] = document
+    return state
+
+
+def get_bm25_index(persist_dir: Path | None = None) -> Bm25State:
     settings = get_settings()
     resolved = str(persist_dir or settings.chroma_persist_dir)
     if resolved not in _index_cache:
@@ -87,6 +100,34 @@ def get_bm25_index(persist_dir: Path | None = None) -> tuple[BM25Okapi | None, l
             if resolved not in _index_cache:
                 _index_cache[resolved] = _build_index(Path(resolved))
     return _index_cache[resolved]
+
+
+def apply_bm25_delta(
+    persist_dir: Path | None = None,
+    added_ids: list[str] | None = None,
+    removed_ids: list[str] | None = None,
+) -> bool:
+    """Updates the cached index for exactly the chunks that changed.
+
+    This is what makes an ingest cost the changed documents rather than the collection: only
+    the added ids are fetched and tokenized, and removals are pure bookkeeping. Returns False
+    when there is no cached index to update -- in that case the next query builds a fresh one
+    from the collection anyway, so there is nothing to do and nothing has been missed.
+    """
+    settings = get_settings()
+    resolved = str(persist_dir or settings.chroma_persist_dir)
+    with _index_lock:
+        state = _index_cache.get(resolved)
+        if state is None:
+            return False
+        for chunk_id in removed_ids or []:
+            state.index.remove(chunk_id)
+            state.documents.pop(chunk_id, None)
+        if added_ids:
+            for chunk_id, document in _fetch_chunks(Path(resolved), ids=list(added_ids)):
+                state.index.add(chunk_id, _tokenize(document.page_content))
+                state.documents[chunk_id] = document
+    return True
 
 
 def invalidate_bm25_index(persist_dir: Path | None = None) -> None:
@@ -103,11 +144,33 @@ def invalidate_bm25_index(persist_dir: Path | None = None) -> None:
         _index_cache.pop(resolved, None)
 
 
+def _passes_filters(metadata: dict, filters) -> bool:
+    """Mirrors vector_store.build_where_clause in Python.
+
+    A chunk with no `ingested_at` (indexed before the field existed) fails any date filter
+    rather than passing it: a date filter is a claim about when a document was indexed, and
+    "unknown" cannot satisfy it. Re-indexing populates the field.
+    """
+    if filters is None or filters.is_empty():
+        return True
+    if filters.sources and metadata.get("source") not in set(filters.sources):
+        return False
+    ingested_at = metadata.get("ingested_at")
+    if filters.ingested_after is not None:
+        if ingested_at is None or ingested_at < filters.ingested_after.timestamp():
+            return False
+    if filters.ingested_before is not None:
+        if ingested_at is None or ingested_at > filters.ingested_before.timestamp():
+            return False
+    return True
+
+
 def bm25_search(
     sub_query: str,
     k: int = 4,
     persist_dir: Path | None = None,
     owner: str = PUBLIC_OWNER,
+    filters=None,
 ) -> list[RetrievedDoc]:
     """Keyword search over the chunks `owner` may see.
 
@@ -117,24 +180,28 @@ def bm25_search(
     narrowed *before* the top-k cut so a tenant always gets k of their own documents rather
     than k minus however many of someone else's outranked them.
     """
-    bm25, chunks = get_bm25_index(persist_dir)
-    if bm25 is None:
+    state = get_bm25_index(persist_dir)
+    if not state.documents:
         return []
 
     allowed = set(visible_owners(owner))
-    scores = bm25.get_scores(_tokenize(sub_query))
-    visible_indices = [
-        i for i in range(len(chunks)) if chunks[i].metadata.get("owner", PUBLIC_OWNER) in allowed
+    scores = state.index.scores(_tokenize(sub_query))
+    visible_ids = [
+        chunk_id
+        for chunk_id, document in state.documents.items()
+        if document.metadata.get("owner", PUBLIC_OWNER) in allowed
+        and _passes_filters(document.metadata, filters)
     ]
-    ranked_indices = sorted(visible_indices, key=lambda i: scores[i], reverse=True)[:k]
+    ranked_ids = sorted(visible_ids, key=lambda i: scores.get(i, 0.0), reverse=True)[:k]
 
     return [
         RetrievedDoc(
-            content=chunks[i].page_content,
-            metadata=chunks[i].metadata,
-            source_id=chunks[i].metadata.get("source", ""),
-            score=float(scores[i]),
+            content=state.documents[chunk_id].page_content,
+            metadata=state.documents[chunk_id].metadata,
+            source_id=state.documents[chunk_id].metadata.get("source", ""),
+            score=float(scores.get(chunk_id, 0.0)),
         )
-        for i in ranked_indices
-        if scores[i] > 0  # no keyword overlap at all -- don't pad results with noise
+        for chunk_id in ranked_ids
+        # no keyword overlap at all -- don't pad results with noise
+        if scores.get(chunk_id, 0.0) > 0
     ]

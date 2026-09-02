@@ -153,9 +153,7 @@ def test_research_unknown_conversation_is_404_before_llm_spend(monkeypatch):
     monkeypatch.setattr(api._graph, "invoke", _must_not_run)
     client = TestClient(api.app)
 
-    response = client.post(
-        "/research", json={"question": "q", "conversation_id": "does-not-exist"}
-    )
+    response = client.post("/research", json={"question": "q", "conversation_id": "does-not-exist"})
 
     assert response.status_code == 404
 

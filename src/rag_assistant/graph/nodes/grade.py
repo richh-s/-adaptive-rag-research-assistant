@@ -44,7 +44,7 @@ def grade_and_score(state: ResearchState) -> dict:
     if relevant_scores and not needs_correction:
         graded_pairs = [(doc, g) for doc, g in zip(all_docs[: len(grades)], grades) if g.relevant]
         graded_pairs.sort(key=lambda pair: pair[1].score, reverse=True)
-        result["fused_documents"] = [doc for doc, _ in graded_pairs] + all_docs[len(grades):]
+        result["fused_documents"] = [doc for doc, _ in graded_pairs] + all_docs[len(grades) :]
 
     return result
 

@@ -72,9 +72,13 @@ class FusedDocument(BaseModel):
 class DocGrade(BaseModel):
     """Corrective-RAG style relevance grade for a single document."""
 
-    relevant: bool = Field(description="Whether this document meaningfully helps answer the question.")
+    relevant: bool = Field(
+        description="Whether this document meaningfully helps answer the question."
+    )
     score: float = Field(
-        ge=0.0, le=1.0, description="Relevance score from 0.0 (irrelevant) to 1.0 (highly relevant)."
+        ge=0.0,
+        le=1.0,
+        description="Relevance score from 0.0 (irrelevant) to 1.0 (highly relevant).",
     )
 
 
@@ -109,6 +113,4 @@ class GoldenQuestion(BaseModel):
     #                   confabulate, which is the failure mode no happy-path row can catch
     #   current      -- needs fresh information the corpus can't have; should route to web
     #   no_retrieval -- general knowledge; retrieving at all is wasted spend
-    category: Literal["factual", "multi_hop", "unanswerable", "current", "no_retrieval"] = (
-        "factual"
-    )
+    category: Literal["factual", "multi_hop", "unanswerable", "current", "no_retrieval"] = "factual"

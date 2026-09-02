@@ -29,6 +29,10 @@ class ResearchState(TypedDict):
     # request context. Every retrieval path filters on it -- see ingestion/ownership.py.
     owner: str
 
+    # Metadata filters narrowing local retrieval (see schemas/api.RetrievalFilters). Carried
+    # as the model itself rather than a dict so the retrieval nodes get validated bounds.
+    filters: object | None
+
     # routing -- Concept: Agentic/Self-RAG
     route: Literal["vector", "web", "both", "none"] | None
     route_reasoning: str | None

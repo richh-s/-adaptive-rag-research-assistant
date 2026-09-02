@@ -128,9 +128,7 @@ def test_a_tenant_scoped_ingest_only_touches_that_tenants_files(
     assert result.parsed_files == 1
     # Only alice's two files are even considered; the public corpus and bob are not scanned.
     assert result.skipped_files == 1
-    assert [call.args[0].source for call in spy.call_args_list] == [
-        f"{TENANT_DIR}/alice/new.md"
-    ]
+    assert [call.args[0].source for call in spy.call_args_list] == [f"{TENANT_DIR}/alice/new.md"]
 
 
 def test_a_scoped_ingest_does_not_delete_other_tenants_chunks(

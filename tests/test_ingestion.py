@@ -13,8 +13,10 @@ def _make_minimal_pdf(text_or_pages: str | list[str]) -> bytes:
 
     objects: dict[int, bytes] = {
         1: b"<< /Type /Catalog /Pages 2 0 R >>",
-        2: (f"<< /Type /Pages /Kids [{' '.join(f'{pid} 0 R' for pid in page_obj_ids)}] "
-            f"/Count {len(pages)} >>").encode("latin-1"),
+        2: (
+            f"<< /Type /Pages /Kids [{' '.join(f'{pid} 0 R' for pid in page_obj_ids)}] "
+            f"/Count {len(pages)} >>"
+        ).encode("latin-1"),
         font_obj_id: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     }
     for page_obj_id, text in zip(page_obj_ids, pages):
@@ -63,7 +65,9 @@ def test_load_documents_ignores_unsupported_files(sample_corpus_dir):
 
 
 def test_load_documents_extracts_text_from_pdf(sample_corpus_dir):
-    (sample_corpus_dir / "cohere.pdf").write_bytes(_make_minimal_pdf("Cohere builds enterprise LLMs."))
+    (sample_corpus_dir / "cohere.pdf").write_bytes(
+        _make_minimal_pdf("Cohere builds enterprise LLMs.")
+    )
 
     docs = load_documents(sample_corpus_dir)
 
@@ -89,7 +93,9 @@ def test_load_documents_skips_image_only_pdf(sample_corpus_dir):
 
 
 def test_load_documents_tags_pdf_pages_with_page_number(sample_corpus_dir):
-    (sample_corpus_dir / "cohere.pdf").write_bytes(_make_minimal_pdf("Cohere builds enterprise LLMs."))
+    (sample_corpus_dir / "cohere.pdf").write_bytes(
+        _make_minimal_pdf("Cohere builds enterprise LLMs.")
+    )
 
     docs = load_documents(sample_corpus_dir)
 
@@ -182,7 +188,9 @@ def _pdf_with_image(path, width: int = 200, height: int = 150, with_text: bool =
     page = doc.new_page()
     if with_text:
         page.insert_text((72, 72), "Quarterly report text.")
-    page.insert_image(pymupdf.Rect(72, 100, 72 + width, 100 + height), stream=_png_bytes(width, height))
+    page.insert_image(
+        pymupdf.Rect(72, 100, 72 + width, 100 + height), stream=_png_bytes(width, height)
+    )
     doc.save(str(path))
     doc.close()
 
