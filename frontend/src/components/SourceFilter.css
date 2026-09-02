@@ -1,0 +1,89 @@
+.source-filter {
+  width: 100%;
+  max-width: 640px;
+  font-size: 13px;
+  color: var(--text-muted, #6b7280);
+}
+
+.source-filter-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.source-filter-toggle:hover {
+  border-color: var(--border);
+}
+
+.source-filter-toggle:focus-visible,
+.source-filter-clear:focus-visible,
+.source-filter-item input:focus-visible {
+  outline: 2px solid var(--accent, #4f46e5);
+  outline-offset: 2px;
+}
+
+.source-filter-list {
+  margin-top: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.source-filter-list fieldset {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  /* Long corpora scroll inside the control rather than pushing the ask box off screen. */
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.source-filter-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px;
+  cursor: pointer;
+}
+
+.source-filter-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text, inherit);
+}
+
+.source-filter-count {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.65;
+}
+
+.source-filter-clear {
+  margin-top: 8px;
+  padding: 3px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.source-filter-hint {
+  margin: 10px 0 0;
+  font-size: 12px;
+  opacity: 0.8;
+}

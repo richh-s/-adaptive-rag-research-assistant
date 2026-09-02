@@ -264,3 +264,12 @@ class FeedbackSummary(BaseModel):
     total: int
     satisfaction: float | None
     recent_downvoted_questions: list[str]
+
+
+class IndexedSource(BaseModel):
+    """One file in the knowledge base, as the caller can refer to it in `filters.sources`."""
+
+    source: str
+    display_name: str
+    chunk_count: int
+    owner: str

@@ -212,3 +212,84 @@ def test_filters_reach_the_retrieval_nodes(monkeypatch):
     )
 
     assert all(send.arg["filters"] is filters for send in sends)
+
+
+# ---- the sources endpoint that makes filtering usable ----
+
+
+def test_sources_endpoint_lists_indexed_files(indexed_corpus, monkeypatch):
+    """A client can't offer a source filter without knowing what the sources are."""
+    from fastapi.testclient import TestClient
+
+    from rag_assistant import api
+
+    _, persist = indexed_corpus
+    monkeypatch.setenv("CHROMA_PERSIST_DIR", str(persist))
+    # The fixture already built an index, which cached settings pointing at the isolated
+    # default persist dir; the endpoint reads settings, so the cache has to be dropped.
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+
+    body = TestClient(api.app).get("/api/v1/sources").json()
+
+    names = {row["display_name"] for row in body}
+    assert "anthropic.md" in names
+    assert all(row["chunk_count"] > 0 for row in body)
+
+
+def test_sources_are_scoped_to_the_tenant(tmp_path, fake_embeddings, monkeypatch):
+    """Listing another tenant's filenames would leak them, exactly as it would through the
+    router's corpus description."""
+    from fastapi.testclient import TestClient
+
+    from rag_assistant import api, auth
+    from rag_assistant.ingestion.ownership import TENANT_DIR
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "public.md").write_text("# Public\n\n## Body\n\nShared content.\n")
+    tenant = corpus / TENANT_DIR / "alice"
+    tenant.mkdir(parents=True)
+    (tenant / "private.md").write_text("# Alice\n\n## Body\n\nPrivate content.\n")
+    persist = tmp_path / "chroma"
+    build_index(source_dir=corpus, persist_dir=persist, embeddings=fake_embeddings)
+
+    monkeypatch.setenv("CHROMA_PERSIST_DIR", str(persist))
+    monkeypatch.setenv("API_KEYS", "alice:secret-a,bob:secret-b")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+    auth.reset_api_key_cache()
+    client = TestClient(api.app)
+
+    alice = client.get("/api/v1/sources", headers={"X-API-Key": "secret-a"}).json()
+    bob = client.get("/api/v1/sources", headers={"X-API-Key": "secret-b"}).json()
+
+    assert {r["display_name"] for r in alice} == {"public.md", "private.md"}
+    assert {r["display_name"] for r in bob} == {"public.md"}
+
+
+def test_the_source_identifier_is_what_filters_match_on(indexed_corpus, monkeypatch):
+    """`display_name` is for humans; `source` is the key `filters.sources` compares against.
+    A client sending the display name would silently match nothing."""
+    from fastapi.testclient import TestClient
+
+    from rag_assistant import api
+
+    _, persist = indexed_corpus
+    monkeypatch.setenv("CHROMA_PERSIST_DIR", str(persist))
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+
+    body = TestClient(api.app).get("/api/v1/sources").json()
+    row = next(r for r in body if r["display_name"] == "anthropic.md")
+
+    hits = bm25_search(
+        "alignment research programmes",
+        k=10,
+        persist_dir=persist,
+        filters=RetrievalFilters(sources=[row["source"]]),
+    )
+    assert {h.source_id for h in hits} <= {"anthropic.md"}

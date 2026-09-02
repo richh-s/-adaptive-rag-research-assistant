@@ -26,7 +26,8 @@ from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.graph.research_summary import build_research_summary
 from rag_assistant.ingestion.build_index import build_index
 from rag_assistant.ingestion.loaders import SUPPORTED_SUFFIXES
-from rag_assistant.ingestion.ownership import owner_corpus_dir
+from rag_assistant.ingestion.manifest import load_manifest
+from rag_assistant.ingestion.ownership import display_source, owner_corpus_dir, visible_owners
 from rag_assistant.ingestion.tasks import create_task, get_task, update_task
 from rag_assistant.ingestion.url_fetch import UrlIngestError, fetch_page, page_to_markdown
 from rag_assistant.logging_conf import configure_logging
@@ -43,6 +44,7 @@ from rag_assistant.schemas.api import (
     FeedbackRequest,
     FeedbackResponse,
     FeedbackSummary,
+    IndexedSource,
     IngestResponse,
     IngestTaskStatus,
     IngestUrlRequest,
@@ -813,6 +815,35 @@ def get_feedback_summary() -> FeedbackSummary:
     """Aggregate ratings for this tenant, plus recently downvoted questions -- the material
     for keeping the golden eval dataset resembling what people actually ask."""
     return FeedbackSummary(**conversations.feedback_summary(owner=auth.get_owner()))
+
+
+@app.get("/api/v1/sources", response_model=list[IndexedSource])
+def list_sources() -> list[IndexedSource]:
+    """The indexed files this tenant can retrieve from.
+
+    Read from the ingestion manifest rather than by querying Chroma: the manifest already
+    records one row per source with its chunk ids and owner, so this is a file read rather
+    than a scan of every chunk in the collection.
+
+    Exists so a client can offer a source filter without the user having to know exact
+    filenames -- `filters.sources` matches on the `source` field returned here, while
+    `display_name` is what a person should be shown (a tenant's own path prefix is noise to
+    the tenant it belongs to).
+    """
+    owner = auth.get_owner()
+    allowed = set(visible_owners(owner))
+    manifest = load_manifest(get_settings().chroma_persist_dir)
+    sources = [
+        IndexedSource(
+            source=source,
+            display_name=display_source(source),
+            chunk_count=len(entry.get("chunk_ids", [])),
+            owner=entry.get("owner", auth.PUBLIC_OWNER),
+        )
+        for source, entry in sorted(manifest.items())
+        if entry.get("owner", auth.PUBLIC_OWNER) in allowed
+    ]
+    return sources
 
 
 @app.get("/api/v1/conversations", response_model=list[ConversationSummary])

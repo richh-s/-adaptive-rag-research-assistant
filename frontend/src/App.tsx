@@ -6,7 +6,9 @@ import { useResearchStream } from './hooks/useResearchStream'
 import { AccessGate } from './components/AccessGate'
 import { Header } from './components/Header'
 import { AskCard } from './components/AskCard'
+import { AnswerFeedback } from './components/AnswerFeedback'
 import { ResultCard } from './components/ResultCard'
+import { SourceFilter } from './components/SourceFilter'
 import { ResearchSummaryPanel } from './components/ResearchSummaryPanel'
 import { ErrorBanner } from './components/ErrorBanner'
 import { GraphVisualization } from './components/GraphVisualization'
@@ -45,6 +47,9 @@ function App() {
     reset,
   } = useResearchStream()
   const threadEndRef = useRef<HTMLDivElement>(null)
+  // Source restriction for the next question. Kept in App rather than in the hook so it
+  // survives across turns -- a filter the user set is meant to stay set.
+  const [filterSources, setFilterSources] = useState<string[]>([])
 
   // Keep the latest activity in view: scroll when a turn completes, a question starts,
   // or the answer begins streaming in (once -- not on every token).
@@ -55,7 +60,7 @@ function App() {
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault()
-    void submit(question)
+    void submit(question, filterSources)
     setQuestion('')
   }
 
@@ -96,6 +101,7 @@ function App() {
               <div key={turn.id} className="chat-turn">
                 <div className="chat-question">{turn.question}</div>
                 <ResultCard result={turn.result} />
+                <AnswerFeedback question={turn.question} result={turn.result} />
                 {turn.result.summary && (
                   <details className="tech-details">
                     <summary>Show technical details</summary>
@@ -126,6 +132,7 @@ function App() {
           </div>
         )}
         {error && <ErrorBanner message={error} onRetry={retry ?? undefined} />}
+        <SourceFilter selected={filterSources} onChange={setFilterSources} />
         <AskCard
           question={question}
           onQuestionChange={setQuestion}

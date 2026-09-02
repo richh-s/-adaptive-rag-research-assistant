@@ -1,0 +1,112 @@
+.answer-feedback {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  max-width: 640px;
+  margin-top: -6px;
+  padding: 0 4px;
+  font-size: 13px;
+  color: var(--text-muted, #6b7280);
+}
+
+.answer-feedback-label {
+  font-size: 13px;
+}
+
+.answer-feedback-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.answer-feedback-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.answer-feedback-button:hover {
+  border-color: var(--accent, #4f46e5);
+}
+
+/* The chosen state is carried by aria-pressed as well as this class, so screen readers get
+   the same signal sighted users get from the fill. */
+.answer-feedback-button.is-chosen {
+  border-color: var(--accent, #4f46e5);
+  background: color-mix(in srgb, var(--accent, #4f46e5) 12%, transparent);
+}
+
+.answer-feedback-button:focus-visible,
+.answer-feedback-note input:focus-visible,
+.answer-feedback-note button:focus-visible {
+  outline: 2px solid var(--accent, #4f46e5);
+  outline-offset: 2px;
+}
+
+.answer-feedback-thanks {
+  font-size: 13px;
+}
+
+.answer-feedback-note {
+  display: flex;
+  gap: 6px;
+  flex: 1 1 260px;
+}
+
+.answer-feedback-note input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+}
+
+.answer-feedback-note button {
+  padding: 5px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.answer-feedback-note button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Available to a screen reader, absent from the visual layout -- the note field needs a real
+   label, but a visible one would crowd a control that is already secondary to the answer. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .answer-feedback-button {
+    transition: none;
+  }
+}

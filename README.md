@@ -207,6 +207,14 @@ uv run rag-assistant retrieve "anthropic founders" --k 4   # raw vector-store re
 uv run rag-assistant search "claude model releases 2026"   # raw DuckDuckGo web search
 ```
 
+Operator commands:
+
+```bash
+uv run rag-assistant backup --keep 7          # snapshot index + corpus + conversations
+uv run rag-assistant restore <archive.tar.gz> # roll back to a snapshot
+uv run rag-assistant loadtest --requests 500 --concurrency 25
+```
+
 ### API
 
 ```bash
@@ -285,7 +293,27 @@ sum(rate(rag_cache_operations_total{result="hit"}[5m])) / sum(rate(rag_cache_ope
 With `API_KEYS` set, `/metrics` requires a key like any other protected route — point the
 scraper at it with an `X-API-Key` header, or set `METRICS_ENABLED=false` to remove the route.
 
+Alert rules and a Grafana dashboard ship in `ops/`:
+
+```yaml
+rule_files:
+  - ops/prometheus/alerts.yml   # then import ops/grafana/dashboard.json
+```
+
+`tests/test_ops_artifacts.py` asserts every metric they reference actually exists. Monitoring
+config rots silently, and an alert that can never fire is worse than no alert because its
+presence is taken as coverage. Two things are deliberately not alerted on: cache hit rate (a
+cache outage is slower and costlier, never wrong) and absolute token spend (what matters is a
+change in the *rate*, which the burn-rate rule catches without anyone guessing a budget).
+
 ### Web UI
+
+The UI carries two controls tied to the features above: a **source filter** above the input,
+which lists what `GET /api/v1/sources` reports this caller can retrieve from and narrows local
+retrieval to the files you tick (web search is unaffected), and **thumbs up/down under each
+answer**, which posts to `/api/v1/feedback`. A downvote reveals an optional note field — the
+rating is recorded immediately either way, because demanding a note before accepting the rating
+would cost most of the ratings.
 
 A React + Vite single-page app in `frontend/` streams `/api/v1/research/stream` live as a
 conversation: each turn shows the question, the streamed report, and its own collapsible
@@ -391,6 +419,106 @@ The dataset (`data/golden_eval/dataset.jsonl`) is 28 questions across five categ
 carry the most weight: a dataset of only answerable questions cannot catch the failure that
 matters most in RAG, which is answering confidently from documents that don't contain the
 answer. It is still small and hand-authored, with no baseline system to compare against.
+
+### Retrieval tuning
+
+Three knobs, all off by default, because each trades cost or a dependency for quality. Turning
+any of them on is a configuration change — none requires a re-index except where noted.
+
+| Setting | What it changes | What it costs |
+| --- | --- | --- |
+| `CHUNKING_STRATEGY=semantic` | Splits a section where consecutive sentences stop being similar, instead of every N characters. Fixed-size splitting routinely severs a claim from the sentence that qualifies it | One embedding call per section at ingest. Re-indexes automatically (`CHUNKING_VERSION`) |
+| `PARENT_CONTEXT=true` | Small-to-big: retrieve on precise chunks, then hand synthesis the whole section each winner came from. Retrieval wants small chunks for precision, synthesis wants large ones for context — this refuses the trade | More of the context budget per document. No re-index: sections are always recorded |
+| `RERANKER=cohere` / `cross_encoder` | Scores (query, document) pairs jointly. RRF ranks by retriever *consensus* and never compares a document against the question, so a passage every path returns for lexical reasons outranks the one that answers it | An API key, or `sentence-transformers` (torch). Both are optional extras |
+
+```bash
+uv sync --extra rerank-cohere   # RERANKER=cohere, needs COHERE_API_KEY
+uv sync --extra rerank-local    # RERANKER=cross_encoder, pulls in torch
+```
+
+Requests can also narrow local retrieval by metadata. Filters are pushed into the query rather
+than applied to the results — post-filtering silently shrinks `k`, and the graph reads a short
+result as "the corpus has nothing" and falls back to web search:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/research \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is their safety approach?",
+       "filters": {"sources": ["anthropic.md"], "ingested_after": "2026-01-01T00:00:00Z"}}'
+```
+
+### Feedback
+
+`POST /api/v1/feedback` records a thumbs up/down against an answer; the web UI shows the
+buttons under each one. `GET /api/v1/feedback/summary` returns the counts and — the useful part
+— the recently downvoted questions.
+
+Those questions are the material a golden eval dataset goes stale for lack of. The gate below
+catches regressions against a *fixed* set of questions; it cannot tell you the set stopped
+resembling what people actually ask. This is the only signal here sourced from a human rather
+than from the system's own behaviour, which is why it is also the only alert of its kind.
+
+### Backup and restore
+
+```bash
+uv run rag-assistant backup --output backups/ --keep 7
+uv run rag-assistant restore backups/rag-assistant-backup-<timestamp>.tar.gz
+```
+
+One archive holds the vector index, the ingestion manifest, the conversation database and the
+corpus — everything that isn't in git. Two design points worth stating, because both are places
+a naive implementation is quietly wrong:
+
+- **SQLite goes through SQLite's online backup API, not `cp`.** In WAL mode the committed data
+  lives across `.db`, `.db-wal` and `.db-shm`, and copying the three catches them at different
+  instants — producing an archive that restores, opens without complaint, and is missing recent
+  writes. The `-wal`/`-shm` sidecars are deliberately *not* copied, because the snapshot has
+  already folded them in.
+- **Restore stages the whole archive before swapping anything**, and moves the existing data
+  aside rather than deleting it. A corrupt or truncated archive fails with the live deployment
+  untouched, instead of halfway replaced. Archives are also checked for path-traversal members,
+  since a restore runs wherever the operator happens to be.
+
+Caches are process-local, so restart the server afterwards — the CLI says so.
+
+### Scaling out
+
+The default is one container with no infrastructure, and that is a deliberate constraint rather
+than a limitation nobody noticed: embedded Chroma locks its SQLite file to one process, the
+ingest task registry is in-memory, and conversations are SQLite. The image pins `--workers 1`
+for exactly that reason.
+
+Each of those ceilings is now a setting rather than a rewrite:
+
+| Setting | Removes |
+| --- | --- |
+| `CHROMA_SERVER_HOST` | The vector index's file lock — replicas share a Chroma server |
+| `TASK_BACKEND=redis` | Per-process ingest tasks. Without it a client polling a load-balanced deployment gets "unknown ingest task" from every replica that didn't accept the upload |
+| `CONVERSATIONS_BACKEND=postgres` + `DATABASE_URL` | SQLite's single-writer lock, the main obstacle to a second replica. Needs `uv sync --extra postgres`; migrations are advisory-locked so replicas can start simultaneously |
+
+The Postgres backend is verified against a real Postgres in `tests/test_postgres_store.py`,
+which skips unless `RAG_TEST_DATABASE_URL` points at one:
+
+```bash
+initdb -D /tmp/pg/data -U postgres --auth=trust
+pg_ctl -D /tmp/pg/data -o "-p 55432 -k /tmp/pg" -l /tmp/pg/log start
+RAG_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/postgres uv run pytest tests/test_postgres_store.py
+```
+
+### Load testing
+
+```bash
+uv run rag-assistant loadtest --requests 500 --concurrency 25          # /health, free
+uv run rag-assistant loadtest --question "Who founded Anthropic?"      # real pipeline, costs LLM calls
+```
+
+Defaults to `/health` on purpose: that exercises the HTTP stack, middleware chain and event
+loop for nothing, while pointing it at the research endpoint is a real bill and the CLI prints
+the estimate first. It reports p50/p95/p99 and never a mean — an average hides exactly the tail
+that matters.
+
+Measured on a laptop, single worker, concurrency 25: **376 rps on `/health`** and **407 rps on a
+SQLite-backed endpoint**, p95 172ms and 109ms, no errors.
 
 ### Running on self-hosted models
 
@@ -526,6 +654,26 @@ public demo mode) — everything then belongs to the shared `public` tenant. `/h
 Docker CMD passes `--proxy-headers --forwarded-allow-ips '*'` so anonymous rate limiting keys
 on the real client IP, not the LB's. Set `SENTRY_DSN` to capture unhandled exceptions.
 
+For anything beyond a demo, `API_KEYS_FILE` points at a JSON file that expresses what a
+comma-separated env var cannot — a key that only reads, one that stops working in March, one
+allowed more requests than the rest:
+
+```json
+{"keys": [
+  {"key": "sk-live-a1b2", "owner": "alice", "scopes": ["read", "write"],
+   "expires_at": "2026-12-31T23:59:59Z", "rate_limit_rpm": 120},
+  {"key": "sk-ro-c3d4", "owner": "reporting", "scopes": ["read"]}
+]}
+```
+
+Writes (`POST /api/v1/ingest*`, `DELETE /api/v1/conversations/*`) need the `write` scope;
+everything else needs `read`. A valid key without the scope gets **403, not 401** — 401 would
+tell a read-only client to re-authenticate, which presenting the same key again cannot fix.
+Every decision is audited with the key's fingerprint, never the key: an audit trail that
+records secrets is a secret store nobody is guarding. The key cache is keyed on the file's
+mtime, so editing it revokes or rotates a credential on the next request rather than the next
+restart — the difference between revocation being an operation and being an outage.
+
 **The knowledge base is tenant-scoped too**, not just conversations. Ownership lives in the
 corpus layout rather than a sidecar table, because the layout is the thing that survives — a
 manifest can be deleted, reset by a fresh deploy, or drift from the files on disk, and every
@@ -569,7 +717,7 @@ local demo script:
 
 | Area | What's there |
 | --- | --- |
-| Containerization | Multi-stage `Dockerfile` (non-root user), `docker-compose.yml` wiring `api` + `redis` with a named volume for the Chroma persist directory (`chromadb.HttpClient` server mode is a documented TODO if this ever needs multiple `api` replicas — embedded Chroma's SQLite backing locks the file to one process) |
+| Containerization | Multi-stage `Dockerfile` (non-root user), `docker-compose.yml` wiring `api` + `redis` with a named volume for the Chroma persist directory. Embedded Chroma's SQLite backing locks the file to one process, which is why the image pins `--workers 1`; `CHROMA_SERVER_HOST` switches to server mode when that ceiling matters (see [Scaling out](#scaling-out)) |
 | Health & readiness | `GET /health` is a pure liveness check; `GET /ready` actually pings Chroma (`_collection.count()`) and DuckDuckGo (`HEAD` request) and returns 503 if either dependency is down, so an orchestrator can distinguish "process is up" from "can actually serve a request" |
 | Input validation | `question` is required, capped at 2000 chars, HTML-tag-stripped, and rejected as gibberish if under 10% alphanumeric — all in a pydantic `field_validator`, so bad input 422s before it ever reaches the graph |
 | Rate limiting | `slowapi`-based, both per-IP (`RATE_LIMIT_RPM`, default 10/min) and a global cap (`RATE_LIMIT_RPM_GLOBAL`, default 30/min) across `/research` and `/research/stream` |
@@ -593,6 +741,13 @@ local demo script:
 | Corpus tenant isolation | Ownership is encoded in the corpus layout (`ingestion/ownership.py`): flat files are the shared public corpus, `_t/<owner>/` is private to that tenant. Both retrieval paths filter on it — Chroma via a `$in` filter applied *during* search rather than after (post-filtering silently shrinks k), BM25 by narrowing candidates before the top-k cut. The router's corpus description is scoped too, since listing another tenant's filenames leaks them through the prompt even when retrieval filters them out |
 | Incremental ingestion cost | Re-indexing is decided from a raw-byte fingerprint plus `CHUNKING_VERSION`/`LOADER_VERSION`, so unchanged files are never parsed — not merely never re-embedded. That distinction is the whole cost: a parse runs pymupdf4llm and, with `PDF_VISION` on, a vision API call per figure and per scanned page. Ingestion is also scoped to the uploading tenant. One upload into an 8-file corpus went from 16 file parses to 1 |
 | BM25 / vector chunk parity | The keyword index is built from the chunks stored in Chroma rather than by re-reading the corpus. Beyond removing a second full parse pass per ingest, it makes RRF's `SHA256(content)` cross-source dedup correct by construction — previously the two paths produced identical text only by the convention that both called the same splitter, and any drift would have silently double-counted and double-cited the same passage |
+| Backup & restore | One archive holds the index, manifest, conversations and corpus. SQLite goes through SQLite's online backup API rather than a file copy — in WAL mode a `cp` of `.db`/`-wal`/`-shm` catches them at different instants and restores into a database that opens cleanly and is missing recent writes. Restore stages the whole archive before swapping and moves the existing data aside rather than deleting it, so a corrupt archive fails with the deployment untouched |
+| Embedding-model drift | The model the index was built with is recorded and checked by `/ready`. This is the one dependency whose failure is *silent*: a changed model with the same dimension embeds queries into a space the stored vectors don't occupy and returns plausible nonsense with no error anywhere. Readiness failing pulls the replica from the load balancer instead |
+| Key management | Scopes (`read`/`write`, 403 not 401), expiry, per-key rate limits, and an audit trail recording key fingerprints and never keys. The key cache is keyed on the key file's mtime, so revocation takes effect on the next request rather than the next restart |
+| Horizontal scaling | Every single-process ceiling is a setting rather than a rewrite: `CHROMA_SERVER_HOST` (vector index file lock), `TASK_BACKEND=redis` (per-process ingest tasks), `CONVERSATIONS_BACKEND=postgres` (SQLite's single-writer lock). Defaults keep a single container infrastructure-free; the Postgres backend is verified against a real Postgres, with advisory-locked migrations so replicas can start at once |
+| Alerting | Prometheus rules and a Grafana dashboard in `ops/`, with tests asserting every metric they reference exists. Thresholds are stated with their reasoning — an alert whose number nobody can justify is one that gets silenced the first time it fires at 3am |
+| Load testing | `rag-assistant loadtest` reports p50/p95/p99 and never a mean. Measured single-worker at concurrency 25: 376 rps on `/health`, 407 rps on a SQLite-backed endpoint, p95 172ms/109ms, no errors |
+| Quality signal | Thumbs up/down per answer, surfacing recently downvoted questions. The eval gate catches regressions against a fixed dataset; only this can tell you the dataset stopped resembling what people ask |
 
 ## Self-audit: findings & fixes
 
@@ -619,36 +774,44 @@ decomposition prompts, exact-content-hash dedup can still let the same source ge
 under different markers if local and web copies differ even slightly, and synthesis has no
 token/context-length cap on however many documents fusion returns.
 
+## Known limitations
+
+Stated plainly, because knowing where a system's edges are is more useful than pretending it
+has none.
+
+- **The eval set is 28 hand-authored questions with no baseline system to compare against.**
+  The gate is real, but on a dataset this size one flipped routing decision moves an aggregate
+  by roughly four points — which is why it compares against a recorded baseline with a
+  tolerance rather than against absolute thresholds. It tells you whether a change made things
+  *worse*; it cannot tell you how good the system is in absolute terms.
+- **Retrieval-quality features are correctness-tested, not quality-measured.** Semantic
+  chunking, reranking and small-to-big all behave as specified and are covered by tests, but
+  whether they *improve* answers on a given corpus is exactly what the eval gate answers — and
+  that requires recording a baseline against real models first.
+- **The optional backends are verified to differing depths.** Postgres is tested against a real
+  Postgres; Redis-backed tasks are tested against a fake client; Chroma server mode is only
+  tested at the construction boundary. None of the three runs in CI, which has no such
+  services.
+- **All tenants share one Chroma collection.** Retrieval and ingestion are tenant-scoped, but
+  there is no per-tenant view of index size or embedding spend. Separate collections would give
+  that, and are the natural companion to the Qdrant move below.
+- **Embeddings are Gemini-only and one-way.** Switching means a full re-index. `/ready` now
+  detects the mismatch rather than serving nonsense, but there is no migration path that keeps
+  the service answering while it re-embeds.
+
 ## Future improvements
 
-Deliberately scoped out of v1 as lower-leverage for a single-user portfolio project, or as
-needing a concrete driving requirement before they're worth the added complexity:
+Deliberately scoped out as needing a concrete driving requirement before they're worth the
+added complexity:
 
-- **Metadata filtering** — filter retrieval by source/date/tag before fusion, not just rerank
-  after the fact. Useful once the corpus grows beyond a handful of hand-picked files.
-- **Qdrant (or another dedicated vector DB) instead of Chroma** — worth it once metadata
-  filtering, multi-tenancy, or corpus size actually demand it; Chroma is not the bottleneck today.
-- **Richer key management** — API keys are static entries in an env var (see
-  [Authentication & multi-tenancy](#authentication--multi-tenancy)). That is enough to gate a
-  demo, but a real multi-user service wants rotation, expiry, per-key rate-limit overrides,
-  scopes, and an audit trail of which key called what — none of which fits in an env var.
-- **Per-tenant embedding cost accounting** — retrieval and ingestion are both tenant-scoped
-  now, but all tenants still share one Chroma collection, so there is no per-tenant view of
-  index size or embedding spend. Separate collections would give that, and are the natural
-  companion to the Qdrant move above.
-- **Semantic / small-to-big chunking** — chunking follows document structure now, but within
-  a section it is still fixed-size. Splitting on semantic boundaries, or indexing small chunks
-  and expanding to their parent section at synthesis time, would help on long prose where a
-  section exceeds one chunk.
-- **A reranker** — grade-informed reranking reuses the Corrective-RAG grades, which is free
-  but coarse. A cross-encoder would rank better, at the cost of another model in the stack.
-- **User feedback signal** — no thumbs up/down, so nothing feeds retrieval quality back into
-  the system. The eval gate catches regressions against a fixed dataset; it can't tell you
-  the dataset stopped resembling what people actually ask.
-- **Horizontal scaling** — the deployment is pinned to a single worker (see the Dockerfile),
-  because embedded Chroma's SQLite backing locks its file to one process and both the ingest
-  task registry and the conversation store's write lock are per-process. Multiple replicas
-  means Chroma in server mode, the task registry in Redis, and conversations in Postgres.
+- **Qdrant (or another dedicated vector DB) instead of Chroma** — worth it once per-tenant
+  collections, richer filtering, or corpus size actually demand it. Chroma is not the
+  bottleneck today.
+- **Retrieval-quality evaluation of the optional features** — a scored comparison of
+  structural vs. semantic chunking, and with vs. without reranking, on a corpus large enough
+  for the difference to be measurable rather than anecdotal.
+- **Streaming re-index** — re-embedding a corpus after an embedding-model change currently
+  means downtime or stale answers; a shadow index swapped in on completion would remove both.
 
 ## Testing
 
@@ -662,6 +825,13 @@ uv run ruff check .
 ```bash
 cd frontend
 npm test               # Vitest + React Testing Library — hooks and components
+```
+
+Two suites need something extra and skip cleanly without it:
+
+```bash
+# Postgres backend (13 tests) -- skipped unless a database is reachable
+RAG_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/postgres uv run pytest tests/test_postgres_store.py
 ```
 
 Optionally install the pre-commit hooks so lint, lockfile drift, and accidentally-staged
@@ -683,6 +853,7 @@ src/rag_assistant/
 ├── config.py, llm.py, logging_conf.py   # settings, model factories, structured JSON logging
 ├── tracing.py, cache.py, readiness.py    # trace-ID contextvar, Redis cache, Chroma/web search health checks
 ├── metrics.py, auth.py                   # Prometheus collectors + LLM callback handler, API-key auth
+├── backup.py, loadtest.py                # snapshot/restore, concurrency measurement
 ├── ingestion/                            # load -> split -> embed -> index the sample corpus
 ├── retrieval/                            # Chroma vector store, BM25 keyword store, DuckDuckGo web search
 ├── fusion/rrf.py                         # Reciprocal Rank Fusion (pure function)

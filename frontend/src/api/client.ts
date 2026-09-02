@@ -80,6 +80,9 @@ export interface ResearchResponse {
   route: string | null
   confidence_score: number | null
   summary?: ResearchSummary | null
+  // The persisted conversation this exchange was appended to (null when save=false). The API
+  // has always returned it; this type simply never declared it.
+  conversation_id?: string | null
 }
 
 export interface StreamEvent {
@@ -155,11 +158,18 @@ function trimHistory(history: ChatTurn[]): ChatTurn[] {
     .map((turn) => ({ ...turn, content: turn.content.slice(0, MAX_HISTORY_TURN_CHARS) }))
 }
 
+export interface RetrievalFilters {
+  /** Restrict local retrieval to these source names (as returned by `listSources`). */
+  sources?: string[]
+}
+
 export interface StreamResearchOptions {
   /** Continue a server-persisted conversation; the server loads its own transcript. */
   conversationId?: string | null
   /** Stateless fallback history, used only when no conversationId is given. */
   history?: ChatTurn[]
+  /** Narrows local retrieval. Web search results are unaffected. */
+  filters?: RetrievalFilters | null
   signal?: AbortSignal
 }
 
@@ -174,6 +184,9 @@ export async function streamResearch(
     body: JSON.stringify({
       question,
       conversation_id: options.conversationId ?? null,
+      // Omitted entirely when nothing is selected, so the default request body is
+      // byte-identical to what it was before filtering existed.
+      ...(options.filters?.sources?.length ? { filters: { sources: options.filters.sources } } : {}),
       history: trimHistory(options.history ?? []),
     }),
     signal: options.signal,
@@ -298,4 +311,47 @@ export async function checkHealth(): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+export type FeedbackRating = 'up' | 'down'
+
+export interface FeedbackRequest {
+  question: string
+  rating: FeedbackRating
+  conversation_id?: string | null
+  note?: string | null
+  route?: string | null
+  confidence_score?: number | null
+}
+
+/**
+ * Records a rating of one answer. Deliberately never throws: feedback is a side channel, and
+ * a failed rating must not surface an error over an answer the user already has. The UI shows
+ * the button as chosen optimistically and simply doesn't persist if the call fails.
+ */
+export async function submitFeedback(body: FeedbackRequest): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/v1/feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify(body),
+    })
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
+export interface IndexedSource {
+  source: string
+  display_name: string
+  chunk_count: number
+  owner: string
+}
+
+/** The indexed files this caller can retrieve from, for the source filter. */
+export async function listSources(): Promise<IndexedSource[]> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/sources`, { headers: authHeaders() })
+  if (!response.ok) throw new ResearchApiError('Could not load sources.')
+  return response.json()
 }

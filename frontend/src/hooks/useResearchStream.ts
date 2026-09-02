@@ -31,7 +31,8 @@ export interface UseResearchStreamResult {
   /** The answer text accumulated so far from token frames, while streaming. */
   streamingAnswer: string
   visits: NodeVisit[]
-  submit: (question: string) => Promise<void>
+  /** `sources` narrows local retrieval to those files; web search is unaffected. */
+  submit: (question: string, sources?: string[]) => Promise<void>
   /** Abort the in-flight request. The turn is discarded client-side. */
   stop: () => void
   /** Re-submit the question whose request just failed (null if none). */
@@ -53,7 +54,7 @@ export function useResearchStream(): UseResearchStreamResult {
   const [failedQuestion, setFailedQuestion] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
 
-  async function submit(question: string) {
+  async function submit(question: string, sources: string[] = []) {
     const trimmed = question.trim()
     if (!trimmed || loading) return
 
@@ -98,7 +99,11 @@ export function useResearchStream(): UseResearchStreamResult {
             setFailedQuestion(trimmed)
           }
         },
-        { conversationId, signal: controller.signal },
+        {
+          conversationId,
+          filters: sources.length ? { sources } : null,
+          signal: controller.signal,
+        },
       )
     } catch (err) {
       if (controller.signal.aborted) {
