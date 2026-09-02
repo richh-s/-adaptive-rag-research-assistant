@@ -28,6 +28,10 @@ data/corpus/*
 # Tenant-uploaded documents (see ingestion/ownership.py) -- private data, never committed
 data/corpus/_t/
 
+# Backup archives written by `rag-assistant backup`. Local recovery state containing
+# conversation history and corpus contents -- never source, and never committed.
+backups/
+
 # Directories `restore` moves aside instead of deleting (see backup.py). Local recovery
 # state, never source.
 *.pre-restore-*
