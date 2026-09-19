@@ -61,6 +61,13 @@ sse_streams_active = Gauge(
     "SSE research streams currently open.",
 )
 
+research_in_flight = Gauge(
+    "rag_research_in_flight",
+    "Research requests currently executing. The number to alert on for saturation: each "
+    "non-streaming request occupies one worker thread for the whole graph run, so this "
+    "approaching API_THREADPOOL_SIZE means new requests are queueing, not running.",
+)
+
 graph_runs_total = Counter(
     "rag_graph_runs_total",
     "Completed graph executions, by chosen route and outcome.",
@@ -97,6 +104,14 @@ llm_tokens_total = Counter(
     "rag_llm_tokens_total",
     "Tokens consumed, by provider, model and kind (input/output).",
     ["provider", "model", "kind"],
+)
+
+prompt_injection_signals_total = Counter(
+    "rag_prompt_injection_signals_total",
+    "Retrieved documents containing injection-shaped phrasing, by category. Detection is "
+    "advisory: nothing is blocked or edited on the strength of a match (see content_trust.py). "
+    "A sustained rise is the signal -- it means someone is probing the corpus or the web path.",
+    ["category"],
 )
 
 cache_operations_total = Counter(
@@ -239,6 +254,17 @@ class MetricsCallbackHandler(BaseCallbackHandler):
             self._finish(run_id, "error")
         except Exception:
             logger.warning("failed to record LLM error metrics", exc_info=True)
+
+
+def record_injection_signals(categories: list[str]) -> None:
+    """Counts injection-shaped phrasing found in retrieved content.
+
+    The label is a fixed category from content_trust's own list, never text drawn from the
+    document -- that text is attacker-controlled, and a label taken from it would let one
+    uploaded file create unbounded series in the registry.
+    """
+    for category in categories:
+        prompt_injection_signals_total.labels(category=category).inc()
 
 
 def record_cache(namespace: str, result: str) -> None:

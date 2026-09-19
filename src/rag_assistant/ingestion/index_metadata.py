@@ -21,7 +21,17 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from rag_assistant.config import get_settings
+
 logger = logging.getLogger(__name__)
+
+
+def _shared_backend() -> bool:
+    """See ingestion/manifest.py. This record has to live wherever the vectors do: left on
+    local disk while the index moved to Postgres, a replica that never ingested has no record
+    to compare against, reports "cannot verify", and is therefore never checked at all."""
+    return get_settings().vector_backend == "pgvector"
+
 
 INDEX_METADATA_FILENAME = "index_metadata.json"
 
@@ -43,6 +53,15 @@ def load_index_metadata(persist_dir: Path) -> IndexMetadata | None:
     """None when nothing has been indexed yet, or when the file predates this feature --
     both mean "no recorded model", which callers must treat as "cannot verify", never as
     "verified fine"."""
+    if _shared_backend():
+        from rag_assistant.retrieval.pgvector_store import load_index_metadata_row
+
+        try:
+            row = load_index_metadata_row()
+        except Exception:
+            logger.warning("Could not read index metadata from Postgres", exc_info=True)
+            return None
+        return IndexMetadata(**row) if row else None
     path = index_metadata_path(persist_dir)
     if not path.exists():
         return None
@@ -61,13 +80,22 @@ def load_index_metadata(persist_dir: Path) -> IndexMetadata | None:
 def save_index_metadata(
     persist_dir: Path, embedding_model: str, embedding_dimension: int | None = None
 ) -> None:
-    path = index_metadata_path(persist_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
     metadata = IndexMetadata(
         embedding_model=embedding_model,
         embedding_dimension=embedding_dimension,
         updated_at=time.time(),
     )
+    if _shared_backend():
+        from rag_assistant.retrieval.pgvector_store import save_index_metadata_row
+
+        save_index_metadata_row(
+            embedding_model=metadata.embedding_model,
+            embedding_dimension=metadata.embedding_dimension,
+            updated_at=metadata.updated_at,
+        )
+        return
+    path = index_metadata_path(persist_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(asdict(metadata), indent=2, sort_keys=True) + "\n")
 
 

@@ -11,6 +11,7 @@ from langchain_core.embeddings import Embeddings
 from rag_assistant.config import get_settings
 from rag_assistant.ingestion.loaders import LOADER_VERSION, iter_corpus_files, load_corpus_file
 from rag_assistant.ingestion.index_metadata import read_embedding_dimension, save_index_metadata
+from rag_assistant.ingestion import vision
 from rag_assistant.ingestion.manifest import load_manifest, save_manifest
 from rag_assistant.ingestion.splitter import CHUNKING_VERSION, split_with_parents
 from rag_assistant.ingestion.ownership import owner_of_relative_path
@@ -44,6 +45,12 @@ class IndexResult:
     # "skipped 40 files" used to be true of embedding while every one of them was still
     # parsed (and, for PDFs with vision on, paid for) first.
     parsed_files: int = 0
+    # What this run cost, for per-tenant billing (see budget.py). Characters rather than
+    # tokens because the embedding API does not report usage back through LangChain's
+    # callbacks the way chat models do -- the conversion is an estimate, and is made once, in
+    # budget.py, rather than at every call site.
+    embedded_chars: int = 0
+    vision_calls: int = 0
 
 
 def _chunk_ids(source: str, chunks: list[Document]) -> list[str]:
@@ -135,6 +142,12 @@ def build_index(
             on_stage("indexing", "Embedding and indexing changed files...")
 
         indexed_chunks = 0
+        embedded_chars = 0
+        # Sampled as a delta around the whole run: the calls happen inside the loaders, and
+        # a process-wide counter read at both ends attributes exactly this run's calls
+        # without the loaders needing to know a tenant exists. Safe because ingestion is
+        # serialised by INGEST_LOCK, which is held for this entire block.
+        vision_calls_before = vision.calls_made()
         changed_files = 0
         skipped_files = 0
         parsed_files = 0
@@ -190,6 +203,7 @@ def build_index(
                 "owner": corpus_file.owner,
             }
             indexed_chunks += len(chunks)
+            embedded_chars += sum(len(chunk.page_content) for chunk in chunks)
             changed_files += 1
 
         save_manifest(persist_dir, manifest)
@@ -218,6 +232,14 @@ def build_index(
         # live object every query reads from, so there is no separate client to refresh. (A
         # multi-worker deployment would break this assumption -- see tasks.py's module
         # docstring -- but this project runs a single worker.)
+        # Published only after the manifest, parents and chunks are all committed. A replica
+        # that polls this number treats it as "everything behind this version is readable",
+        # so bumping it earlier would invite a rebuild against a half-written index.
+        if (changed_files or removed_sources) and get_settings().vector_backend == "pgvector":
+            from rag_assistant.retrieval.pgvector_store import bump_index_version
+
+            bump_index_version()
+
         if changed_files or removed_sources:
             # Apply just the delta. `apply_bm25_delta` reports False when no index is cached
             # yet, in which case building one now keeps the eager-refresh guarantee: by the
@@ -236,4 +258,6 @@ def build_index(
         skipped_files=skipped_files,
         removed_files=len(removed_sources),
         parsed_files=parsed_files,
+        embedded_chars=embedded_chars,
+        vision_calls=vision.calls_made() - vision_calls_before,
     )

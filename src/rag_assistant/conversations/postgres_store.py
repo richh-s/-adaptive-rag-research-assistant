@@ -333,6 +333,17 @@ def prune_conversations(owner: str = "public") -> int:
 # ---- feedback ----
 
 
+def delete_all_for_owner(owner: str) -> tuple[int, int]:
+    """Postgres counterpart of the SQLite implementation -- same semantics, one transaction."""
+    with _get_pool().connection() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM conversations WHERE owner = %s", (owner,))
+        conversations = cur.rowcount
+        cur.execute("DELETE FROM feedback WHERE owner = %s", (owner,))
+        feedback = cur.rowcount
+        conn.commit()
+    return conversations, feedback
+
+
 def record_feedback(
     question: str,
     rating: str,

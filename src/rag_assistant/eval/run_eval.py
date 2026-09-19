@@ -31,6 +31,7 @@ class QuestionResult:
     question: str
     category: str
     expected_route: str
+    acceptable_routes: list[str]
     actual_route: str | None
     route_match: bool
     expected_sources: list[str]
@@ -60,8 +61,11 @@ def _run_question(graph, golden_question: GoldenQuestion) -> QuestionResult:
             used_citations(result.get("final_answer") or "", result.get("citations", []))
         ),
         expected_route=golden_question.expected_route,
+        acceptable_routes=golden_question.acceptable_routes,
         actual_route=result.get("route"),
-        route_match=result.get("route") == golden_question.expected_route,
+        # Defensible rather than identical -- see GoldenQuestion.acceptable_routes.
+        route_match=result.get("route")
+        in (golden_question.acceptable_routes or [golden_question.expected_route]),
         expected_sources=golden_question.expected_sources,
         actual_sources=actual_sources,
         source_overlap=bool(set(golden_question.expected_sources) & set(actual_sources)),
@@ -80,6 +84,7 @@ def compute_metrics(results: list[QuestionResult]) -> EvalMetrics:
                 question=r.question,
                 category=r.category,
                 expected_route=r.expected_route,
+                acceptable_routes=r.acceptable_routes,
                 actual_route=r.actual_route,
                 expected_sources=r.expected_sources,
                 actual_sources=r.actual_sources,

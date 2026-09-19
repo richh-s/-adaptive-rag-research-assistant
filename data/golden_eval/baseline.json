@@ -6,5 +6,7 @@
     "source_recall": 1.0
   },
   "note": "Recorded by `rag-assistant eval --record-baseline`. Re-record deliberately when a change is a genuine improvement; never to make a failing gate pass.",
-  "question_count": 28
+  "recorded_question_count": 28,
+  "stale": true,
+  "stale_reason": "Recorded 2026-09-02 against a 28-row dataset and the pre-trust-preamble prompts. The dataset is now 50 rows with acceptable_routes, and the synthesis/grading prompts carry an untrusted-content preamble that can change citation counts, which abstention_accuracy is derived from. Re-record against a known-good build before trusting a comparison: `rag-assistant eval --limit 50 --record-baseline`."
 }

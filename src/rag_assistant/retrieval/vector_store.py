@@ -1,3 +1,4 @@
+import logging
 import threading
 from pathlib import Path
 
@@ -10,20 +11,37 @@ from rag_assistant.config import get_settings
 from rag_assistant.ingestion.ownership import visible_owners
 from rag_assistant.llm import get_embeddings_model
 
+logger = logging.getLogger(__name__)
+
 COLLECTION_NAME = "research_corpus"
 
 # LangGraph's `Send` fan-out can invoke `retrieve_vector` for multiple sub-queries
 # concurrently (via a thread pool). Two threads each opening a fresh `Chroma` client
 # against the same on-disk directory races in its Rust binding teardown, so every
 # persist directory gets exactly one cached client instance, built under a lock.
-_store_cache: dict[str, Chroma] = {}
+_store_cache: dict[str, object] = {}
 _store_lock = threading.Lock()
 
 
-def get_vector_store(
-    embeddings: Embeddings | None = None, persist_dir: Path | None = None
-) -> Chroma:
+def get_vector_store(embeddings: Embeddings | None = None, persist_dir: Path | None = None):
+    """The process-wide vector store for the configured backend.
+
+    `persist_dir` is a Chroma concept and is ignored by the pgvector backend, which keeps its
+    vectors in Postgres. It still selects the *rest* of the index -- manifest, parent store
+    and BM25 cache are all keyed on it -- so callers keep passing it either way.
+    """
     settings = get_settings()
+    if settings.vector_backend == "pgvector":
+        if "pgvector" not in _store_cache:
+            with _store_lock:
+                if "pgvector" not in _store_cache:
+                    from rag_assistant.retrieval.pgvector_store import PgVectorStore
+
+                    _store_cache["pgvector"] = PgVectorStore(
+                        embeddings=embeddings or get_embeddings_model()
+                    )
+        return _store_cache["pgvector"]
+
     resolved_persist_dir = str(persist_dir or settings.chroma_persist_dir)
     # Server mode is keyed separately so a process can hold both (tests pass explicit
     # persist dirs while the app may be pointed at a server).
@@ -78,6 +96,10 @@ def get_retriever(
     to web search.
     """
     store = get_vector_store(embeddings=embeddings, persist_dir=persist_dir)
+    if get_settings().vector_backend == "pgvector":
+        # The pgvector backend translates owner/filters into a SQL predicate itself, so it
+        # takes them directly rather than a Chroma `where` dict it would have to parse back.
+        return store.as_retriever(k=k, owner=owner, filters=filters)
     return store.as_retriever(search_kwargs={"k": k, "filter": build_where_clause(owner, filters)})
 
 
@@ -96,3 +118,17 @@ def build_where_clause(owner: str, filters=None) -> dict:
         if filters.ingested_before is not None:
             clauses.append({"ingested_at": {"$lte": filters.ingested_before.timestamp()}})
     return clauses[0] if len(clauses) == 1 else {"$and": clauses}
+
+
+def reset_store_cache() -> None:
+    """Drops the cached store(s). Tests that switch backend or persist directory mid-process
+    need this; so does the pgvector pool, which otherwise outlives a changed DATABASE_URL."""
+    global _store_cache
+    with _store_lock:
+        _store_cache = {}
+    try:
+        from rag_assistant.retrieval.pgvector_store import reset_pool
+
+        reset_pool()
+    except Exception:
+        logger.debug("pgvector pool reset skipped", exc_info=True)

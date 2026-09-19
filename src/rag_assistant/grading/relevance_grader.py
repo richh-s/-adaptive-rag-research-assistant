@@ -1,5 +1,7 @@
 import logging
 
+from rag_assistant import metrics
+from rag_assistant.content_trust import build_untrusted_context, new_nonce
 from rag_assistant.llm import get_structured_llm
 from rag_assistant.prompts.grading_prompt import GRADING_PROMPT
 from rag_assistant.schemas.models import DocGrade, DocGradeBatch, FusedDocument
@@ -14,7 +16,21 @@ def grade_documents(question: str, docs: list[FusedDocument]) -> list[DocGrade]:
     if not docs:
         return []
 
-    numbered = "\n\n".join(f"[{i + 1}] {doc.content}" for i, doc in enumerate(docs))
+    # Same fencing as synthesis. Grading is the earlier of the two surfaces a hostile
+    # document reaches, and the more consequential: these grades drive the confidence score
+    # and whether corrective web search runs at all, so a document that talks its way to a
+    # high grade also suppresses the search that might have found something better.
+    nonce = new_nonce()
+    numbered, injection_categories = build_untrusted_context(
+        [(doc.source_id, doc.content) for doc in docs], nonce=nonce
+    )
+    if injection_categories:
+        metrics.record_injection_signals(injection_categories)
+        logger.warning(
+            "Documents being graded contain injection-shaped phrasing: %s",
+            ", ".join(injection_categories),
+            extra={"injection_categories": injection_categories},
+        )
     llm = get_structured_llm(DocGradeBatch)
     try:
         result: DocGradeBatch = llm.invoke(

@@ -9,9 +9,10 @@ services:
       - REDIS_URL=redis://redis:6379/0
     volumes:
       # Embedded Chroma is SQLite-backed, which locks the file to one process -- fine for a
-      # single `api` replica today. If this ever needs multiple replicas, migrate to Chroma's
-      # server mode (a dedicated `chroma` service here, with vector_store.py switched from a
-      # local persist_directory to chromadb.HttpClient) instead of sharing this volume.
+      # single `api` replica today. Two ways out if this ever needs multiple replicas, neither
+      # of which is sharing this volume: Chroma's server mode (a dedicated `chroma` service,
+      # CHROMA_SERVER_HOST), or VECTOR_BACKEND=pgvector, which moves the index into the
+      # `postgres` service below. Start that one with `docker compose --profile pgvector up`.
       - chroma_data:/app/chroma_db
     depends_on:
       redis:
@@ -41,6 +42,29 @@ services:
       timeout: 3s
       retries: 5
 
+  # Behind a profile so the default `docker compose up` stays two services and needs no
+  # configuration. `docker compose --profile pgvector up` starts it; the api then needs
+  # VECTOR_BACKEND=pgvector and DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres
+  # in .env -- psycopg is already in the image, so no rebuild is needed.
+  postgres:
+    # pgvector's image rather than stock postgres: the `vector` extension has to exist in the
+    # server before CREATE EXTENSION can enable it.
+    image: pgvector/pgvector:pg17
+    profiles: ["pgvector"]
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   chroma_data:
   redis_data:
+  postgres_data:
