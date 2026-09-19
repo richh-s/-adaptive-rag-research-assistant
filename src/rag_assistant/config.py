@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -16,6 +16,21 @@ class Settings(BaseSettings):
 
     app_env: Literal["development", "staging", "production"] = "development"
     log_level: str = "INFO"
+
+    # One switch that sets the five backend switches coherently.
+    #
+    # "single-node" is the default and changes nothing: embedded Chroma, SQLite
+    # conversations, in-process ingest tasks. No infrastructure, one container.
+    #
+    # "multi-replica" turns on the shared backends together -- the vector index, the
+    # conversation store and the ingest task registry -- because they are not independent
+    # choices. A deployment with two replicas and a shared index but per-process ingest tasks
+    # serves "unknown ingest task" 404s from whichever replica did not accept the upload; one
+    # with shared tasks but a local index has two divergent corpora. Every combination that
+    # is half-shared is broken in a way that looks like flakiness rather than
+    # misconfiguration, so the individual switches remain available for deliberate overrides
+    # and the profile makes the coherent set the easy thing to ask for.
+    deployment_profile: Literal["single-node", "multi-replica"] = "single-node"
 
     google_api_key: str = Field(..., description="Google AI Studio API key (free tier)")
     # Required (must be present, even set to "") rather than defaulted to None, so a fresh
@@ -65,6 +80,19 @@ class Settings(BaseSettings):
     anthropic_chat_model: str = "claude-sonnet-5"
 
     corpus_dir: Path = PROJECT_ROOT / "data" / "corpus"
+    # Where the vector index lives. "chroma" is the default and is correct for one container:
+    # embedded, zero-infrastructure, durable on a mounted volume. "pgvector" (with
+    # DATABASE_URL) puts the index in Postgres instead -- worth it when Postgres is already
+    # in the deployment for conversations, since it removes embedded Chroma's one-process
+    # file lock without operating a second service. See retrieval/pgvector_store.py.
+    vector_backend: Literal["chroma", "pgvector"] = "chroma"
+    # How often a replica re-checks the shared index version to discover that *another*
+    # replica ingested and its in-memory BM25 index is stale (see retrieval/bm25_store.py).
+    # Only consulted when vector_backend == "pgvector"; on the single-process default the
+    # ingesting process invalidates its own index directly and nothing can race it. The
+    # window this opens is stale *keyword ranking*, not stale answers -- vector retrieval and
+    # grading read through to the shared store on every query.
+    bm25_version_poll_seconds: float = 5.0
     chroma_persist_dir: Path = PROJECT_ROOT / "chroma_db"
     # Point at a Chroma server to share the index across replicas. Embedded Chroma is
     # SQLite-backed and locks its file to one process, which is the single hardest constraint
@@ -86,6 +114,46 @@ class Settings(BaseSettings):
     # frontend from it at "/" -- used by the Docker image / Render deployment so one
     # container is the whole demo. Unset in development, where Vite serves the frontend.
     static_dir: Path | None = None
+
+    # Per-tenant LLM token allowance per UTC day; 0 disables it entirely (the default).
+    # Rate limiting bounds request *count*, which says nothing about cost -- a decomposed,
+    # multi-path, corrective run can cost orders of magnitude more than a routed-to-`none`
+    # one. Checked before a run and charged after, so a tenant can overshoot by at most one
+    # request; see budget.py for why that is the cheaper error than a reservation protocol.
+    # Shared across replicas only when Redis is reachable, and logs loudly when it is not.
+    tenant_daily_token_budget: int = 0
+    # What one vision call counts as against the budget. A real image's cost scales with
+    # resolution and is not reported back, so this is a deliberate over-estimate: a cap that
+    # under-counts lets a tenant exceed the budget it exists to enforce, while over-counting
+    # only makes it conservative.
+    vision_call_token_estimate: int = 1500
+
+    # Worker threads available to synchronous request handlers. `POST /api/v1/research` is a
+    # sync `def`, so FastAPI runs it on this pool and each in-flight research call occupies
+    # one thread for the entire graph -- seconds, not milliseconds. That makes this the real
+    # concurrency ceiling of a worker: at the default 40, the 41st concurrent research
+    # request waits for a thread rather than starting, no matter how idle the CPU is.
+    #
+    # Stated as a setting rather than inherited from AnyIO's default so the number is visible
+    # and deliberate. Raising it trades memory and context-switching for queueing, and stops
+    # helping once the real bottleneck is the provider's own rate limit.
+    api_threadpool_size: int = 40
+
+    # OTLP endpoint for distributed traces, e.g. "http://localhost:4318/v1/traces". Blank
+    # (the default) leaves tracing off entirely and imports nothing. Needs
+    # `uv sync --extra otel`. The per-request trace_id in the logs is unaffected either way --
+    # this adds the parent/child span structure that shows where the time actually went.
+    otel_exporter_otlp_endpoint: str = ""
+
+    # Shingle containment (|A n B| / min(|A|,|B|)) at or above which fusion treats two
+    # retrieved passages as the same one (see fusion/rrf.py, which shows the measurements
+    # behind this number). Exact hashing collapsed only byte-identical text, so a local copy
+    # and a web copy of one page both reached synthesis and earned separate citation markers
+    # pointing at the same words. Measured, every true near-duplicate scores 1.000 and the
+    # nearest false positive -- a different chunk of the same document -- scores 0.333, so
+    # 0.9 sits in a gap rather than on a slope. 0 disables similarity matching entirely and
+    # leaves only exact and normalized hashing.
+    fusion_near_duplicate_threshold: float = 0.9
 
     confidence_threshold: float = 0.6
 
@@ -140,6 +208,19 @@ class Settings(BaseSettings):
     # which a client polling a load-balanced deployment gets 404s from every worker that
     # didn't happen to accept the upload.
     task_backend: Literal["memory", "redis"] = "memory"
+    # How long an ingest task may sit in a non-terminal stage before a restart concludes it
+    # was orphaned and fails it (see ingestion/tasks.reconcile_stale_tasks). Must exceed the
+    # longest legitimate gap between stage updates on a large corpus, or an ingest that is
+    # simply slow gets failed out from under itself.
+    ingest_stale_after_seconds: float = 900.0
+    # How many times an ingest may be attempted before it is failed for good. A file that
+    # crashes the parser crashes it again, so without a ceiling a poison upload becomes an
+    # infinite restart loop that presents as an unstable deployment rather than a bad file.
+    ingest_max_attempts: int = 3
+    # Delay between in-process retries of a failed ingest. Fixed rather than exponential: the
+    # ceiling is 3 attempts, so the difference between schedules is a few seconds, and a
+    # constant is one less thing to reason about when reading a task's timeline.
+    ingest_retry_delay_seconds: float = 2.0
     redis_url: str = "redis://localhost:6379/0"
     cache_ttl_router: int = 300
     cache_ttl_web_search: int = 600
@@ -196,6 +277,39 @@ class Settings(BaseSettings):
     # a stuck provider from starving the rest of the graph's budget.
     llm_request_timeout_seconds: float = 12.0
     llm_max_retries: int = 1
+
+    @model_validator(mode="after")
+    def _apply_deployment_profile(self) -> "Settings":
+        """Fills in the shared backends for `multi-replica`, without overriding anything set
+        explicitly.
+
+        `model_fields_set` is what makes that distinction: pydantic-settings records a field
+        there when an environment variable supplied it, so an operator who sets
+        VECTOR_BACKEND themselves keeps it, and one who sets only DEPLOYMENT_PROFILE gets the
+        coherent set. A profile that silently overrode explicit configuration would be the
+        opposite of useful -- it would make the individual switches lie.
+        """
+        if self.deployment_profile != "multi-replica":
+            return self
+        explicit = self.model_fields_set
+        if "vector_backend" not in explicit:
+            self.vector_backend = "pgvector"
+        if "conversations_backend" not in explicit:
+            self.conversations_backend = "postgres"
+        if "task_backend" not in explicit:
+            self.task_backend = "redis"
+        # Checked rather than defaulted: there is no sensible guess for where the database
+        # is, and starting without one would fail later, per request, inside a background
+        # task -- far from the configuration that caused it.
+        if (
+            self.vector_backend == "pgvector" or self.conversations_backend == "postgres"
+        ) and not self.database_url:
+            raise ValueError(
+                "DEPLOYMENT_PROFILE=multi-replica needs DATABASE_URL: it puts the vector "
+                "index and the conversation store in Postgres. Set DATABASE_URL, or pin the "
+                "individual backends explicitly if you meant something narrower."
+            )
+        return self
 
     def cors_origins(self) -> list[str]:
         """CORS_ALLOW_ORIGINS split into the list CORSMiddleware wants. Blank means no

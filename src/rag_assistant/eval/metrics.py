@@ -76,6 +76,7 @@ def score_question(
     expected_sources: list[str],
     actual_sources: list[str],
     citation_count: int,
+    acceptable_routes: list[str] | None = None,
 ) -> QuestionMetrics:
     """Scores one golden question against what the graph actually did.
 
@@ -108,7 +109,7 @@ def score_question(
     return QuestionMetrics(
         question=question,
         category=category,
-        route_match=actual_route == expected_route,
+        route_match=actual_route in (acceptable_routes or [expected_route]),
         source_recall=source_recall,
         reciprocal_rank=reciprocal_rank,
         abstained=abstained,

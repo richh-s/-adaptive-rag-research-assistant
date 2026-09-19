@@ -1,7 +1,10 @@
 import hashlib
 import json
+import logging
 
+from rag_assistant import metrics
 from rag_assistant.cache import cache_get, cache_key, cache_set
+from rag_assistant.content_trust import build_untrusted_context, new_nonce
 from rag_assistant.config import get_settings
 from rag_assistant.graph.context_budget import select_context_documents
 from rag_assistant.graph.state import ResearchState
@@ -17,6 +20,8 @@ from rag_assistant.schemas.models import Citation, FusedDocument
 
 # Mirrors condense.py's window: enough turns for continuity of tone/topic, without pasting
 # the whole session (including full prior reports) into every synthesis prompt.
+logger = logging.getLogger(__name__)
+
 _MAX_HISTORY_TURNS = 6
 _MAX_TURN_CHARS = 800
 
@@ -121,10 +126,24 @@ def synthesize_answer(state: ResearchState) -> dict:
         answer = get_chat_model().invoke(prompt)
         result = {"final_answer": answer.text, "citations": []}
     else:
-        context = "\n\n".join(
-            f"[{i + 1}] (source: {display_source(d.source_id)})\n{d.content}"
-            for i, d in enumerate(docs)
+        # Every document here is attacker-influenceable -- uploaded by a tenant or fetched
+        # from whatever the web search returned. Fenced with a per-request nonce so a
+        # document cannot close its own fence and escape into instruction position; see
+        # content_trust.py.
+        nonce = new_nonce()
+        context, injection_categories = build_untrusted_context(
+            [(display_source(d.source_id), d.content) for d in docs], nonce=nonce
         )
+        if injection_categories:
+            # Counted, never acted on. The document still reaches the prompt intact: dropping
+            # it would corrupt legitimate content (a page *about* prompt injection matches
+            # every pattern) and would hide the attempt instead of surfacing it.
+            metrics.record_injection_signals(injection_categories)
+            logger.warning(
+                "Retrieved content contains injection-shaped phrasing: %s",
+                ", ".join(injection_categories),
+                extra={"injection_categories": injection_categories},
+            )
         prompt = SYNTHESIS_PROMPT.format(
             question=question, context=context, history_block=history_block
         )

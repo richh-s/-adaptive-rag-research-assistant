@@ -38,6 +38,17 @@ markdown tables. If part of the page is illegible, note '[illegible]' at that sp
 guessing. No preamble; output only the transcription."""
 
 
+# Vision calls are the most expensive thing an ingest does -- one per figure and per scanned
+# page -- and they happen several layers below the caller that knows which tenant to bill.
+# A counter at the single choke point, sampled as a delta by build_index, keeps the
+# accounting here rather than threading a ledger through the loaders.
+_calls_made = 0
+
+
+def calls_made() -> int:
+    return _calls_made
+
+
 def vision_available() -> bool:
     """Vision needs at least one configured provider key, and can be disabled outright via
     PDF_VISION=false (tests do this so offline ingestion never attempts a network call)."""
@@ -56,6 +67,8 @@ def describe_image(image_bytes: bytes, media_type: str, prompt: str) -> str | No
         logger.info("Skipping vision call for oversized image (%d bytes)", len(image_bytes))
         return None
 
+    global _calls_made
+    _calls_made += 1
     encoded = base64.b64encode(image_bytes).decode()
     message = {
         "role": "user",

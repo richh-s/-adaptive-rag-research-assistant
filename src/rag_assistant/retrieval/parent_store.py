@@ -19,7 +19,17 @@ import sqlite3
 import threading
 from pathlib import Path
 
+from rag_assistant.config import get_settings
+
 logger = logging.getLogger(__name__)
+
+
+def _shared_backend() -> bool:
+    """See ingestion/manifest.py. Sections move with the chunks that point at them: a replica
+    holding chunks whose `parent_id` it cannot resolve silently degrades small-to-big
+    retrieval back to plain chunk retrieval, with no error anywhere to say so."""
+    return get_settings().vector_backend == "pgvector"
+
 
 PARENT_DB_FILENAME = "parents.db"
 
@@ -74,6 +84,11 @@ def replace_parents_for_source(
     before (a heading removed), and an upsert would leave the vanished sections behind as
     orphans that no chunk points at and nothing ever cleans up.
     """
+    if _shared_backend():
+        from rag_assistant.retrieval.pgvector_store import replace_parents
+
+        replace_parents(source, owner, parents)
+        return
     with _LOCK:
         conn = _get_conn(persist_dir)
         conn.execute("DELETE FROM parents WHERE source = ?", (source,))
@@ -85,6 +100,11 @@ def replace_parents_for_source(
 
 
 def delete_parents_for_source(persist_dir: Path, source: str) -> None:
+    if _shared_backend():
+        from rag_assistant.retrieval.pgvector_store import delete_parents
+
+        delete_parents(source)
+        return
     with _LOCK:
         conn = _get_conn(persist_dir)
         conn.execute("DELETE FROM parents WHERE source = ?", (source,))
@@ -97,6 +117,10 @@ def get_parents(persist_dir: Path, parent_ids: list[str]) -> dict[str, str]:
     never populated degrades to ordinary chunk retrieval rather than losing the answer."""
     if not parent_ids:
         return {}
+    if _shared_backend():
+        from rag_assistant.retrieval.pgvector_store import get_parent_contents
+
+        return get_parent_contents(parent_ids)
     with _LOCK:
         conn = _get_conn(persist_dir)
         placeholders = ",".join("?" * len(parent_ids))
@@ -108,5 +132,9 @@ def get_parents(persist_dir: Path, parent_ids: list[str]) -> dict[str, str]:
 
 
 def count_parents(persist_dir: Path) -> int:
+    if _shared_backend():
+        from rag_assistant.retrieval.pgvector_store import count_parent_rows
+
+        return count_parent_rows()
     with _LOCK:
         return _get_conn(persist_dir).execute("SELECT COUNT(*) FROM parents").fetchone()[0]

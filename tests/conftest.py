@@ -7,6 +7,7 @@ from langchain_core.embeddings import Embeddings
 from rag_assistant import auth, cache
 from rag_assistant.config import get_settings
 from rag_assistant.conversations import store as conversations_store
+from rag_assistant.ingestion import tasks as ingest_tasks
 from rag_assistant.retrieval import parent_store, reranker
 
 
@@ -36,6 +37,9 @@ def _default_test_env(request, monkeypatch, tmp_path):
     # PDF vision ingestion would otherwise attempt real API calls whenever a test PDF has
     # an image-only page; tests that exercise the vision path mock describe_image directly.
     monkeypatch.setenv("PDF_VISION", "false")
+    # Ingest retries are real sleeps. Tests that exercise the retry path assert the attempt
+    # count, not the wall clock, and a 2s default would add seconds per failing-ingest test.
+    monkeypatch.setenv("INGEST_RETRY_DELAY_SECONDS", "0")
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +50,10 @@ def _clear_settings_cache():
     conversations_store.reset_store_cache()
     parent_store.reset_parent_store_cache()
     reranker.reset_reranker_cache()
+    # The ingest registry is a module-level singleton like the rest, and it now carries a
+    # content index used for upload idempotency -- without resetting it, one test's upload
+    # makes an identical upload in a later test collapse onto the first test's task.
+    ingest_tasks.reset_tasks()
     yield
     get_settings.cache_clear()
     cache.reset_client_cache()
@@ -53,6 +61,7 @@ def _clear_settings_cache():
     conversations_store.reset_store_cache()
     parent_store.reset_parent_store_cache()
     reranker.reset_reranker_cache()
+    ingest_tasks.reset_tasks()
 
 
 class FakeHashingEmbeddings(Embeddings):

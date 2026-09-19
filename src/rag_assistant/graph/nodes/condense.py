@@ -1,5 +1,6 @@
 import logging
 
+from rag_assistant.content_trust import fence_block, new_nonce
 from rag_assistant.graph.state import ResearchState
 from rag_assistant.llm import get_structured_llm
 from rag_assistant.prompts.condense_prompt import CONDENSE_PROMPT
@@ -41,7 +42,12 @@ def condense_question(state: ResearchState) -> dict:
     try:
         llm = get_structured_llm(CondensedQuestion)
         result: CondensedQuestion = llm.invoke(
-            CONDENSE_PROMPT.format(history=_format_history(history), question=question)
+            CONDENSE_PROMPT.format(
+                history=fence_block(
+                    _format_history(history), nonce=new_nonce(), label="CONVERSATION"
+                ),
+                question=question,
+            )
         )
         standalone = (result.standalone_question or "").strip()
     except Exception:

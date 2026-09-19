@@ -432,6 +432,25 @@ class FeedbackRow:
     created_at: float
 
 
+def delete_all_for_owner(owner: str) -> tuple[int, int]:
+    """Removes every conversation and feedback row belonging to `owner`.
+
+    Returns (conversations, feedback). One transaction, because a purge that deleted the
+    conversations and then failed would leave feedback rows referencing questions that no
+    longer exist -- an erasure request half-honoured is not honoured.
+    """
+    if (backend := _postgres()) is not None:
+        return backend.delete_all_for_owner(owner)
+    with _LOCK:
+        conn = _get_conn()
+        # Messages follow via ON DELETE CASCADE, which is why this does not delete them
+        # explicitly -- doing both would be two sources of truth for one relationship.
+        conversations = conn.execute("DELETE FROM conversations WHERE owner = ?", (owner,)).rowcount
+        feedback = conn.execute("DELETE FROM feedback WHERE owner = ?", (owner,)).rowcount
+        conn.commit()
+    return conversations, feedback
+
+
 def record_feedback(
     question: str,
     rating: str,

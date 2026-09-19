@@ -168,7 +168,11 @@ class IngestResponse(BaseModel):
     filename: str
     original_filename: str
     size_bytes: int
-    status: Literal["queued"]
+    # Normally "queued". A repeated upload of identical bytes is collapsed onto the original
+    # task rather than starting a second ingest, and that task may already have progressed or
+    # finished -- reporting its real stage is the point, since the client is being handed its
+    # id to poll.
+    status: Literal["queued", "parsing", "indexing", "indexed", "failed"]
     message: str
 
 
@@ -273,3 +277,17 @@ class IndexedSource(BaseModel):
     display_name: str
     chunk_count: int
     owner: str
+
+
+class TenantPurgeResponse(BaseModel):
+    """DELETE /api/v1/tenant/data response body. Reports what was actually removed rather
+    than a bare 204, because an erasure request is exactly the case where the requester needs
+    to see that something happened -- and a purge that found nothing is a meaningful answer,
+    not a failure."""
+
+    owner: str
+    sources_removed: int
+    chunks_removed: int
+    conversations_removed: int
+    feedback_removed: int
+    corpus_files_removed: bool

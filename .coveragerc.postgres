@@ -1,0 +1,13 @@
+# Coverage config for CI's `postgres` job only.
+#
+# pyproject.toml's [tool.coverage.run] omits the two Postgres-backed modules, because the
+# main gate runs in a job with no database and their coverage there measures the absence of a
+# service container rather than anything about the suite. That omit list wins over an
+# explicit `--cov=<module>` on the command line, so measuring them needs a config that does
+# not carry it. Deliberately minimal: the modules under measurement come from `--cov` flags
+# in the workflow, next to the threshold they are gated at.
+[run]
+branch = true
+
+[report]
+show_missing = true

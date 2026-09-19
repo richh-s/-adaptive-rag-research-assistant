@@ -55,6 +55,17 @@ class BaselineComparison:
         return not self.regressions
 
 
+class BaselineStale(RuntimeError):
+    """Raised when the recorded baseline no longer describes the system being measured.
+
+    Comparing against an invalid baseline is worse than not gating at all: it reports a pass
+    or a failure with equal confidence, and neither means anything. A change that alters the
+    dataset or the prompts feeding a metric invalidates the numbers recorded before it, so the
+    baseline is marked rather than silently reused, and the gate refuses until someone
+    re-records deliberately.
+    """
+
+
 class BaselineNotFound(RuntimeError):
     """Raised when a gate run finds no baseline to compare against.
 
@@ -67,6 +78,8 @@ class BaselineNotFound(RuntimeError):
 def save_baseline(metrics: EvalMetrics, path: Path | None = None) -> Path:
     target = path or DEFAULT_BASELINE_PATH
     target.parent.mkdir(parents=True, exist_ok=True)
+    # No `stale` key: recording is the act that makes a baseline current again, so a fresh
+    # file simply lacks the flag rather than carrying it set to false.
     payload = {
         "question_count": metrics.question_count,
         "metrics": metrics.gated_scores(),
@@ -87,7 +100,15 @@ def load_baseline(path: Path | None = None) -> dict[str, float]:
             f"    uv run rag-assistant eval --limit <n> --record-baseline\n"
             f"This needs real API keys -- the eval harness runs the actual graph."
         )
-    return json.loads(source.read_text())["metrics"]
+    payload = json.loads(source.read_text())
+    if payload.get("stale"):
+        raise BaselineStale(
+            f"The eval baseline at {source} is marked stale and cannot be compared against.\n"
+            f"Reason: {payload.get('stale_reason', 'not given')}\n"
+            f"Re-record against a known-good build with:\n"
+            f"    uv run rag-assistant eval --limit <n> --record-baseline"
+        )
+    return payload["metrics"]
 
 
 def compare(

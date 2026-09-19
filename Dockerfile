@@ -10,11 +10,17 @@ WORKDIR /app
 
 # Copy only the dependency manifests first so this layer is cached across source-only changes.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-install-project --no-dev
+# The optional extras are baked in so the switches they back are deploy-time configuration
+# rather than rebuild-time: CONVERSATIONS_BACKEND=postgres and VECTOR_BACKEND=pgvector need
+# psycopg, and OTEL_EXPORTER_OTLP_ENDPOINT needs the OpenTelemetry SDK. All three are
+# documented as environment variables, so an image lacking the libraries turns flipping one
+# into an ImportError on the first request that touches it. Costs a few MB and no
+# infrastructure: the defaults still run SQLite, embedded Chroma and no tracing.
+RUN uv sync --frozen --no-install-project --no-dev --extra postgres --extra otel
 
 COPY src ./src
 COPY README.md ./
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --extra postgres --extra otel
 
 # ---- frontend: build the React app so the API can serve it from one container ----
 FROM node:22-alpine AS frontend

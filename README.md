@@ -393,10 +393,10 @@ purpose: it costs model calls per row and its scores drift slightly between runs
 output, so gating on it would fail builds for reasons unrelated to the change.
 
 ```bash
-uv run rag-assistant eval --limit 28                    # score the full dataset
-uv run rag-assistant eval --limit 28 --llm-judge        # ...plus RAGAS faithfulness/relevancy
-uv run rag-assistant eval --limit 28 --record-baseline  # record baseline from a known-good build
-uv run rag-assistant eval --limit 28 --check            # fail on regression vs. that baseline
+uv run rag-assistant eval --limit 50                    # score the full dataset
+uv run rag-assistant eval --limit 50 --llm-judge        # ...plus RAGAS faithfulness/relevancy
+uv run rag-assistant eval --limit 50 --record-baseline  # record baseline from a known-good build
+uv run rag-assistant eval --limit 50 --check            # fail on regression vs. that baseline
 ```
 
 A baseline recorded on Claude Sonnet against the sample corpus is committed at
@@ -501,15 +501,55 @@ Each of those ceilings is now a setting rather than a rewrite:
 | `CHROMA_SERVER_HOST` | The vector index's file lock — replicas share a Chroma server |
 | `TASK_BACKEND=redis` | Per-process ingest tasks. Without it a client polling a load-balanced deployment gets "unknown ingest task" from every replica that didn't accept the upload |
 | `CONVERSATIONS_BACKEND=postgres` + `DATABASE_URL` | SQLite's single-writer lock, the main obstacle to a second replica. Needs `uv sync --extra postgres`; migrations are advisory-locked so replicas can start simultaneously |
+| `VECTOR_BACKEND=pgvector` + `DATABASE_URL` | The same file lock `CHROMA_SERVER_HOST` removes, but without operating a second service — the index becomes a table in a database that is already backed up, replicated and monitored. Needs the `vector` extension in that database |
 
-The Postgres backend is verified against a real Postgres in `tests/test_postgres_store.py`,
-which skips unless `RAG_TEST_DATABASE_URL` points at one:
+Both Postgres-backed paths are verified against a real Postgres — `tests/test_postgres_store.py`
+for conversations and `tests/test_pgvector_store.py` for the index — and both skip unless
+`RAG_TEST_DATABASE_URL` points at one:
 
 ```bash
 initdb -D /tmp/pg/data -U postgres --auth=trust
 pg_ctl -D /tmp/pg/data -o "-p 55432 -k /tmp/pg" -l /tmp/pg/log start
-RAG_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/postgres uv run pytest tests/test_postgres_store.py
+RAG_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/postgres \
+    uv run pytest tests/test_postgres_store.py tests/test_pgvector_store.py
 ```
+
+The pgvector suite asserts the same behaviours the Chroma tests do — retrieval, idempotent
+re-ingest, tenant isolation, metadata filtering — because two backends are interchangeable only
+if they actually behave the same, and one that stored vectors correctly while dropping the
+tenant predicate would be a data-isolation bug introduced by flipping a config value. Two tests
+carry the load beyond that:
+
+- **`test_ranking_matches_the_chroma_backend_on_the_same_corpus`** indexes one corpus into both
+  backends with the same deterministic embeddings and asserts the same documents come back in
+  the same *order*. Retrieving the right set in the wrong order changes which document reaches
+  the synthesis prompt first, and nothing else would catch it.
+- **`test_ranking_is_cosine_not_euclidean`** pins the distance metric. The parity test above
+  cannot: the shared fake embeddings return unit vectors, and on unit vectors cosine and
+  Euclidean rank identically — mutating `<=>` to `<->` leaves it green. This one uses
+  deliberately unnormalized embeddings, where the two metrics disagree, and fails under that
+  mutation. An HNSW index built with the wrong operator class never errors either; the `<=>`
+  query silently stops using it and falls back to a sequential scan.
+
+### Concurrency ceiling
+
+Worth stating explicitly because it is arithmetic, not a benchmark, and nothing else in this
+document says it:
+
+`POST /api/v1/research` is a synchronous handler. FastAPI runs those on the AnyIO worker
+threadpool, and each in-flight research call holds one thread for the entire graph run --
+seconds, not milliseconds. So a single worker's concurrency ceiling is `API_THREADPOOL_SIZE`
+(default 40), regardless of how idle the CPU is: the 41st concurrent research request waits
+for a thread rather than starting one.
+
+That interacts with `--workers 1` in the Dockerfile. One container serves ~40 concurrent
+research calls; more than that queues. `rag_research_in_flight` is the gauge to alert on, and
+it is the number that should drive the decision to scale out rather than CPU or memory, both
+of which will look healthy while requests queue.
+
+Raising the setting trades memory and context-switching for queueing, and stops helping
+entirely once the binding constraint is the LLM provider's own rate limit -- which, for most
+deployments, it will be well before 40.
 
 ### Load testing
 
@@ -747,10 +787,25 @@ local demo script:
 | Corpus tenant isolation | Ownership is encoded in the corpus layout (`ingestion/ownership.py`): flat files are the shared public corpus, `_t/<owner>/` is private to that tenant. Both retrieval paths filter on it — Chroma via a `$in` filter applied *during* search rather than after (post-filtering silently shrinks k), BM25 by narrowing candidates before the top-k cut. The router's corpus description is scoped too, since listing another tenant's filenames leaks them through the prompt even when retrieval filters them out |
 | Incremental ingestion cost | Re-indexing is decided from a raw-byte fingerprint plus `CHUNKING_VERSION`/`LOADER_VERSION`, so unchanged files are never parsed — not merely never re-embedded. That distinction is the whole cost: a parse runs pymupdf4llm and, with `PDF_VISION` on, a vision API call per figure and per scanned page. Ingestion is also scoped to the uploading tenant. One upload into an 8-file corpus went from 16 file parses to 1 |
 | BM25 / vector chunk parity | The keyword index is built from the chunks stored in Chroma rather than by re-reading the corpus. Beyond removing a second full parse pass per ingest, it makes RRF's `SHA256(content)` cross-source dedup correct by construction — previously the two paths produced identical text only by the convention that both called the same splitter, and any drift would have silently double-counted and double-cited the same passage |
-| Backup & restore | One archive holds the index, manifest, conversations and corpus. SQLite goes through SQLite's online backup API rather than a file copy — in WAL mode a `cp` of `.db`/`-wal`/`-shm` catches them at different instants and restores into a database that opens cleanly and is missing recent writes. Restore stages the whole archive before swapping and moves the existing data aside rather than deleting it, so a corrupt archive fails with the deployment untouched |
+| Backup & restore | One archive holds the index, manifest, conversations and corpus — including when those live in Postgres rather than on disk. `VECTOR_BACKEND=pgvector` moves the vectors, manifest and parent sections out of the persist directory, and archiving only the directories in that configuration produced something worse than a failure: a well-formed archive whose metadata correctly reported eight indexed sources (the count reads through the live manifest, which *does* reach Postgres) and which restored an empty index, with no error anywhere. The Postgres-backed tables are now dumped under `postgres/` inside the archive, read in a single `REPEATABLE READ` transaction so a manifest can never name chunk ids the chunk dump lacks, and a restore **refuses** an archive holding tables the target is not configured to read rather than loading an index into a backend nothing queries. SQLite goes through SQLite's online backup API rather than a file copy — in WAL mode a `cp` of `.db`/`-wal`/`-shm` catches them at different instants and restores into a database that opens cleanly and is missing recent writes. Restore stages the whole archive before swapping and moves the existing data aside rather than deleting it, so a corrupt archive fails with the deployment untouched |
 | Embedding-model drift | The model the index was built with is recorded and checked by `/ready`. This is the one dependency whose failure is *silent*: a changed model with the same dimension embeds queries into a space the stored vectors don't occupy and returns plausible nonsense with no error anywhere. Readiness failing pulls the replica from the load balancer instead |
 | Key management | Scopes (`read`/`write`, 403 not 401), expiry, per-key rate limits, and an audit trail recording key fingerprints and never keys. The key cache is keyed on the key file's mtime, so revocation takes effect on the next request rather than the next restart |
-| Horizontal scaling | Every single-process ceiling is a setting rather than a rewrite: `CHROMA_SERVER_HOST` (vector index file lock), `TASK_BACKEND=redis` (per-process ingest tasks), `CONVERSATIONS_BACKEND=postgres` (SQLite's single-writer lock). Defaults keep a single container infrastructure-free; the Postgres backend is verified against a real Postgres, with advisory-locked migrations so replicas can start at once |
+| Horizontal scaling | Every single-process ceiling is a setting rather than a rewrite: `CHROMA_SERVER_HOST` or `VECTOR_BACKEND=pgvector` (vector index file lock), `TASK_BACKEND=redis` (per-process ingest tasks), `CONVERSATIONS_BACKEND=postgres` (SQLite's single-writer lock). Defaults keep a single container infrastructure-free; both Postgres-backed paths are verified against a real Postgres **in CI**, with advisory-locked migrations so replicas can start at once |
+| Interchangeable vector backends | `VECTOR_BACKEND=pgvector` moves the index into Postgres (`retrieval/pgvector_store.py`), keeping the tenant predicate in SQL — applied *during* the search, not after, for the same reason as the Chroma path: post-filtering silently shrinks k, and the graph reads a short result set as "the corpus has nothing" and falls back to web search. The embedding column sizes itself on the first write and builds its HNSW index then, so there is no dimension setting to get wrong, and pgvector afterwards rejects a vector of the wrong width — an embedding-model swap fails at insert instead of silently returning neighbours from a space the stored vectors don't occupy. Backend parity is asserted on retrieval *order*, and the distance metric is pinned by a test that fails when `<=>` is mutated to `<->` |
+| Shared index state | `VECTOR_BACKEND=pgvector` moves the *whole* index, not just the vectors: the ingestion manifest and the parent-section store go to Postgres with them. Vectors alone are not the index — a replica that reads a manifest which never saw another replica's ingest decides what to re-index from a record of someone else's collection, and serves chunks whose parent sections it cannot resolve. A manifest that disagrees with the vectors it describes is worse than either being missing |
+| Cross-replica index invalidation | The in-memory BM25 index has a second way to go stale that no local call can catch: another replica ingesting. Each replica records the shared index version it built from and re-checks it at most every `BM25_VERSION_POLL_SECONDS`, rebuilding on a mismatch. A poll rather than a subscription on purpose — no broker, no delivery guarantee, no reconnect logic, and it converges from any state including a replica that was down for three ingests. Exposure is bounded stale *keyword ranking*, never stale answers, since vector retrieval reads through to the shared store every query |
+| Untrusted content boundary | Applied at **both** LLM surfaces that see retrieved text — synthesis and relevance grading. Grading is the earlier and arguably more consequential one: its grades set the confidence score and decide whether corrective web search runs, so a document that talks its way to a high grade also suppresses the search that might have found something better. Retrieved documents are attacker-influenceable — uploaded by any tenant with a write scope, or fetched from whatever the web search returned — and reach the same prompt as the system's own instructions. Each is fenced with a **per-request random nonce** (`content_trust.py`), which is what defeats the obvious attack on any fencing scheme: a document that closes its own fence escapes into instruction position, and that requires a marker the attacker has never seen. The instruction hierarchy is stated *before* the content, since instructions after untrusted text occupy the position an injection is trying to claim. Detection is advisory and counted (`rag_prompt_injection_signals_total`), never enforced — silently dropping text that matched a regex would corrupt legitimate documents and replace a visible risk with an invisible one |
+| Per-tenant cost control | `TENANT_DAILY_TOKEN_BUDGET` caps tokens per tenant per UTC day (`budget.py`), across **both** the research and ingest paths. Ingest is the expensive one — an embedding per chunk and a vision call per figure or scanned page — and neither reports usage the way a chat completion does, so both are estimated deliberately high: an estimate that under-counts lets a tenant exceed the cap the budget exists to enforce, while over-counting only makes it conservative. Enforced before the upload is accepted, since streaming 25MB to disk only to reject it wastes the resource being protected. Rate limiting bounds request *count*, which says nothing about cost when one question routes to `none` and the next decomposes into four sub-queries with corrective search. Usage was already metered; a Prometheus counter cannot be consulted to decide whether to serve a request. Checked before, charged after — including on failures, since a run that died after four LLM calls cost what it cost, and not charging failures makes failure the cheap way to burn a provider quota |
+| Ingest idempotency | Uploading identical bytes twice returns the original task instead of parsing and embedding the file again — the retry case after a timeout, a dropped connection or a double-clicked button. Keyed on content and scoped per tenant: the same filename with new bytes is exactly when the work *is* needed, and collapsing two tenants' identical uploads would put one tenant's document in the other's corpus |
+| Restart reconciliation | An ingest runs as a background task inside the process that accepted the upload, so a deploy or a crash stops the work but not the record — the task sits at `parsing` forever while a client polls a job nobody is doing. Startup fails those with a message saying what happened and what to do. There is no resumption to offer (the work was in memory), and a terminal failure is more honest than a status indistinguishable from slow progress |
+| Explicit concurrency ceiling | `POST /api/v1/research` is a sync handler, so it runs on the worker threadpool and holds one thread for the whole multi-second graph run. `API_THREADPOOL_SIZE` (default 40) is therefore the real per-worker concurrency limit — the 41st concurrent research request queues rather than starts, however idle the CPU. Stated as a setting rather than inherited from AnyIO's default so the number is visible, with `rag_research_in_flight` to watch against it |
+| Distributed tracing | Optional OpenTelemetry (`uv sync --extra otel`, `OTEL_EXPORTER_OTLP_ENDPOINT`). The existing per-request `trace_id` correlates log lines but cannot show where the time went; spans add the parent/child structure. One span per node, emitted from the shared `_timed` wrapper rather than from eleven nodes that would each carry their own copy and drift. Entirely inert when unconfigured — the disabled path is a working context manager, not a guard at every call site |
+| Right to erasure | `DELETE /api/v1/tenant/data` removes everything belonging to the calling tenant across all five stores that hold any: corpus files, embeddings, parent sections, manifest entries, and conversations plus feedback. Ordered so that files go last and each manifest entry is cleared only after its chunks and parents are — an interrupted purge leaves the remaining work still described, so a re-run finishes it. Scoped to the caller rather than taking an owner parameter, because erasing someone else's data should not share an endpoint with erasing your own |
+| One coherent deployment switch | `DEPLOYMENT_PROFILE=multi-replica` turns on pgvector, Postgres conversations and Redis tasks together, and fails at startup without `DATABASE_URL`. They are not independent choices: a shared index with per-process ingest tasks serves "unknown ingest task" 404s from whichever replica did not accept the upload, and shared tasks with a local index give two divergent corpora. Every half-shared combination breaks as flakiness rather than as misconfiguration. Explicitly-set switches still win — a profile that overrode them would make the individual settings lie |
+| Resumable ingestion | An ingest interrupted by a deploy or a crash is **resumed**, not failed. The uploaded file was written into the corpus before the task existed and `build_index` decides what to do from a fingerprint, so re-running costs only what was unfinished and costs nothing at all after a completed run. Transient failures retry in place up to `INGEST_MAX_ATTEMPTS`; the attempt counter lives on the task record, so a crash mid-retry resumes at the right attempt rather than granting a fresh budget every restart. A task that exhausts its attempts becomes terminally `failed` carrying the count — the record is the dead-letter queue, already queryable through the status endpoint |
+| Near-duplicate fusion | Fusion collapses passages by **shingle containment**, not byte equality. A local copy and a web copy of one page previously both reached synthesis and earned separate citation markers pointing at the same words. Containment rather than Jaccard because Jaccard punishes length differences — a truncated copy of the same passage scores 0.321 by Jaccard and 1.000 by containment, and no Jaccard threshold that catches it stays clear of genuinely distinct text. Measured, every true near-duplicate lands at 1.000 and the nearest false positive (a different chunk of the same document) at 0.333, so the threshold sits in a gap rather than on a slope. The fuller copy is kept — text, metadata and source id together — because a merge must not truncate evidence, and citing one source for another's words is worse than keeping both |
+| Defensible routing metric | `route_accuracy` scores against `acceptable_routes` rather than one asserted answer. Routing is genuinely ambiguous for a real share of questions — a company's private GPU count can defensibly go to `web` or to `both` — so a single-answer dataset measured its own labelling as much as the router. 17 of 50 rows now list more than one defensible route, and a test fails the build if the dataset is ever widened until every route is acceptable everywhere |
+| Baselines that refuse to lie | A baseline recorded before a change that invalidates it is marked `stale`, and the gate **refuses to run** against it rather than comparing. An invalid baseline reports a pass or a failure with equal confidence and neither means anything. `--check` exits 2 for "the gate could not run" and 1 for "the gate ran and failed", and CI treats them differently — a shared exit code would make a misconfiguration look like a quality regression |
 | Alerting | Prometheus rules and a Grafana dashboard in `ops/`, with tests asserting every metric they reference exists. Thresholds are stated with their reasoning — an alert whose number nobody can justify is one that gets silenced the first time it fires at 3am |
 | Load testing | `rag-assistant loadtest` reports p50/p95/p99 and never a mean. Measured single-worker at concurrency 25: 376 rps on `/health`, 407 rps on a SQLite-backed endpoint, p95 172ms/109ms, no errors |
 | Quality signal | Thumbs up/down per answer, surfacing recently downvoted questions. The eval gate catches regressions against a fixed dataset; only this can tell you the dataset stopped resembling what people ask |
@@ -776,42 +831,107 @@ synthesized answer ("No relevant sources were found...") both came out correct �
 state plumbing, not just the code path in isolation.
 
 Gaps identified but deliberately not yet acted on: no few-shot examples in the router/
-decomposition prompts, exact-content-hash dedup can still let the same source get cited twice
-under different markers if local and web copies differ even slightly, and synthesis has no
-token/context-length cap on however many documents fusion returns.
+decomposition prompts, and exact-content-hash dedup can still let the same source get cited
+twice under different markers if local and web copies differ even slightly. (The third gap
+listed here originally — synthesis having no token/context-length cap on however many
+documents fusion returns — has since been closed; see **Context budget** in
+[Production readiness](#production-readiness).)
 
 ## Known limitations
 
 Stated plainly, because knowing where a system's edges are is more useful than pretending it
 has none.
 
-- **`route_accuracy` is depressed by label ambiguity, not only by routing errors.** Several
-  questions have more than one defensible route -- asking for a company's private GPU count
-  can reasonably go to `web` alone or to `both` -- and the dataset asserts one. The recorded
-  baseline (0.786) therefore reflects the labels as much as the router. It still functions as
-  a gate: routing is deterministic at temperature 0, so the same questions route the same way
-  run to run, and a real regression moves the number well past the tolerance. Encoding
-  `acceptable_routes` per question rather than a single expected one would make the absolute
-  figure meaningful too.
-- **The eval set is 28 hand-authored questions with no baseline system to compare against.**
-  The gate is real, but on a dataset this size one flipped routing decision moves an aggregate
-  by roughly four points — which is why it compares against a recorded baseline with a
-  tolerance rather than against absolute thresholds. It tells you whether a change made things
-  *worse*; it cannot tell you how good the system is in absolute terms.
+- **`route_accuracy` is now scored against `acceptable_routes`, and the baseline predates
+  it.** The dataset lists every defensible route per question rather than asserting one, so
+  the metric finally means "the router chose defensibly". The recorded baseline (0.786) was
+  measured before that change, against 28 rows, and is marked stale -- the gate refuses to
+  compare until someone re-records it with real API keys. **Nobody has re-measured it yet.**
+- **The eval set is 50 hand-authored questions with no baseline system to compare against.**
+  Larger than the 28 it started at, and balanced across all five categories and all four
+  routes, but still small enough that one flipped routing decision moves an aggregate by about
+  two points — which is why it compares against a recorded baseline with a tolerance rather
+  than against absolute thresholds. It tells you whether a change made things *worse*; it
+  cannot tell you how good the system is in absolute terms. Every row is authored against the
+  same five-document corpus, so it measures this system on this corpus and nothing wider.
 - **Retrieval-quality features are correctness-tested, not quality-measured.** Semantic
   chunking, reranking and small-to-big all behave as specified and are covered by tests, but
   whether they *improve* answers on a given corpus is exactly what the eval gate answers — and
   that requires recording a baseline against real models first.
-- **The optional backends are verified to differing depths.** Postgres is tested against a real
-  Postgres; Redis-backed tasks are tested against a fake client; Chroma server mode is only
-  tested at the construction boundary. None of the three runs in CI, which has no such
-  services.
+- **The optional backends are still verified to differing depths.** The two Postgres-backed
+  paths — conversations and the pgvector index — now run against a real `pgvector/pgvector:pg17`
+  service container in CI, and that job fails rather than passes if the suites skip, since a
+  suite that skips itself produces a green job having verified nothing. Redis-backed tasks are
+  still tested against a fake client, and Chroma server mode still only at the construction
+  boundary; neither runs in CI.
 - **All tenants share one Chroma collection.** Retrieval and ingestion are tenant-scoped, but
   there is no per-tenant view of index size or embedding spend. Separate collections would give
-  that, and are the natural companion to the Qdrant move below.
-- **Embeddings are Gemini-only and one-way.** Switching means a full re-index. `/ready` now
-  detects the mismatch rather than serving nonsense, but there is no migration path that keeps
-  the service answering while it re-embeds.
+  that, and are the natural companion to the Qdrant move below. Token spend *is* now attributed
+  per tenant across research and ingest (see `budget.py`); index size is not. Embedding and
+  vision spend is charged from an estimate rather than reported usage, because neither
+  surfaces token counts through LangChain's callbacks.
+
+- **Prompt-injection defense is structural, and structural is not proof.** All four prompts
+  that interpolate text the pipeline did not author -- synthesis, grading, routing and
+  condensation -- are now fenced with a per-request nonce and carry the trust hierarchy ahead
+  of the content, and a test fails the build if a fifth is added without one. The fence and
+  the instruction hierarchy make injection harder and
+  attempts visible; neither can guarantee a model obeys, and no prompt-level defense can. The
+  tests assert the mechanism — that documents
+  are fenced, that the nonce cannot be forged, that attempts are counted and nothing is silently
+  dropped — not that a given model resists, which is a property of the model and measurable only
+  against a live one. What actually bounds the blast radius is elsewhere: retrieval is
+  tenant-scoped, synthesis has no tools, and citations are built from the documents the pipeline
+  selected rather than from anything the model claims.
+
+- **Ingestion resumes and retries, but there is still no broker.** A restart-orphaned task is
+  re-queued and resumed, transient failures retry with a bounded attempt count, duplicates are
+  collapsed, and exhausted tasks land in a terminal state that serves as the dead-letter
+  record. What is still absent is a real queue: no visibility timeout, no work stealing, no
+  distribution across replicas. Resumption happens in the process that restarts, which means a
+  replica that dies permanently takes its in-flight work with it until another one's startup
+  pass notices the stale record. A broker is the right answer once ingest volume justifies
+  operating one.
+
+- **The concurrency ceiling is stated but not load-tested at the pipeline level.** The published
+  throughput numbers are `/health` and a SQLite-backed endpoint; they measure the HTTP stack.
+  What `API_THREADPOOL_SIZE` concurrent *research* calls actually do to p99 — against real
+  provider rate limits — has not been measured, and the arithmetic below is a bound, not a
+  benchmark.
+- **Embeddings are Gemini-only and one-way.** Switching means a full re-index. `/ready` detects
+  the mismatch rather than serving nonsense, and on the pgvector backend a model of a *different*
+  width is rejected outright at insert — but a model of the *same* width is still caught only by
+  the recorded embedding-model name, and there is no migration path that keeps the service
+  answering while it re-embeds.
+
+## Service objectives and recovery
+
+Stated as targets rather than measurements. Nothing here has been observed under production
+traffic, and the alert thresholds in `ops/` were chosen to match these numbers — the point of
+writing them down is that an alert nobody can justify gets silenced the first time it fires at
+3am.
+
+| Objective | Target | Measured by |
+| --- | --- | --- |
+| Availability | 99.5% of `/api/v1/research` returning non-5xx | `rag_http_requests_total` by status class |
+| Latency | p95 under 12s, p99 under 25s for a `both`-routed question | `rag_http_request_duration_seconds` |
+| Saturation | `rag_research_in_flight` below 80% of `API_THREADPOOL_SIZE` | gauge vs. configured ceiling |
+| Retrieval quality | No aggregate in `rag-assistant eval --check` regressing past tolerance against the recorded baseline | CI eval gate |
+| Freshness | Keyword index within `BM25_VERSION_POLL_SECONDS` of the shared index | poll interval, bounded by construction |
+
+**Recovery objectives.** The archive now covers Postgres-backed state as well as the two
+directories, so a `VECTOR_BACKEND=pgvector` deployment is genuinely recoverable from one
+file. RPO is the age of the last backup archive — `rag-assistant backup`
+is a manual command, so RPO equals the operator's schedule and is *not* bounded by the system
+itself. That is the honest statement: an unscheduled backup is not a recovery point objective.
+RTO is dominated by restore, which stages the whole archive before swapping and moves the
+existing data aside rather than deleting it, so a corrupt archive fails with the deployment
+untouched.
+
+The restore path is exercised by `tests/test_backup.py`, including the case where an archive
+was built with a different embedding model. What has **not** happened is a drill against a
+real deployment: restoring into a running service, with real corpus volume, and timing it. Until
+that has been done, RTO is an estimate rather than a number.
 
 ## Future improvements
 
@@ -869,7 +989,7 @@ src/rag_assistant/
 ├── metrics.py, auth.py                   # Prometheus collectors + LLM callback handler, API-key auth
 ├── backup.py, loadtest.py                # snapshot/restore, concurrency measurement
 ├── ingestion/                            # load -> split -> embed -> index the sample corpus
-├── retrieval/                            # Chroma vector store, BM25 keyword store, DuckDuckGo web search
+├── retrieval/                            # Chroma + pgvector stores, BM25 keyword store, DuckDuckGo web search
 ├── fusion/rrf.py                         # Reciprocal Rank Fusion (pure function)
 ├── grading/relevance_grader.py           # batched LLM relevance grading
 ├── graph/                                # ResearchState, one node module per concept, build_graph(),

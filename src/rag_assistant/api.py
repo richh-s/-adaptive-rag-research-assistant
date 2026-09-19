@@ -1,9 +1,11 @@
+import anyio
 import asyncio
 import hashlib
 import json
 import logging
 import re
 import signal
+import threading
 import time
 import uuid
 import weakref
@@ -19,7 +21,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
-from rag_assistant import auth, metrics
+from rag_assistant import auth, budget, metrics, tenancy
 from rag_assistant.config import get_settings
 from rag_assistant.conversations import store as conversations
 from rag_assistant.graph.build_graph import build_graph
@@ -28,6 +30,7 @@ from rag_assistant.ingestion.build_index import build_index
 from rag_assistant.ingestion.loaders import SUPPORTED_SUFFIXES
 from rag_assistant.ingestion.manifest import load_manifest
 from rag_assistant.ingestion.ownership import display_source, owner_corpus_dir, visible_owners
+from rag_assistant.ingestion import tasks as ingest_tasks
 from rag_assistant.ingestion.tasks import create_task, get_task, update_task
 from rag_assistant.ingestion.url_fetch import UrlIngestError, fetch_page, page_to_markdown
 from rag_assistant.logging_conf import configure_logging
@@ -51,8 +54,9 @@ from rag_assistant.schemas.api import (
     ResearchRequest,
     ResearchResponse,
     StreamEvent,
+    TenantPurgeResponse,
 )
-from rag_assistant.tracing import get_trace_id, new_trace_id, trace_id_var
+from rag_assistant.tracing import configure_otel, get_trace_id, new_trace_id, trace_id_var
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -100,6 +104,38 @@ def _handle_sigterm() -> None:
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     loop = asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGTERM, _handle_sigterm)
+    # An ingest runs inside the process that accepted the upload, so a deploy or a crash
+    # leaves its task record stuck in a non-terminal stage with nothing working on it. There
+    # is nothing to resume, so the startup pass fails those loudly rather than leaving a
+    # client polling a job nobody is doing. Best-effort: a broken task backend must not stop
+    # the service from starting.
+    try:
+        for stale in ingest_tasks.reconcile_stale_tasks():
+            # Off the event loop: the resumed work is the same synchronous graph-and-embed
+            # job a request would have run, and doing it inline would block startup until
+            # every orphaned corpus finished re-indexing.
+            threading.Thread(
+                target=_run_ingest_in_background,
+                args=(new_trace_id(), stale.task_id, stale.owner),
+                name=f"resume-ingest-{stale.task_id[:8]}",
+                daemon=True,
+            ).start()
+    except Exception:
+        logger.warning("Could not reconcile in-flight ingest tasks at startup", exc_info=True)
+    # Sized explicitly rather than left at AnyIO's default, because this is the concurrency
+    # ceiling for `/api/v1/research` -- a sync handler holding one thread for a multi-second
+    # graph run. Set here, inside the running loop, since the limiter is loop-scoped.
+    # Before anything else that might emit a span.
+    try:
+        configure_otel()
+    except Exception:
+        logger.warning("Could not configure OpenTelemetry tracing", exc_info=True)
+    try:
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = get_settings().api_threadpool_size
+        logger.info("request threadpool sized to %d threads", limiter.total_tokens)
+    except Exception:
+        logger.warning("Could not size the request threadpool", exc_info=True)
     try:
         yield
     finally:
@@ -388,36 +424,88 @@ def _run_ingest_in_background(trace_id: str, task_id: str, owner: str) -> None:
     thread unobserved. `build_index()`'s `on_stage` hook drives the "parsing"/"indexing"
     transitions; this function only owns the terminal "indexed"/"failed" transition, since it's
     the one place that knows whether the whole job actually succeeded.
+
+    Retries in a loop up to INGEST_MAX_ATTEMPTS. In-place rather than re-queued because the
+    work is already here and the staged file is already on disk, and `build_index` decides
+    what to do from a fingerprint -- so a retry costs only what the failed attempt did not
+    finish. Bounded because a file that crashes the parser will crash it again, and an
+    unbounded retry turns one bad upload into a loop that reads as an unstable service.
+
+    The attempt counter lives on the task record rather than in this frame, so a restart
+    midway resumes at the right attempt instead of granting a fresh budget every crash.
     """
+    settings = get_settings()
     token = trace_id_var.set(trace_id)
-    update_task(task_id, stage="parsing", message="Starting ingestion...")
     try:
-        # Scoped to the uploading tenant: their upload should cost their corpus, not a
-        # scan of every other tenant's documents (see ingestion/loaders.iter_corpus_files).
-        result = build_index(
-            owner=owner,
-            on_stage=lambda stage, message: update_task(task_id, stage=stage, message=message),
-        )
-        logger.info(
-            "background ingestion complete",
-            extra={
-                "indexed_chunks": result.indexed_chunks,
-                "changed_files": result.changed_files,
-                "skipped_files": result.skipped_files,
-                "removed_files": result.removed_files,
-            },
-        )
-        if result.changed_files == 0 and result.removed_files == 0:
-            message = "No changes detected -- file content matched what was already indexed."
-        else:
-            message = (
-                f"Indexed {result.indexed_chunks} chunk(s) from {result.changed_files} "
-                f"file(s); local search is up to date."
+        existing = get_task(task_id)
+        attempt = (existing.attempts if existing else 0) + 1
+        while True:
+            update_task(task_id, stage="parsing", message="Starting ingestion...", attempts=attempt)
+            try:
+                # Scoped to the uploading tenant: their upload should cost their corpus, not
+                # a scan of every other tenant's documents (see ingestion/loaders).
+                result = build_index(
+                    owner=owner,
+                    on_stage=lambda stage, message: update_task(
+                        task_id, stage=stage, message=message
+                    ),
+                )
+            except Exception as exc:
+                logger.exception("background ingestion failed (attempt %d)", attempt)
+                if attempt >= settings.ingest_max_attempts:
+                    update_task(
+                        task_id,
+                        stage="failed",
+                        message=f"Indexing failed after {attempt} attempt(s).",
+                        error=str(exc),
+                        attempts=attempt,
+                    )
+                    return
+                update_task(
+                    task_id,
+                    stage="queued",
+                    message=f"Attempt {attempt} failed; retrying.",
+                    error=str(exc),
+                    attempts=attempt,
+                )
+                # What makes this a retry rather than a tight loop against a provider that is
+                # rate-limiting us.
+                time.sleep(settings.ingest_retry_delay_seconds)
+                attempt += 1
+                continue
+
+            # Charged here rather than at the endpoint, because the endpoint returns 202
+            # before any of this has happened and the cost is not knowable until it has.
+            # Embeddings and vision calls do not report usage the way chat completions do,
+            # so the amounts are estimates -- see budget.charge_ingest.
+            budget.charge_ingest(owner, result.embedded_chars, result.vision_calls)
+            logger.info(
+                "background ingestion complete",
+                extra={
+                    "indexed_chunks": result.indexed_chunks,
+                    "changed_files": result.changed_files,
+                    "skipped_files": result.skipped_files,
+                    "removed_files": result.removed_files,
+                    "embedded_chars": result.embedded_chars,
+                    "vision_calls": result.vision_calls,
+                    "attempts": attempt,
+                },
             )
-        update_task(task_id, stage="indexed", message=message, indexed_chunks=result.indexed_chunks)
-    except Exception as exc:
-        logger.exception("background ingestion failed")
-        update_task(task_id, stage="failed", message="Indexing failed.", error=str(exc))
+            if result.changed_files == 0 and result.removed_files == 0:
+                message = "No changes detected -- file content matched what was already indexed."
+            else:
+                message = (
+                    f"Indexed {result.indexed_chunks} chunk(s) from {result.changed_files} "
+                    f"file(s); local search is up to date."
+                )
+            update_task(
+                task_id,
+                stage="indexed",
+                message=message,
+                indexed_chunks=result.indexed_chunks,
+                attempts=attempt,
+            )
+            return
     finally:
         trace_id_var.reset(token)
 
@@ -445,6 +533,14 @@ async def ingest_document(
             detail=f"Unsupported file type {suffix!r}. Supported types: {sorted(SUPPORTED_SUFFIXES)}.",
         )
 
+    # Before the upload is accepted, not after: ingest is the expensive path (an embedding
+    # per chunk, a vision call per figure), and streaming 25MB to disk first only to reject
+    # it wastes the one resource the budget is protecting.
+    try:
+        budget.enforce(auth.get_owner())
+    except budget.BudgetExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+
     settings = get_settings()
     # Written into the uploading tenant's subtree, which is what makes the document private
     # to them; the public tenant keeps writing flat, so an open demo's layout is unchanged.
@@ -458,6 +554,10 @@ async def ingest_document(
     dest_path = dest_dir / dest_name
 
     size_bytes = 0
+    # Hashed while streaming rather than by re-reading the file afterwards: the bytes are
+    # already passing through, and a second full read of a 25MB upload to learn something
+    # this loop could have computed for free is pure latency.
+    digest = hashlib.sha256()
     try:
         with dest_path.open("wb") as out:
             while chunk := await file.read(_UPLOAD_CHUNK_BYTES):
@@ -467,6 +567,7 @@ async def ingest_document(
                         status_code=413,
                         detail=f"File exceeds the {_MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit.",
                     )
+                digest.update(chunk)
                 out.write(chunk)
     except HTTPException:
         dest_path.unlink(missing_ok=True)
@@ -484,7 +585,36 @@ async def ingest_document(
 
     logger.info("upload persisted", extra={"dest_name": dest_name, "size_bytes": size_bytes})
 
-    task = create_task(filename=dest_name, original_filename=file.filename)
+    # Owner-scoped: two tenants uploading identical bytes are two separate ingests into two
+    # separate subtrees, and collapsing them would put one tenant's document in the other's
+    # corpus. Same bytes from the same tenant is the case worth collapsing -- that is a retry
+    # after a timeout, or a double-clicked upload button.
+    content_hash = f"{auth.get_owner()}:{digest.hexdigest()}"
+    existing = ingest_tasks.find_task_by_content(content_hash)
+    if existing is not None and existing.stage != "failed":
+        # The duplicate upload is discarded rather than indexed. `build_index` would skip it
+        # by fingerprint anyway, but only after the file was written into the corpus, where
+        # it would sit forever as a second copy under a different UUID suffix.
+        dest_path.unlink(missing_ok=True)
+        logger.info(
+            "duplicate upload collapsed onto the existing task",
+            extra={"task_id": existing.task_id, "original_filename": file.filename},
+        )
+        return IngestResponse(
+            task_id=existing.task_id,
+            filename=existing.filename,
+            original_filename=existing.original_filename,
+            size_bytes=size_bytes,
+            status=existing.stage,
+            message="This file was already uploaded; returning the original ingest task.",
+        )
+
+    task = create_task(
+        filename=dest_name,
+        original_filename=file.filename,
+        content_hash=content_hash,
+        owner=auth.get_owner(),
+    )
     background_tasks.add_task(
         _run_ingest_in_background, get_trace_id(), task.task_id, auth.get_owner()
     )
@@ -512,6 +642,12 @@ def ingest_url(
     runs it in the threadpool, and the fetch (bounded by FETCH_TIMEOUT_SECONDS) happens before
     the 202 goes out so an unreachable/blocked/empty URL fails the request itself instead of
     a background task the client would have to poll to discover."""
+    # Before the fetch, for the same reason as the upload path: the network round trip and
+    # the indexing behind it are what the budget is protecting.
+    try:
+        budget.enforce(auth.get_owner())
+    except budget.BudgetExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     try:
         page = fetch_page(body.url)
     except UrlIngestError as exc:
@@ -620,6 +756,18 @@ def _persist_exchange(body: ResearchRequest, final_state: dict) -> str | None:
 @global_limiter.limit(_global_limit)
 def research(request: Request, body: ResearchRequest) -> ResearchResponse:
     history = _resolve_history(body)
+    owner = auth.get_owner()
+    # 429 before any model is called, rather than after the bill. Disabled by default; see
+    # budget.py for why the charge lands after the run rather than being pre-authorised.
+    try:
+        budget.enforce(owner)
+    except budget.BudgetExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    accountant = budget.TokenAccountant()
+    # Incremented around the graph run only, not the whole handler: the gauge is meant to
+    # answer "how many worker threads are tied up in a graph right now", which is what
+    # saturation looks like against API_THREADPOOL_SIZE.
+    metrics.research_in_flight.inc()
     try:
         result = _graph.invoke(
             {
@@ -627,16 +775,25 @@ def research(request: Request, body: ResearchRequest) -> ResearchResponse:
                 "chat_history": history,
                 "trace_id": get_trace_id(),
                 # Retrieval is scoped to this tenant -- see ingestion/ownership.py.
-                "owner": auth.get_owner(),
+                "owner": owner,
                 "filters": body.filters,
             },
-            config={"recursion_limit": _RECURSION_LIMIT},
+            # The accountant rides the config so it reaches every node and nested LLM call;
+            # a contextvar would not reliably survive LangGraph's thread scheduling.
+            config={"recursion_limit": _RECURSION_LIMIT, "callbacks": [accountant]},
         )
     except Exception as exc:
         logger.exception("research failed for question=%r", body.question)
         metrics.record_graph_run(None, "error")
+        # Charged even on failure: a run that errored after four LLM calls cost exactly as
+        # much as one that succeeded, and not charging it would make failure the cheap way to
+        # exhaust a provider quota.
+        budget.charge(owner, accountant.total_tokens)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        metrics.research_in_flight.dec()
 
+    budget.charge(owner, accountant.total_tokens)
     metrics.record_graph_run(result.get("route"), "ok")
     conversation_id = _persist_exchange(body, result)
 
@@ -663,6 +820,7 @@ async def _stream_research_events(
     connection = _StreamConnection()
     _active_streams.add(connection)
     metrics.sse_streams_active.inc()
+    accountant = budget.TokenAccountant()
     try:
         final_state: dict = {}
         # Two stream modes at once: "updates" drives the per-node progress frames, and
@@ -676,7 +834,7 @@ async def _stream_research_events(
                 "owner": owner,
                 "filters": body.filters,
             },
-            config={"recursion_limit": _RECURSION_LIMIT},
+            config={"recursion_limit": _RECURSION_LIMIT, "callbacks": [accountant]},
             stream_mode=["updates", "messages"],
         ).__aiter__()
         # Bounds total time spent waiting on the graph, not any single node -- each
@@ -752,6 +910,10 @@ async def _stream_research_events(
         error_event = StreamEvent(type="error", detail=detail)
         yield f"data: {error_event.model_dump_json()}\n\n"
     finally:
+        # In `finally` so every exit charges: success, error, timeout, and the shutdown path
+        # that returns early mid-stream. A client disconnecting halfway through still spent
+        # whatever the graph had already spent by then.
+        budget.charge(owner, accountant.total_tokens)
         _active_streams.discard(connection)
         metrics.sse_streams_active.dec()
 
@@ -767,8 +929,16 @@ async def research_stream(request: Request, body: ResearchRequest) -> StreamingR
     # The owner is resolved here rather than inside the generator: `auth.owner_var` is a
     # contextvar reset when the request handler returns, and the generator runs *after* that,
     # while the response streams. Reading it lazily would see the default tenant.
+    owner = auth.get_owner()
+    # Checked here, not in the generator, for the same reason the 404 above is: once the
+    # generator yields its first frame the status is locked at 200, and an exhausted budget
+    # would have to be reported as an SSE error frame that no HTTP client can act on.
+    try:
+        budget.enforce(owner)
+    except budget.BudgetExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     return StreamingResponse(
-        _stream_research_events(body, history, auth.get_owner()),
+        _stream_research_events(body, history, owner),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -844,6 +1014,40 @@ def list_sources() -> list[IndexedSource]:
         if entry.get("owner", auth.PUBLIC_OWNER) in allowed
     ]
     return sources
+
+
+@app.delete("/api/v1/tenant/data", response_model=TenantPurgeResponse)
+@limiter.limit(_per_ip_limit)
+async def purge_tenant_data(request: Request) -> TenantPurgeResponse:
+    """Erases everything belonging to the calling tenant: indexed documents, embeddings,
+    parent sections, manifest entries, conversations and feedback.
+
+    Scoped to the caller rather than taking an owner parameter. A tenant may erase their own
+    data; erasing someone else's is an administrative action that should not share an
+    endpoint with it, where a single wrong argument is the difference. DELETE maps to the
+    `write` scope through the usual middleware, so a read-only key gets a 403.
+    """
+    owner = auth.get_owner()
+    try:
+        result = tenancy.purge_tenant(owner)
+    except Exception as exc:
+        logger.exception("tenant purge failed for owner=%r", owner)
+        raise HTTPException(status_code=500, detail=f"Purge failed: {exc}") from exc
+
+    auth.audit(
+        "tenant data purged",
+        path="/api/v1/tenant/data",
+        method="DELETE",
+        outcome=f"sources={result.sources},conversations={result.conversations}",
+    )
+    return TenantPurgeResponse(
+        owner=owner,
+        sources_removed=result.sources,
+        chunks_removed=result.chunks,
+        conversations_removed=result.conversations,
+        feedback_removed=result.feedback,
+        corpus_files_removed=result.files_removed,
+    )
 
 
 @app.get("/api/v1/conversations", response_model=list[ConversationSummary])

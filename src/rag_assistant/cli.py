@@ -9,6 +9,7 @@ from rich.table import Table
 from rag_assistant.eval.baseline import (
     DEFAULT_TOLERANCE,
     BaselineNotFound,
+    BaselineStale,
     compare,
     load_baseline,
     save_baseline,
@@ -430,7 +431,10 @@ def eval_(
 
         try:
             baseline = load_baseline()
-        except BaselineNotFound as exc:
+        except (BaselineNotFound, BaselineStale) as exc:
+            # Exit 2, distinct from the exit 1 a real regression produces: "the gate could not
+            # run" and "the gate ran and failed" call for completely different responses, and
+            # a shared exit code makes a misconfiguration look like a quality regression.
             console.print(f"[red]{exc}[/red]")
             raise typer.Exit(code=2) from exc
 
