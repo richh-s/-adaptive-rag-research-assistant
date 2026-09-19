@@ -46,6 +46,65 @@ jobs:
           path: coverage.xml
           if-no-files-found: ignore
 
+  # The Postgres-backed backends (conversations and the pgvector index) were previously
+  # verifiable only on a developer machine, which meant the claim "swapping the backend
+  # changes nothing observable" rested on whoever last remembered to run them locally. A
+  # service container is cheap enough that it should not.
+  postgres:
+    runs-on: ubuntu-latest
+    env:
+      GOOGLE_API_KEY: ci-test-key
+      ANTHROPIC_API_KEY: ""
+      RAG_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+    services:
+      postgres:
+        # pgvector's own image rather than the stock postgres one: the vector extension has
+        # to be installed in the server, and `CREATE EXTENSION` cannot conjure it.
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --frozen --extra postgres
+      # Named explicitly rather than running the whole suite: these two files are the ones
+      # that skip without a database, so running them here is what turns a silent skip into
+      # a real result.
+      - name: Postgres-backed backends
+        shell: bash
+        run: |
+          set -o pipefail
+          uv run pytest -q --no-cov -rs \
+            tests/test_postgres_store.py tests/test_pgvector_store.py | tee pg-tests.log
+          # Both suites skip themselves when no database is reachable, which is correct on a
+          # developer machine and useless here: without this check an unreachable service
+          # container produces a green job that verified nothing at all.
+          if grep -q "skipped" pg-tests.log; then
+            echo "::error::Postgres suites skipped -- the service container was not reachable."
+            exit 1
+          fi
+      # These two modules are omitted from the main coverage gate, which runs without a
+      # database and would otherwise be measuring the absence of a service container. This is
+      # where they are actually measured, against only their own line count.
+      - name: Coverage gate for the Postgres-backed backends
+        run: |
+          uv run pytest -q \
+            --cov-config=.coveragerc.postgres \
+            --cov=rag_assistant.conversations.postgres_store \
+            --cov=rag_assistant.retrieval.pgvector_store \
+            --cov-report=term-missing --cov-fail-under=90 \
+            tests/test_postgres_store.py tests/test_pgvector_store.py
+
   frontend:
     runs-on: ubuntu-latest
     defaults:
@@ -125,7 +184,7 @@ jobs:
             echo "::notice::Eval gate skipped -- no GOOGLE_API_KEY secret configured."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           elif [ ! -f data/golden_eval/baseline.json ]; then
-            echo "::warning::Eval gate skipped -- no baseline recorded. Run 'uv run rag-assistant eval --limit 28 --record-baseline' against a known-good build and commit data/golden_eval/baseline.json to turn the gate on."
+            echo "::warning::Eval gate skipped -- no baseline recorded. Run 'uv run rag-assistant eval --limit 50 --record-baseline' against a known-good build and commit data/golden_eval/baseline.json to turn the gate on."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
@@ -135,7 +194,20 @@ jobs:
         run: uv run rag-assistant ingest
       - name: Eval gate
         if: steps.guard.outputs.enabled == 'true'
-        run: uv run rag-assistant eval --limit 28 --check
+        run: |
+          # Exit 2 means the gate could not run (no baseline, or one marked stale after a
+          # change that invalidated it) -- reported as a warning rather than a failure,
+          # because it is a signal to re-record deliberately with real keys, not evidence
+          # that retrieval got worse. Exit 1, a real regression, still fails the build.
+          set +e
+          uv run rag-assistant eval --limit 50 --check
+          status=$?
+          set -e
+          if [ "$status" = "2" ]; then
+            echo "::warning::Eval gate could not run -- re-record the baseline with 'uv run rag-assistant eval --limit 50 --record-baseline'."
+            exit 0
+          fi
+          exit $status
 
   docker:
     runs-on: ubuntu-latest

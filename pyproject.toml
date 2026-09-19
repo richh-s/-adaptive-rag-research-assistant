@@ -49,11 +49,21 @@ dependencies = [
 # code path is never reached. Install with `uv sync --extra rerank-cohere`.
 rerank-cohere = ["cohere>=5.13"]
 rerank-local = ["sentence-transformers>=3.3"]
-# Postgres-backed conversations, for running more than one replica (see
-# conversations/postgres_store.py). SQLite remains the default.
+# Postgres-backed conversations and/or vector index, for running more than one replica (see
+# conversations/postgres_store.py and retrieval/pgvector_store.py). SQLite and embedded
+# Chroma remain the defaults; the pgvector backend additionally needs the `vector` extension
+# available in the target database.
 postgres = [
     "psycopg-pool>=3.2",
     "psycopg[binary]>=3.2",
+]
+# Distributed tracing. Off unless OTEL_EXPORTER_OTLP_ENDPOINT is set, and not installed by
+# default because a collector is infrastructure -- the same stance as Redis and Postgres.
+# Without it the per-request trace_id still correlates logs; what is missing is the span
+# structure that shows where a nine-second request actually spent its time.
+otel = [
+    "opentelemetry-sdk>=1.29",
+    "opentelemetry-exporter-otlp-proto-http>=1.29",
 ]
 
 [project.scripts]
@@ -93,6 +103,13 @@ omit = [
     # counting it would mean either a permanently red number or fake tests that mock RAGAS
     # itself and assert nothing real.
     "src/rag_assistant/eval/*",
+    # The two Postgres-backed backends. Omitted *here* rather than left at 0%: this gate runs
+    # in a job with no database, where their coverage measures the absence of a service
+    # container and nothing about the suite. They are not unmeasured -- CI's `postgres` job
+    # runs them against a real pgvector/pgvector:pg17 service and gates them at 90% on their
+    # own, which is a real number rather than one diluted by 3,000 lines of unrelated code.
+    "src/rag_assistant/conversations/postgres_store.py",
+    "src/rag_assistant/retrieval/pgvector_store.py",
 ]
 
 [tool.coverage.report]

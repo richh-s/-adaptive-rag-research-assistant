@@ -4,6 +4,7 @@ from pathlib import Path
 from rag_assistant.auth import PUBLIC_OWNER
 from rag_assistant.cache import cache_get, cache_key, cache_set
 from rag_assistant.config import get_settings
+from rag_assistant.content_trust import fence_block, new_nonce
 from rag_assistant.graph.state import ResearchState
 from rag_assistant.ingestion.manifest import load_manifest
 from rag_assistant.ingestion.ownership import display_source, visible_owners
@@ -57,7 +58,12 @@ def route_query(state: ResearchState) -> dict:
 
     llm = get_structured_llm(RouteDecision)
     decision: RouteDecision = llm.invoke(
-        ROUTER_PROMPT.format(question=question, corpus_description=corpus_description)
+        ROUTER_PROMPT.format(
+            question=question,
+            corpus_description=fence_block(
+                corpus_description, nonce=new_nonce(), label="CORPUS CONTENTS"
+            ),
+        )
     )
     result = {"route": decision.route, "route_reasoning": decision.reasoning}
     cache_set(key, result, get_settings().cache_ttl_router)

@@ -104,6 +104,21 @@ class GoldenQuestion(BaseModel):
     ground_truth: str
     reference_contexts: list[str]
     expected_route: Literal["vector", "web", "both", "none"]
+    # Every route a careful reviewer would accept for this question, including
+    # `expected_route`. Empty means "only `expected_route`", which keeps rows written before
+    # this field valid.
+    #
+    # Routing is genuinely ambiguous for a real share of questions -- asking for a company's
+    # private GPU count can defensibly go to `web` alone or to `both` -- and a dataset that
+    # asserts one answer measures its own labelling as much as the router. The gate worked
+    # regardless, because routing is deterministic at temperature 0 and a regression moves
+    # the number well past tolerance; what it could not do was report an absolute figure
+    # anyone should quote. This is what makes `route_accuracy` mean "the router chose
+    # defensibly" rather than "the router chose what one reviewer wrote down".
+    #
+    # Widened only where a second route is genuinely defensible, never to make a failing gate
+    # pass -- a dataset edited until the number looks good measures nothing at all.
+    acceptable_routes: list[Literal["vector", "web", "both", "none"]] = []
     expected_sources: list[str]
     # What this row is testing. Defaulted so rows written before categories existed stay
     # valid, and so adding a category later never invalidates the dataset.

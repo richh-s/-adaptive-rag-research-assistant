@@ -21,8 +21,10 @@ into the corpus directory is invisible to keyword search until `ingest` runs -- 
 honest behaviour, since it was already invisible to vector search.
 """
 
+import logging
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,6 +40,8 @@ from rag_assistant.schemas.models import RetrievedDoc
 # Deliberately simple: no stemming, no stopword removal. BM25 is sensitive to exact token
 # overlap, so e.g. "founded" vs "founding" won't match -- an accepted simplification for a
 # small, low-vocabulary-variance corpus, not a production-grade tokenizer.
+logger = logging.getLogger(__name__)
+
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -54,6 +58,11 @@ class Bm25State:
 
     index: IncrementalBM25 = field(default_factory=IncrementalBM25)
     documents: dict[str, Document] = field(default_factory=dict)
+    # The shared index version this was built from, and when that was last verified. Both are
+    # meaningless on the file-backed default, where this process is the only writer and
+    # `invalidate_bm25_index` is called directly by the ingest that changed things.
+    built_at_version: int = 0
+    last_version_check: float = 0.0
 
 
 _index_cache: dict[str, Bm25State] = {}
@@ -85,20 +94,85 @@ def _fetch_chunks(persist_dir: Path, ids: list[str] | None = None) -> list[tuple
 
 
 def _build_index(persist_dir: Path) -> Bm25State:
-    state = Bm25State()
+    # Version first, chunks second, and the order matters. An ingest landing between the two
+    # reads is then reflected in the chunks but *not* in the recorded version, so the next
+    # poll sees a mismatch and rebuilds -- one wasted rebuild. Reading the chunks first would
+    # record a version newer than the data it describes, and this replica would serve a stale
+    # keyword index forever with nothing to signal it.
+    version = _shared_index_version()
+    state = Bm25State(built_at_version=version, last_version_check=time.monotonic())
     for chunk_id, document in _fetch_chunks(persist_dir):
         state.index.add(chunk_id, _tokenize(document.page_content))
         state.documents[chunk_id] = document
     return state
 
 
+def _shared_backend() -> bool:
+    return get_settings().vector_backend == "pgvector"
+
+
+def _shared_index_version() -> int:
+    """The current index version, or 0 when there is no shared backend to ask.
+
+    Best-effort: a database blip here must not take keyword search down. Failing closed
+    (returning the state's own version) would hide a real staleness signal, so this returns 0
+    and lets the caller treat "unknown" as "no reason to rebuild" -- the same answer it gives
+    on the single-process default.
+    """
+    if not _shared_backend():
+        return 0
+    try:
+        from rag_assistant.retrieval.pgvector_store import current_index_version
+
+        return current_index_version()
+    except Exception:
+        logger.warning("Could not read the shared index version", exc_info=True)
+        return 0
+
+
 def get_bm25_index(persist_dir: Path | None = None) -> Bm25State:
+    """The in-memory keyword index, rebuilt when the shared index has moved on.
+
+    On the file-backed default this is the lazy singleton it always was: one process writes
+    and that same process invalidates, so nothing else can make it stale.
+
+    With a shared backend there is a second way to become stale that no local call can catch
+    -- another replica ingesting. Each replica records the index version it built from and
+    re-checks it at most once every `BM25_VERSION_POLL_SECONDS`, rebuilding on a mismatch.
+    That is a poll rather than a subscription on purpose: it needs no message broker, no
+    delivery guarantee and no reconnect logic, and it converges in bounded time from any
+    state, including a replica that was down while three ingests happened. The cost is one
+    indexed single-row read per replica per interval, and the exposure is at most that
+    interval of stale keyword hits -- which degrades ranking slightly, never correctness,
+    because vector retrieval and grading still see the new chunks.
+    """
     settings = get_settings()
     resolved = str(persist_dir or settings.chroma_persist_dir)
     if resolved not in _index_cache:
         with _index_lock:
             if resolved not in _index_cache:
                 _index_cache[resolved] = _build_index(Path(resolved))
+        return _index_cache[resolved]
+
+    state = _index_cache[resolved]
+    if not _shared_backend():
+        return state
+
+    now = time.monotonic()
+    if now - state.last_version_check < settings.bm25_version_poll_seconds:
+        return state
+    state.last_version_check = now
+    current = _shared_index_version()
+    if current == state.built_at_version:
+        return state
+
+    logger.info(
+        "BM25 index is stale (built at version %d, shared index is at %d) -- rebuilding",
+        state.built_at_version,
+        current,
+    )
+    with _index_lock:
+        _index_cache[resolved] = _build_index(Path(resolved))
     return _index_cache[resolved]
 
 

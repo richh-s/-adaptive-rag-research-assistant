@@ -17,6 +17,16 @@ copied because the snapshot has already folded them in.
 Vector segment files (HNSW binaries) are copied as plain files, so the backup holds the
 ingestion lock to stop this process from mutating them mid-copy. That covers ingestion, which
 is the only thing that writes them.
+
+Not all of that state is necessarily on disk. `VECTOR_BACKEND=pgvector` moves the vectors,
+the ingestion manifest and the parent sections into Postgres, and
+`CONVERSATIONS_BACKEND=postgres` moves the transcripts. Archiving only the directories in
+that configuration produces something far worse than a failure: a well-formed archive whose
+metadata reports eight indexed sources and which restores an empty index, with no error
+anywhere. So the Postgres-backed tables are dumped into the archive too, under `postgres/`,
+and a restore refuses when the archive holds tables the target deployment is not configured
+to receive -- restoring an index into a backend nobody reads is the same silent emptiness by
+another route.
 """
 
 import json
@@ -25,7 +35,7 @@ import shutil
 import sqlite3
 import tarfile
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,10 +46,29 @@ from rag_assistant.ingestion.splitter import CHUNKING_VERSION
 
 logger = logging.getLogger(__name__)
 
-BACKUP_FORMAT_VERSION = 1
+# 2 adds the `postgres/` dump. Bumped rather than left at 1 because an older build reading a
+# v2 archive would ignore that directory and cheerfully restore an empty index -- exactly the
+# failure this version exists to remove. The version check makes it refuse instead.
+BACKUP_FORMAT_VERSION = 2
 METADATA_FILENAME = "backup_metadata.json"
 CHROMA_DIR = "chroma"
 CORPUS_DIR = "corpus"
+POSTGRES_DIR = "postgres"
+
+# Dumped in this order and restored in it, because `messages` and `feedback` reference
+# `conversations`. Grouped by the setting that puts them in Postgres at all.
+_PGVECTOR_TABLES = (
+    "corpus_manifest",
+    "corpus_parents",
+    "corpus_index_state",
+    "corpus_index_metadata",
+    "corpus_chunks",
+)
+_CONVERSATION_TABLES = ("conversations", "messages", "feedback")
+
+# Columns Postgres cannot infer a type for from a text parameter. `vector` and `jsonb` both
+# arrive as strings and have to be cast explicitly on insert, or the row is rejected.
+_COLUMN_CASTS = {"embedding": "::vector", "metadata": "::jsonb", "entry": "::jsonb"}
 
 _SQLITE_SUFFIXES = {".sqlite3", ".sqlite", ".db"}
 # Folded into the snapshot by the online backup API; copying them over a consistent snapshot
@@ -60,6 +89,9 @@ class BackupMetadata:
     indexed_sources: int
     corpus_files: int
     conversations: int
+    # Which Postgres tables the archive carries. Defaulted so a v1 archive, which has none,
+    # still loads into this dataclass rather than failing to parse.
+    postgres_tables: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -111,6 +143,121 @@ def _copy_tree_consistently(source_dir: Path, destination_dir: Path) -> None:
             shutil.copy2(path, target)
 
 
+def configured_postgres_tables() -> list[str]:
+    """The Postgres tables this deployment keeps state in, in dependency order."""
+    settings = get_settings()
+    tables: list[str] = []
+    if settings.vector_backend == "pgvector":
+        tables.extend(_PGVECTOR_TABLES)
+    if settings.conversations_backend == "postgres":
+        tables.extend(_CONVERSATION_TABLES)
+    return tables
+
+
+def _pg_connection():
+    """A direct connection for dump/restore, rather than either module's pool.
+
+    Backup is a one-shot operation that must work in a CLI process which has not otherwise
+    touched the stores, and borrowing a pool would mean initialising a vector store and
+    running migrations as a side effect of taking a backup.
+    """
+    import psycopg
+
+    database_url = get_settings().database_url
+    if not database_url:
+        raise RuntimeError(
+            "A Postgres-backed backend is configured but DATABASE_URL is not set, so the "
+            "backup cannot include its tables. Refusing to write an archive that would "
+            "silently omit the index."
+        )
+    return psycopg.connect(database_url)
+
+
+def _dump_postgres(staging: Path, tables: list[str]) -> list[str]:
+    """Writes one JSONL file per table into `staging`. Returns the tables actually dumped.
+
+    All tables are read inside a single REPEATABLE READ transaction so they are mutually
+    consistent: a manifest naming chunk ids that the chunk dump does not contain is precisely
+    the divergence the shared-state work exists to prevent, and it would be reintroduced by
+    reading the four tables at four different instants.
+    """
+    from psycopg import IsolationLevel
+
+    if not tables:
+        return []
+    staging.mkdir(parents=True, exist_ok=True)
+    dumped: list[str] = []
+    with _pg_connection() as conn:
+        conn.read_only = True
+        conn.isolation_level = IsolationLevel.REPEATABLE_READ
+        with conn.cursor() as cur:
+            for table in tables:
+                try:
+                    cur.execute(f"SELECT * FROM {table}")
+                except Exception:
+                    # A table that does not exist yet (nothing ingested, or conversations
+                    # never used) is not an error -- there is simply nothing to archive.
+                    logger.debug("skipping absent table %s", table, exc_info=True)
+                    conn.rollback()
+                    continue
+                columns = [d[0] for d in cur.description]
+                path = staging / f"{table}.jsonl"
+                count = 0
+                with path.open("w") as out:
+                    for row in cur:
+                        out.write(json.dumps(dict(zip(columns, row)), default=str) + "\n")
+                        count += 1
+                dumped.append(table)
+                logger.info("dumped %d row(s) from %s", count, table)
+    return dumped
+
+
+def _adapt(column: str, value):
+    """Re-serialises a value the dump round-tripped into a Python object.
+
+    psycopg deserialises `jsonb` into dicts and lists on read, and cannot adapt those back on
+    write -- `%s::jsonb` needs the JSON text. Only the columns that are cast need this;
+    everything else round-trips as-is, and `vector` already arrives as its text form.
+    """
+    if _COLUMN_CASTS.get(column) == "::jsonb" and not isinstance(value, str):
+        return json.dumps(value)
+    return value
+
+
+def _load_postgres(staging: Path, tables: list[str]) -> None:
+    """Replaces the contents of each dumped table, in dependency order, in one transaction.
+
+    Delete-then-insert rather than upsert, because a restore is a replacement: rows that
+    exist now and not in the archive must not survive it. One transaction so a failure
+    partway leaves the database as it was rather than half-restored.
+    """
+    present = [t for t in tables if (staging / f"{t}.jsonl").exists()]
+    if not present:
+        return
+    with _pg_connection() as conn:
+        with conn.cursor() as cur:
+            # Reverse order for the deletes: children before parents, or the FK from
+            # `messages` to `conversations` rejects the delete.
+            for table in reversed(present):
+                cur.execute(f"DELETE FROM {table}")
+            for table in present:
+                rows = [
+                    json.loads(line)
+                    for line in (staging / f"{table}.jsonl").read_text().splitlines()
+                    if line.strip()
+                ]
+                if not rows:
+                    continue
+                columns = list(rows[0].keys())
+                placeholders = ", ".join(f"%s{_COLUMN_CASTS.get(column, '')}" for column in columns)
+                cur.executemany(
+                    f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+                    [tuple(_adapt(column, row[column]) for column in columns) for row in rows],
+                )
+                logger.info("restored %d row(s) into %s", len(rows), table)
+        conn.commit()
+
+
 def _count_conversations(persist_dir: Path) -> int:
     database = get_settings().conversations_db_path
     if not database.exists():
@@ -127,7 +274,9 @@ def _count_conversations(persist_dir: Path) -> int:
         return 0
 
 
-def _gather_metadata(persist_dir: Path, corpus_dir: Path) -> BackupMetadata:
+def _gather_metadata(
+    persist_dir: Path, corpus_dir: Path, postgres_tables: list[str] | None = None
+) -> BackupMetadata:
     index_metadata = load_index_metadata(persist_dir)
     return BackupMetadata(
         format_version=BACKUP_FORMAT_VERSION,
@@ -140,6 +289,7 @@ def _gather_metadata(persist_dir: Path, corpus_dir: Path) -> BackupMetadata:
         if corpus_dir.exists()
         else 0,
         conversations=_count_conversations(persist_dir),
+        postgres_tables=list(postgres_tables or []),
     )
 
 
@@ -170,7 +320,12 @@ def create_backup(
 
     with INGEST_LOCK, tempfile.TemporaryDirectory() as staging_name:
         staging = Path(staging_name)
-        metadata = _gather_metadata(persist_dir, corpus_dir)
+        # Dumped first so the metadata can record what the archive actually holds rather than
+        # what it was asked to hold. A `DATABASE_URL` misconfiguration raises here, before any
+        # archive exists -- failing is the correct outcome, because the alternative is a
+        # well-formed backup missing the entire index.
+        dumped_tables = _dump_postgres(staging / POSTGRES_DIR, configured_postgres_tables())
+        metadata = _gather_metadata(persist_dir, corpus_dir, postgres_tables=dumped_tables)
         (staging / METADATA_FILENAME).write_text(
             json.dumps(asdict(metadata), indent=2, sort_keys=True) + "\n"
         )
@@ -265,8 +420,31 @@ def restore_backup(
 
         staged_chroma = staging / CHROMA_DIR
         staged_corpus = staging / CORPUS_DIR
-        if not staged_chroma.exists() and not staged_corpus.exists():
+        staged_postgres = staging / POSTGRES_DIR
+        if (
+            not staged_chroma.exists()
+            and not staged_corpus.exists()
+            and not staged_postgres.exists()
+        ):
             raise ValueError(f"{archive_path} contains neither an index nor a corpus.")
+
+        # Refused rather than skipped. Loading an archive's Postgres tables into a deployment
+        # configured for Chroma would put the index somewhere nothing reads, which looks
+        # exactly like a successful restore and serves nothing -- the same silent emptiness
+        # this whole mechanism exists to remove, arrived at from the other direction.
+        configured = set(configured_postgres_tables())
+        archived = set(metadata.postgres_tables)
+        if archived - configured:
+            raise ValueError(
+                f"{archive_path} holds Postgres-backed state ({', '.join(sorted(archived))}) "
+                "that this deployment is not configured to read. Set VECTOR_BACKEND / "
+                "CONVERSATIONS_BACKEND to match the backup before restoring, or the index "
+                "would be restored into a backend nothing reads."
+            )
+        if archived:
+            _load_postgres(
+                staged_postgres, [t for t in configured_postgres_tables() if t in archived]
+            )
 
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         previous_kept_at: Path | None = None
