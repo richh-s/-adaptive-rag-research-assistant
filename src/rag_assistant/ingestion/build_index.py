@@ -12,7 +12,7 @@ from rag_assistant.config import get_settings
 from rag_assistant.ingestion.loaders import LOADER_VERSION, iter_corpus_files, load_corpus_file
 from rag_assistant.ingestion.index_metadata import read_embedding_dimension, save_index_metadata
 from rag_assistant.ingestion import vision
-from rag_assistant.ingestion.describe import describe_document
+from rag_assistant.ingestion.describe import describe_document, document_context_line
 from rag_assistant.ingestion.manifest import load_manifest, save_manifest
 from rag_assistant.ingestion.splitter import CHUNKING_VERSION, split_with_parents
 from rag_assistant.ingestion.ownership import owner_of_relative_path
@@ -193,6 +193,13 @@ def build_index(
 
             docs = load_corpus_file(corpus_file)
             parsed_files += 1
+            # Before chunking, because every chunk is prefixed with it below.
+            description = None
+            if describe:
+                description_calls += 1
+                description = describe_document(
+                    Path(source).name, "\n\n".join(d.page_content for d in docs)
+                )
 
             if existing:
                 removed_chunk_ids.extend(existing["chunk_ids"])
@@ -204,8 +211,15 @@ def build_index(
             # compare numbers, and lexicographic date strings would only work by accident of
             # ISO formatting.
             indexed_at = time.time()
+            # Prepended to what gets embedded and keyword-indexed, on top of the heading
+            # breadcrumb the splitter already charges against chunk_size. The breadcrumb says
+            # where in a document a chunk sits; this says *which* document, which is the part
+            # a corpus of near-identical annual reports turns on (see describe.py). Bounded
+            # by MAX_DESCRIPTION_CHARS, so it cannot crowd out the chunk it labels.
+            context_line = document_context_line(Path(source).name, description)
             for chunk in chunks:
                 chunk.metadata["ingested_at"] = indexed_at
+                chunk.page_content = f"{context_line}\n\n{chunk.page_content}"
             chunk_ids = _chunk_ids(source, chunks)
             if chunks:
                 store.add_documents(chunks, ids=chunk_ids)
@@ -226,10 +240,7 @@ def build_index(
                 "owner": corpus_file.owner,
             }
             if describe:
-                description_calls += 1
-                manifest[source]["description"] = describe_document(
-                    Path(source).name, "\n\n".join(d.page_content for d in docs)
-                )
+                manifest[source]["description"] = description
             indexed_chunks += len(chunks)
             embedded_chars += sum(len(chunk.page_content) for chunk in chunks)
             changed_files += 1

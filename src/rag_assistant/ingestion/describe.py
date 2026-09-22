@@ -12,6 +12,7 @@ exactly what it had before this existed.
 
 import logging
 import re
+from pathlib import Path
 
 from rag_assistant.content_trust import fence_block, new_nonce
 from rag_assistant.llm import get_chat_model
@@ -49,6 +50,22 @@ def clean_description(raw: str) -> str | None:
     if not line or line.lower().startswith("unknown -- unknown -- unknown"):
         return None
     return line[:MAX_DESCRIPTION_CHARS]
+
+
+def document_context_line(filename: str, description: str | None) -> str:
+    """The one line prepended to every chunk of a document before it is embedded.
+
+    A chunk carries the heading breadcrumb it came from but nothing about the document it came
+    from, and in a corpus of near-identical annual reports that is what decides a year-specific
+    question. Measured on 30 such reports: the passage answering "Ethiopian Reinsurance's
+    2020/21 profit before tax" reads "During the period under review, the Company has
+    registered Birr 220 million profit before tax" -- naming neither the company nor the year
+    -- and did not reach the top 20 for that question, though its own report took the first
+    four places.
+
+    Falls back to the filename: weak, but never worse than nothing.
+    """
+    return description or Path(filename).stem.replace("_", " ").replace("-", " ").strip()
 
 
 def describe_document(filename: str, text: str) -> str | None:

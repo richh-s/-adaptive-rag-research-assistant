@@ -32,7 +32,7 @@ from rag_assistant.ingestion.semantic_splitter import semantic_split
 # re-index -- without it, `build_index` would compare unchanged file hashes, skip every file,
 # and leave the collection full of chunks built by the previous strategy while the code
 # assumes the new one. Silent, and only visible as quietly worse retrieval.
-CHUNKING_VERSION = 4
+CHUNKING_VERSION = 5
 
 _HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*$")
 # A "#" inside a fenced code block is a comment, not a heading. Tracking fences costs one

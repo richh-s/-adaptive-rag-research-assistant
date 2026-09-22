@@ -188,3 +188,50 @@ def test_the_router_sees_the_label_next_to_the_filename(monkeypatch):
         described
     )
     assert "cbe" in described
+
+
+# ---- chunk context prefix ----
+
+
+def test_the_context_line_falls_back_to_the_filename():
+    assert describe.document_context_line("a.pdf", "CBE -- annual report -- 2010/11") == (
+        "CBE -- annual report -- 2010/11"
+    )
+    assert describe.document_context_line("Annual_Report_JUNE-2021.pdf", None) == (
+        "Annual Report JUNE 2021"
+    )
+
+
+def test_every_chunk_is_prefixed_with_its_document_label(
+    sample_corpus_dir, fake_embeddings, tmp_path, describing
+):
+    """A chunk carries its heading breadcrumb but nothing saying which document it came from,
+    which is what a corpus of near-identical annual reports turns on."""
+    persist_dir = tmp_path / "chroma"
+
+    build_index(source_dir=sample_corpus_dir, persist_dir=persist_dir, embeddings=fake_embeddings)
+
+    from rag_assistant.retrieval.vector_store import get_vector_store
+
+    stored = get_vector_store(embeddings=fake_embeddings, persist_dir=persist_dir)._collection.get(
+        include=["documents", "metadatas"]
+    )
+    for doc, meta in zip(stored["documents"], stored["metadatas"]):
+        assert doc.startswith(f"Label for {meta['source']}\n\n")
+    # The label is what makes the document findable by publisher, not just by its own words.
+    assert any("Constitutional AI" in doc for doc in stored["documents"])
+
+
+def test_chunks_are_prefixed_with_the_filename_when_labelling_is_off(
+    sample_corpus_dir, fake_embeddings, tmp_path
+):
+    persist_dir = tmp_path / "chroma"
+
+    build_index(source_dir=sample_corpus_dir, persist_dir=persist_dir, embeddings=fake_embeddings)
+
+    from rag_assistant.retrieval.vector_store import get_vector_store
+
+    stored = get_vector_store(embeddings=fake_embeddings, persist_dir=persist_dir)._collection.get(
+        include=["documents"]
+    )
+    assert any(doc.startswith("anthropic\n\n") for doc in stored["documents"])

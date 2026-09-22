@@ -459,10 +459,19 @@ uv run rag-assistant eval --dataset data/golden_eval/private/dataset.jsonl \
 ```
 
 Worth stating plainly, because it is the argument for doing this at all: run against 30 real
-scanned annual reports, this harness found four defects the unit suite could not (see
-[Self-audit](#self-audit-findings--fixes)) and measured an embedding-model change that unit
-tests can only assert *happened* — source recall 0.868 → 1.000 and MRR 0.882 → 0.961 on the
-same 50 questions.
+scanned annual reports, this harness found five defects the unit suite could not (see
+[Self-audit](#self-audit-findings--fixes)) and measured three changes unit tests can only
+assert *happened*, on the same 50 questions:
+
+| Change | Source recall | MRR | Context precision | Context recall |
+| --- | --- | --- | --- | --- |
+| Baseline (all-minilm, no labels) | 0.868 | 0.882 | 0.283 | 0.456 |
+| A stronger embedding model | 1.000 | 0.961 | 0.413 | 0.561 |
+| Per-chunk document context lines | 0.985 | **1.000** | **0.642** | **0.926** |
+
+The last row is the one that would have been hardest to guess: prefixing each chunk with its
+document's label costs one line per chunk and moved context recall further than changing the
+embedding model did.
 
 ### Retrieval tuning
 
@@ -864,7 +873,7 @@ happy-path correctness. Fixed:
 | Documentation | README implied RAGAS's semantic, LLM-judged `context_precision`/`context_recall`, when the harness actually runs the non-LLM overlap variants | Relabeled accurately, and noted the eval set is small and non-adversarial with no baseline comparison |
 
 A second pass, against a 30-document corpus of real scanned annual reports rather than the
-sample corpus, surfaced four more — every one of them invisible to the unit suite, and three
+sample corpus, surfaced five more — every one of them invisible to the unit suite, and four
 found by running the eval rather than by reading code:
 
 | Area | Finding | Fix |
@@ -873,6 +882,7 @@ found by running the eval rather than by reading code:
 | PDF vision | Every scanned page was read **twice**: transcribed, then "figure described" — because a scan's only embedded image is the page itself. Double the vision cost, the 20-image budget spent on scans instead of real charts, and a second looser copy whose numbers could contradict the transcript (4,081.50 transcribed vs 4,082.50 described, on a real CBE key-figures page) | The figure pass now runs only on pages that have a text layer. Figure-described pages fell 273 → 151 on the same corpus |
 | Non-English scans | Removing that duplicate pass also removed the one thing it did well — an English gloss that let English questions match an Amharic scan. Two eval rows regressed from correct to not-found | The transcription prompt now ends with an `[English summary: ...]` line when the page isn't in English — same single call. Both rows returned to rank 1 |
 | Eval harness | One provider timeout at question 40 aborted the whole run and discarded the 39 results before it; and a correct refusal that cites its context ("I don't have information on X; the procedure covers Y [1]") was scored as a confident answer | A failing question is scored as the failure it is and the run continues; abstention counts a citation-free answer *or* one opening with the refusal phrase the synthesis prompt mandates (shared constant, pinned by a test) |
+| Chunk context | A chunk carried its heading breadcrumb but nothing naming the document it came from. Across four near-identical Ethio Re reports and four CBE ones, the passage answering "Ethiopian Reinsurance's 2020/21 profit before tax" — "During the period under review, the Company has registered Birr 220 million profit before tax" — did not reach the top 20 for that question, though its own report took the first four places | Every chunk is prefixed with its document's label before embedding. That passage now ranks 8th, and across the 50 questions MRR reached 1.000 with context recall 0.561 → 0.926 |
 
 Verified with the full offline suite (68/68) plus a live end-to-end run: a real router call
 picked the `web` route for a live-price question, a simulated web-search outage was forced, and the
