@@ -12,6 +12,7 @@ from rag_assistant.eval.baseline import (
     BaselineStale,
     compare,
     load_baseline,
+    provenance_mismatch,
     save_baseline,
 )
 from rag_assistant.eval.golden_dataset import load_golden_dataset
@@ -447,6 +448,13 @@ def eval_(
             console.print(f"[red]{exc}[/red]")
             raise typer.Exit(code=2) from exc
 
+        mismatch = provenance_mismatch(baseline_path)
+        if mismatch:
+            console.print(
+                f"[yellow]Note: this run used different models than the baseline "
+                f"({mismatch}). A difference here is not necessarily a regression.[/yellow]"
+            )
+
         comparison = compare(deterministic, baseline, tolerance=tolerance)
         gate = Table(title=f"Baseline comparison (tolerance {tolerance:.2f})")
         gate.add_column("Metric")
@@ -465,6 +473,47 @@ def eval_(
             console.print(f"[red]Eval gate failed -- regressed: {names}[/red]")
             raise typer.Exit(code=1)
         console.print("[green]Eval gate passed.[/green]")
+
+
+@app.command()
+def labels(
+    relabel: str | None = typer.Option(
+        None, help="Re-describe this source from the text already in the index (no re-parse)."
+    ),
+    set_to: str | None = typer.Option(
+        None, "--set", help="Use this exact label instead of asking the model."
+    ),
+) -> None:
+    """Show the one-line label each indexed document carries, and fix a wrong one.
+
+    The label prefixes every chunk of its document and is what the router reads to decide
+    whether a question belongs to the local corpus -- so it is worth being able to see them."""
+    configure_logging()
+    from rag_assistant.ingestion.build_index import relabel_source
+    from rag_assistant.ingestion.manifest import load_manifest
+
+    persist_dir = get_settings().chroma_persist_dir
+    if relabel:
+        try:
+            new = relabel_source(relabel, persist_dir, label=set_to)
+        except KeyError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        console.print(f"[green]{relabel}[/green] -> {new!r}")
+        console.print(
+            "[yellow]The router sees this now; retrieval sees it after that file is "
+            "re-indexed, since the label is baked into its stored chunks.[/yellow]"
+        )
+        return
+
+    manifest = load_manifest(persist_dir)
+    table = Table(title="Document labels")
+    table.add_column("Source")
+    table.add_column("Label")
+    for source in sorted(manifest):
+        description = manifest[source].get("description")
+        table.add_row(source, description or "[dim]none -- router sees the filename[/dim]")
+    console.print(table)
 
 
 def main() -> None:

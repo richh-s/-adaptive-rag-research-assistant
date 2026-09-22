@@ -220,7 +220,9 @@ def _local_structured_runnable(model: _LocalChatOpenAI, schema: type) -> Runnabl
     )
 
 
-def get_structured_llm(schema: type, temperature: float = 0.0) -> Runnable:
+def get_structured_llm(
+    schema: type, temperature: float = 0.0, timeout: float | None = None
+) -> Runnable:
     """Structured-output runnable under the same provider priority.
 
     `with_structured_output()` must be bound per-provider before fallbacks are attached —
@@ -228,7 +230,7 @@ def get_structured_llm(schema: type, temperature: float = 0.0) -> Runnable:
     wrap the already-structured runnables rather than the raw chat models.
     """
     structured = []
-    for build in _provider_chain(temperature, streaming=False):
+    for build in _provider_chain(temperature, streaming=False, timeout=timeout):
         model = build()
         if isinstance(model, _LocalChatOpenAI):
             structured.append(_local_structured_runnable(model, schema))
@@ -251,6 +253,37 @@ class _JudgeChatAnthropic(ChatAnthropic):
         if name == "temperature":
             return
         super().__setattr__(name, value)
+
+
+def embedding_backend_unavailable(exc: BaseException) -> str | None:
+    """A message when `exc` is a self-hosted embedding server being unreachable, else None.
+
+    Worth distinguishing from every other failure because the response differs: embeddings
+    have no fallback, so this is "the dependency is down, retry" rather than "the request was
+    bad" or "something broke". Walks the cause chain because the connection error arrives
+    wrapped by whichever node was retrieving at the time.
+    """
+    settings = get_settings()
+    if settings.embedding_provider != "local":
+        return None
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, httpx.ConnectError | httpx.ConnectTimeout | httpx.ReadTimeout):
+            return (
+                f"The embedding server at {settings.local_embedding_base_url} is unreachable, "
+                "so questions cannot be answered. See /ready."
+            )
+        # openai's client wraps transport failures in its own class; matched by name to keep
+        # this module free of a hard dependency on its exception hierarchy.
+        if type(current).__name__ in {"APIConnectionError", "APITimeoutError"}:
+            return (
+                f"The embedding server at {settings.local_embedding_base_url} is unreachable, "
+                "so questions cannot be answered. See /ready."
+            )
+        current = current.__cause__ or current.__context__
+    return None
 
 
 def get_judge_chat_model() -> BaseChatModel:

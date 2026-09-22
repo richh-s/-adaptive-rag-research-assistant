@@ -477,3 +477,21 @@ def test_the_judge_model_ignores_ragas_setting_temperature(monkeypatch):
     assert judge.temperature is None
     assert judge.default_request_timeout == get_settings().judge_request_timeout_seconds
     assert get_settings().judge_request_timeout_seconds > get_settings().llm_request_timeout_seconds
+
+
+def test_grading_gets_a_longer_timeout_than_the_other_structured_calls(monkeypatch):
+    """Grading is structured like routing but sized like synthesis: one call carrying every
+    fused document. A timeout here does not fail the request -- the grader degrades to
+    "trust retrieval", which silently disables the corrective search a low-confidence answer
+    depends on."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    monkeypatch.setenv("GOOGLE_API_KEY", "")
+    from rag_assistant.schemas.models import DocGradeBatch
+
+    settings = get_settings()
+    graded = llm.get_structured_llm(DocGradeBatch, timeout=settings.grading_request_timeout_seconds)
+    routed = llm.get_structured_llm(DocGradeBatch)
+
+    assert graded.first.default_request_timeout == settings.grading_request_timeout_seconds
+    assert routed.first.default_request_timeout == settings.llm_request_timeout_seconds
+    assert settings.grading_request_timeout_seconds < settings.graph_timeout_seconds

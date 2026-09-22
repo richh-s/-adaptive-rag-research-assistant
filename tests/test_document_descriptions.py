@@ -257,3 +257,58 @@ def test_parent_sections_carry_the_label_too(
 
     assert parents
     assert all(text.startswith("Label for ") for text in parents.values())
+
+
+# ---- reviewing and correcting labels ----
+
+
+def test_a_label_can_be_set_by_hand_without_re_parsing(
+    sample_corpus_dir, fake_embeddings, tmp_path, describing
+):
+    """A wrong label is not cosmetic: it prefixes every chunk of its document and is what the
+    router reads. Correcting one must not mean re-parsing a PDF (and re-paying its vision
+    calls)."""
+    from rag_assistant.ingestion.build_index import relabel_source
+
+    persist_dir = tmp_path / "chroma"
+    build_index(source_dir=sample_corpus_dir, persist_dir=persist_dir, embeddings=fake_embeddings)
+
+    returned = relabel_source("anthropic.md", persist_dir, label="Anthropic -- profile -- 2025")
+
+    assert returned == "Anthropic -- profile -- 2025"
+    assert (
+        load_manifest(persist_dir)["anthropic.md"]["description"] == "Anthropic -- profile -- 2025"
+    )
+
+
+def test_relabelling_asks_the_model_from_stored_text(
+    sample_corpus_dir, fake_embeddings, tmp_path, describing, monkeypatch
+):
+    from rag_assistant.ingestion import build_index as module
+    from rag_assistant.ingestion.build_index import relabel_source
+
+    persist_dir = tmp_path / "chroma"
+    build_index(source_dir=sample_corpus_dir, persist_dir=persist_dir, embeddings=fake_embeddings)
+
+    seen = {}
+    monkeypatch.setattr(
+        module,
+        "describe_document",
+        lambda filename, text: seen.update(filename=filename, text=text) or "Fresh label",
+    )
+
+    assert relabel_source("mistral.md", persist_dir) == "Fresh label"
+    assert "Mixtral" in seen["text"]  # read back from the index, not from the file
+    assert load_manifest(persist_dir)["mistral.md"]["description"] == "Fresh label"
+
+
+def test_relabelling_something_that_is_not_indexed_is_an_error(
+    sample_corpus_dir, fake_embeddings, tmp_path
+):
+    from rag_assistant.ingestion.build_index import relabel_source
+
+    persist_dir = tmp_path / "chroma"
+    build_index(source_dir=sample_corpus_dir, persist_dir=persist_dir, embeddings=fake_embeddings)
+
+    with pytest.raises(KeyError):
+        relabel_source("never-ingested.pdf", persist_dir)

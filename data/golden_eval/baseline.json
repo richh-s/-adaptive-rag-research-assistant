@@ -6,5 +6,9 @@
     "source_recall": 0.9807692307692307
   },
   "note": "Recorded by `rag-assistant eval --record-baseline`. Re-record deliberately when a change is a genuine improvement; never to make a failing gate pass.",
-  "question_count": 50
+  "question_count": 50,
+  "recorded_with": {
+    "chat_provider": "Anthropic",
+    "embedding_model": "models/gemini-embedding-001"
+  }
 }

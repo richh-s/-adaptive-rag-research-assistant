@@ -1,6 +1,7 @@
 import logging
 
 from rag_assistant import metrics
+from rag_assistant.config import get_settings
 from rag_assistant.content_trust import build_untrusted_context, new_nonce
 from rag_assistant.llm import get_structured_llm
 from rag_assistant.prompts.grading_prompt import GRADING_PROMPT
@@ -31,7 +32,7 @@ def grade_documents(question: str, docs: list[FusedDocument]) -> list[DocGrade]:
             ", ".join(injection_categories),
             extra={"injection_categories": injection_categories},
         )
-    llm = get_structured_llm(DocGradeBatch)
+    llm = get_structured_llm(DocGradeBatch, timeout=get_settings().grading_request_timeout_seconds)
     try:
         result: DocGradeBatch = llm.invoke(
             GRADING_PROMPT.format(question=question, documents=numbered)

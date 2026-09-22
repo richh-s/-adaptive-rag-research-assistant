@@ -33,6 +33,7 @@ from rag_assistant.ingestion.ownership import display_source, owner_corpus_dir, 
 from rag_assistant.ingestion import tasks as ingest_tasks
 from rag_assistant.ingestion.tasks import create_task, get_task, update_task
 from rag_assistant.ingestion.url_fetch import UrlIngestError, fetch_page, page_to_markdown
+from rag_assistant.llm import embedding_backend_unavailable
 from rag_assistant.logging_conf import configure_logging
 from rag_assistant.readiness import (
     check_chroma,
@@ -55,6 +56,7 @@ from rag_assistant.schemas.api import (
     ResearchResponse,
     StreamEvent,
     TenantPurgeResponse,
+    TenantUsageResponse,
 )
 from rag_assistant.tracing import configure_otel, get_trace_id, new_trace_id, trace_id_var
 
@@ -791,7 +793,13 @@ def research(request: Request, body: ResearchRequest) -> ResearchResponse:
         # much as one that succeeded, and not charging it would make failure the cheap way to
         # exhaust a provider quota.
         budget.charge(owner, accountant.total_tokens)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        # 503, not 500, when the self-hosted embedding server is simply gone: it is a
+        # dependency outage a client should retry and an orchestrator should route around,
+        # not a defect in the request. Everything else stays a 500.
+        unavailable = embedding_backend_unavailable(exc)
+        raise HTTPException(
+            status_code=503 if unavailable else 500, detail=unavailable or str(exc)
+        ) from exc
     finally:
         metrics.research_in_flight.dec()
 
@@ -1016,6 +1024,27 @@ def list_sources() -> list[IndexedSource]:
         if entry.get("owner", auth.PUBLIC_OWNER) in allowed
     ]
     return sources
+
+
+@app.get("/api/v1/tenant/usage", response_model=TenantUsageResponse)
+@limiter.limit(_per_ip_limit)
+def tenant_usage(request: Request) -> TenantUsageResponse:
+    """What the calling tenant currently occupies in the index, and what it has spent today.
+
+    Scoped to the caller for the same reason the purge endpoint is: reading another tenant's
+    footprint is an administrative question, and it should not share an endpoint with reading
+    your own.
+    """
+    owner = auth.get_owner()
+    usage = tenancy.tenant_usage(owner)
+    return TenantUsageResponse(
+        owner=owner,
+        sources=usage.sources,
+        chunks=usage.chunks,
+        corpus_bytes=usage.corpus_bytes,
+        tokens_used_today=usage.tokens_used_today,
+        daily_token_budget=usage.daily_token_budget,
+    )
 
 
 @app.delete("/api/v1/tenant/data", response_model=TenantPurgeResponse)

@@ -16,8 +16,9 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from rag_assistant.config import PROJECT_ROOT
+from rag_assistant.config import PROJECT_ROOT, get_settings
 from rag_assistant.eval.metrics import EvalMetrics
+from rag_assistant.llm import primary_chat_provider_name
 
 DEFAULT_BASELINE_PATH = PROJECT_ROOT / "data" / "golden_eval" / "baseline.json"
 
@@ -83,6 +84,11 @@ def save_baseline(metrics: EvalMetrics, path: Path | None = None) -> Path:
     payload = {
         "question_count": metrics.question_count,
         "metrics": metrics.gated_scores(),
+        # Who produced these numbers. A baseline recorded against different models is not
+        # wrong, it is *incomparable*: swap the embedding model and retrieval changes; swap
+        # the chat provider and routing and abstention change. Recording it lets `--check`
+        # say so instead of reporting a provider difference as a quality regression.
+        "recorded_with": _provenance(),
         "note": (
             "Recorded by `rag-assistant eval --record-baseline`. Re-record deliberately when "
             "a change is a genuine improvement; never to make a failing gate pass."
@@ -90,6 +96,35 @@ def save_baseline(metrics: EvalMetrics, path: Path | None = None) -> Path:
     }
     target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return target
+
+
+def _provenance() -> dict[str, str]:
+    return {
+        "embedding_model": get_settings().embedding_model_name,
+        "chat_provider": primary_chat_provider_name(),
+    }
+
+
+def provenance_mismatch(path: Path | None = None) -> str | None:
+    """How the recorded baseline differs from the models about to be measured, or None.
+
+    Advisory rather than fatal: running against a different provider is a legitimate thing to
+    do (CI has different keys to a laptop), and refusing would make the gate useless there.
+    Saying nothing, though, turns "your embedding model changed" into "retrieval regressed".
+    """
+    source = path or DEFAULT_BASELINE_PATH
+    if not source.exists():
+        return None
+    recorded = json.loads(source.read_text()).get("recorded_with")
+    if not recorded:
+        return "the baseline predates provenance recording, so it cannot be compared on models"
+    current = _provenance()
+    differences = [
+        f"{key}: baseline {recorded[key]!r}, now {current[key]!r}"
+        for key in sorted(current)
+        if recorded.get(key) != current[key]
+    ]
+    return "; ".join(differences) or None
 
 
 def load_baseline(path: Path | None = None) -> dict[str, float]:

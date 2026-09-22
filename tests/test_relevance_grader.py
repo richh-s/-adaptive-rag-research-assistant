@@ -17,7 +17,7 @@ def test_grade_documents_returns_grades_in_order(monkeypatch):
 
     monkeypatch.setattr(
         "rag_assistant.grading.relevance_grader.get_structured_llm",
-        lambda schema: fake_structured_llm,
+        lambda schema, **kw: fake_structured_llm,
     )
 
     grades = grade_documents("question", [_doc("a"), _doc("b")])
@@ -36,7 +36,7 @@ def test_grade_documents_falls_back_when_grade_count_mismatches(monkeypatch):
 
     monkeypatch.setattr(
         "rag_assistant.grading.relevance_grader.get_structured_llm",
-        lambda schema: fake_structured_llm,
+        lambda schema, **kw: fake_structured_llm,
     )
 
     grades = grade_documents("question", [_doc("a"), _doc("b")])

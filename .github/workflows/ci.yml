@@ -105,6 +105,46 @@ jobs:
             --cov-report=term-missing --cov-fail-under=90 \
             tests/test_postgres_store.py tests/test_pgvector_store.py
 
+  # Same reasoning as the postgres job: the Redis-backed paths (answer cache, per-tenant
+  # budget, ingest task registry) were covered only by a hand-written fake, which agrees with
+  # whatever the code expects of it -- it cannot disagree about TTL semantics or about what a
+  # second client sees. A service container is cheap enough that it should not have to.
+  redis:
+    runs-on: ubuntu-latest
+    env:
+      GOOGLE_API_KEY: ci-test-key
+      ANTHROPIC_API_KEY: ""
+      RAG_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --frozen
+      - name: Redis-backed paths
+        shell: bash
+        run: |
+          set -o pipefail
+          uv run pytest -q --no-cov -rs tests/test_redis_backed.py | tee redis-tests.log
+          # The suite skips itself without RAG_TEST_REDIS_URL, which is correct on a laptop and
+          # useless here: an unreachable service container would otherwise be a green job that
+          # verified nothing.
+          if grep -q "skipped" redis-tests.log; then
+            echo "::error::Redis suite skipped -- the service container was not reachable."
+            exit 1
+          fi
+
   frontend:
     runs-on: ubuntu-latest
     defaults:

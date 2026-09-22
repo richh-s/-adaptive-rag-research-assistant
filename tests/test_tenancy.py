@@ -235,3 +235,36 @@ def test_research_passes_the_authenticated_owner_into_the_graph(monkeypatch):
 
     assert response.status_code == 200
     assert captured["owner"] == "alice"
+
+
+def test_tenant_usage_reports_only_the_callers_footprint(tmp_path, monkeypatch, fake_embeddings):
+    """Spend was metered per tenant while index size was not, so "what is this tenant costing
+    me" needed the manifest read by hand. Both halves now answer in one place -- scoped to the
+    caller, like the purge endpoint, because reading someone else's footprint is an
+    administrative question."""
+    from rag_assistant.ingestion.build_index import build_index
+    from rag_assistant.ingestion.ownership import owner_corpus_dir
+    from rag_assistant.config import get_settings
+    from rag_assistant.tenancy import tenant_usage
+
+    corpus = tmp_path / "corpus"
+    persist = tmp_path / "chroma"
+    mine = owner_corpus_dir(corpus, "alice")
+    theirs = owner_corpus_dir(corpus, "bob")
+    mine.mkdir(parents=True)
+    theirs.mkdir(parents=True)
+    (mine / "mine.md").write_text("Alice's document about deposits and branches.")
+    (theirs / "theirs.md").write_text("Bob's document, which Alice must not be billed for.")
+    monkeypatch.setenv("CORPUS_DIR", str(corpus))
+    monkeypatch.setenv("CHROMA_PERSIST_DIR", str(persist))
+    get_settings.cache_clear()
+
+    build_index(source_dir=corpus, persist_dir=persist, embeddings=fake_embeddings, owner="alice")
+    build_index(source_dir=corpus, persist_dir=persist, embeddings=fake_embeddings, owner="bob")
+
+    usage = tenant_usage("alice", persist)
+
+    assert usage.sources == 1
+    assert usage.chunks > 0
+    assert usage.corpus_bytes == (mine / "mine.md").stat().st_size
+    assert usage.tokens_used_today == 0

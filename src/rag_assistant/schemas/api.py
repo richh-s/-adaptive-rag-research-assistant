@@ -279,6 +279,20 @@ class IndexedSource(BaseModel):
     owner: str
 
 
+class TenantUsageResponse(BaseModel):
+    """GET /api/v1/tenant/usage response body. Spend was already metered per tenant while
+    index size was not, which put the two halves of "what is this tenant costing me" in
+    different places -- one queryable, one only knowable by reading the manifest by hand."""
+
+    owner: str
+    sources: int
+    chunks: int
+    corpus_bytes: int
+    tokens_used_today: int
+    # 0 means no cap is configured (see TENANT_DAILY_TOKEN_BUDGET), not a budget of zero.
+    daily_token_budget: int
+
+
 class TenantPurgeResponse(BaseModel):
     """DELETE /api/v1/tenant/data response body. Reports what was actually removed rather
     than a bare 204, because an erasure request is exactly the case where the requester needs

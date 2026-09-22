@@ -583,3 +583,29 @@ def test_research_stream_relays_synthesis_tokens_only(monkeypatch):
     assert events[-1]["type"] == "done"
     assert events[-1]["answer"] == "Hello world."
     assert events[-1]["report"] == "# Hello world."
+
+
+def test_an_unreachable_embedding_server_is_a_503_not_a_500(monkeypatch):
+    """Embeddings have no fallback, so this is a dependency outage a client should retry and
+    an orchestrator should route around -- not a defect in the request. Other failures stay
+    500 (see the configuration-error test above), because dressing a bug as an outage hides
+    it."""
+    import httpx
+
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_EMBEDDING_BASE_URL", "http://gpu-box.example.ts.net:11434/v1")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+
+    def _raise(state, config=None):
+        raise RuntimeError("retrieve_vector failed") from httpx.ConnectError("no route to host")
+
+    monkeypatch.setattr(api._graph, "invoke", _raise)
+    client = TestClient(api.app)
+
+    response = client.post("/api/v1/research", json={"question": "What were total deposits?"})
+
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert "unreachable" in detail and "/ready" in detail

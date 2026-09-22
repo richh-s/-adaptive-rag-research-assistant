@@ -309,3 +309,31 @@ def build_index(
         vision_calls=vision.calls_made() - vision_calls_before,
         description_calls=description_calls,
     )
+
+
+def relabel_source(
+    source: str, persist_dir: Path | None = None, label: str | None = None
+) -> str | None:
+    """Re-label one indexed document, from the model or from `label` verbatim.
+
+    Labels are model output about a document's opening pages, and a wrong one is not cosmetic:
+    it prefixes every chunk of that file and is what the router reads. `tax_expenditure_
+    ethiopia_2021_22.pdf` came back as "FY 2018/19 - 2020/21", defensible for a report covering
+    three years and still not what its filename says. Reviewing them needs a way to fix one
+    without re-parsing the PDF, so this reads the text back from the index like the backfill
+    does.
+
+    The new label reaches retrieval at the next re-index of that file, since the prefix is
+    baked into the stored chunks; the router sees it immediately.
+    """
+    persist_dir = persist_dir or get_settings().chroma_persist_dir
+    manifest = load_manifest(persist_dir)
+    entry = manifest.get(source)
+    if entry is None:
+        raise KeyError(f"{source!r} is not in the index")
+    if label is None:
+        store = get_vector_store(persist_dir=persist_dir)
+        label = describe_document(Path(source).name, _stored_text(store, entry["chunk_ids"]))
+    entry["description"] = label
+    save_manifest(persist_dir, manifest)
+    return label

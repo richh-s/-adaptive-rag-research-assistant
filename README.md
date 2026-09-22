@@ -232,7 +232,24 @@ Operator commands:
 uv run rag-assistant backup --keep 7          # snapshot index + corpus + conversations
 uv run rag-assistant restore <archive.tar.gz> # roll back to a snapshot
 uv run rag-assistant loadtest --requests 500 --concurrency 25
+uv run rag-assistant labels                   # the router label each document carries
+uv run rag-assistant labels --relabel report.pdf                  # ask the model again
+uv run rag-assistant labels --relabel report.pdf --set "Ethio Re -- annual report -- 2020/21"
 ```
+
+Labels are worth a look after a first ingest. They are model output about a document's opening
+pages, they prefix every chunk of that document, and they are what the router reads — so a
+wrong one is not cosmetic. Re-labelling reads the text back from the index rather than
+re-parsing the file, so correcting one never re-pays its vision calls; the router sees the new
+label immediately, and retrieval sees it when that file is next re-indexed.
+
+**Upgrading an existing index.** `CHUNKING_VERSION` and `LOADER_VERSION` are recorded per file
+in the manifest, so a change to either makes the next `ingest` re-index the files it affects —
+by design, since the alternative is a collection full of chunks the current code no longer
+produces. For a PDF corpus that means re-paying vision calls, so run it deliberately rather
+than discovering it during a deploy. Both versions moved in this release (scanned pages are
+read once, and every chunk carries its document label), so an existing PDF index re-ingests in
+full on its next run.
 
 ### API
 
@@ -903,6 +920,8 @@ local demo script:
 | Restart reconciliation | An ingest runs as a background task inside the process that accepted the upload, so a deploy or a crash stops the work but not the record — the task sits at `parsing` forever while a client polls a job nobody is doing. Startup fails those with a message saying what happened and what to do. There is no resumption to offer (the work was in memory), and a terminal failure is more honest than a status indistinguishable from slow progress |
 | Explicit concurrency ceiling | `POST /api/v1/research` is a sync handler, so it runs on the worker threadpool and holds one thread for the whole multi-second graph run. `API_THREADPOOL_SIZE` (default 40) is therefore the real per-worker concurrency limit — the 41st concurrent research request queues rather than starts, however idle the CPU. Stated as a setting rather than inherited from AnyIO's default so the number is visible, with `rag_research_in_flight` to watch against it |
 | Distributed tracing | Optional OpenTelemetry (`uv sync --extra otel`, `OTEL_EXPORTER_OTLP_ENDPOINT`). The existing per-request `trace_id` correlates log lines but cannot show where the time went; spans add the parent/child structure. One span per node, emitted from the shared `_timed` wrapper rather than from eleven nodes that would each carry their own copy and drift. Entirely inert when unconfigured — the disabled path is a working context manager, not a guard at every call site |
+| Outage vs. defect | A self-hosted embedding server going away returns **503** with the server's address and a pointer to `/ready`, not a generic 500: embeddings have no fallback, so it is a dependency outage a client should retry and an orchestrator should route around. Every other failure stays a 500, because dressing a bug as an outage hides it |
+| Per-tenant footprint | `GET /api/v1/tenant/usage` reports sources, chunks, corpus bytes and today's token spend for the calling tenant — the index-size half of "what is this tenant costing me", which used to mean reading the manifest by hand while spend was already metered |
 | Right to erasure | `DELETE /api/v1/tenant/data` removes everything belonging to the calling tenant across all five stores that hold any: corpus files, embeddings, parent sections, manifest entries, and conversations plus feedback. Ordered so that files go last and each manifest entry is cleared only after its chunks and parents are — an interrupted purge leaves the remaining work still described, so a re-run finishes it. Scoped to the caller rather than taking an owner parameter, because erasing someone else's data should not share an endpoint with erasing your own |
 | One coherent deployment switch | `DEPLOYMENT_PROFILE=multi-replica` turns on pgvector, Postgres conversations and Redis tasks together, and fails at startup without `DATABASE_URL`. They are not independent choices: a shared index with per-process ingest tasks serves "unknown ingest task" 404s from whichever replica did not accept the upload, and shared tasks with a local index give two divergent corpora. Every half-shared combination breaks as flakiness rather than as misconfiguration. Explicitly-set switches still win — a profile that overrode them would make the individual settings lie |
 | Resumable ingestion | An ingest interrupted by a deploy or a crash is **resumed**, not failed. The uploaded file was written into the corpus before the task existed and `build_index` decides what to do from a fingerprint, so re-running costs only what was unfinished and costs nothing at all after a completed run. Transient failures retry in place up to `INGEST_MAX_ATTEMPTS`; the attempt counter lives on the task record, so a crash mid-retry resumes at the right attempt rather than granting a fresh budget every restart. A task that exhausts its attempts becomes terminally `failed` carrying the count — the record is the dead-letter queue, already queryable through the status endpoint |
@@ -1004,18 +1023,22 @@ has none.
   (rank 2, then absent from the top 8). So Amharic questions about the Amharic documents work;
   Amharic questions about the English reports are unreliable, and nothing in the gate measures
   it.
-- **The optional backends are still verified to differing depths.** The two Postgres-backed
-  paths — conversations and the pgvector index — now run against a real `pgvector/pgvector:pg17`
-  service container in CI, and that job fails rather than passes if the suites skip, since a
-  suite that skips itself produces a green job having verified nothing. Redis-backed tasks are
-  still tested against a fake client, and Chroma server mode still only at the construction
-  boundary; neither runs in CI.
-- **All tenants share one Chroma collection.** Retrieval and ingestion are tenant-scoped, but
-  there is no per-tenant view of index size or embedding spend. Separate collections would give
-  that, and are the natural companion to the Qdrant move below. Token spend *is* now attributed
-  per tenant across research and ingest (see `budget.py`); index size is not. Embedding and
-  vision spend is charged from an estimate rather than reported usage, because neither
-  surfaces token counts through LangChain's callbacks.
+- **The optional backends are still verified to differing depths.** The Postgres-backed paths
+  (conversations, the pgvector index) and the Redis-backed ones (answer cache, per-tenant
+  budget, ingest task registry) each run against a real service container in CI, and those jobs
+  fail rather than pass if their suites skip, since a suite that skips itself produces a green
+  job having verified nothing. The Redis tests deliberately read back through a *second* client,
+  which is the part a fake cannot check — a fake agrees with whatever the code expects of it,
+  including about TTLs and about what another replica sees. Chroma **server mode** is still
+  covered only at the construction boundary and still runs nowhere in CI.
+- **All tenants share one Chroma collection.** Retrieval and ingestion are tenant-scoped, and
+  `GET /api/v1/tenant/usage` now answers both halves of "what is this tenant costing me" —
+  sources, chunks and corpus bytes alongside today's token spend — scoped to the caller, like
+  the erasure endpoint. What a shared collection still cannot give is isolation: one tenant's
+  vectors sit beside another's, separated by a metadata predicate rather than by storage, which
+  is the argument for separate collections and the natural companion to the Qdrant move below.
+  Embedding and vision spend is still charged from an estimate rather than reported usage,
+  because neither surfaces token counts through LangChain's callbacks.
 
 - **Prompt-injection defense is structural, and structural is not proof.** All four prompts
   that interpolate text the pipeline did not author -- synthesis, grading, routing and

@@ -438,3 +438,51 @@ def test_the_synthesis_prompt_still_asks_for_the_refusal_phrase_the_eval_detects
     from rag_assistant.prompts.synthesis_prompt import REFUSAL_PHRASE, SYNTHESIS_PROMPT
 
     assert REFUSAL_PHRASE in SYNTHESIS_PROMPT
+
+
+# ---- baseline provenance ----
+
+
+def test_a_recorded_baseline_states_which_models_produced_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+    path = tmp_path / "baseline.json"
+    save_baseline(aggregate([scored()]), path)
+
+    recorded = json.loads(path.read_text())["recorded_with"]
+
+    assert recorded["chat_provider"] == "Anthropic"
+    assert recorded["embedding_model"] == get_settings().embedding_model_name
+
+
+def test_a_different_embedding_model_is_reported_not_treated_as_a_regression(tmp_path, monkeypatch):
+    """Swap the embedding model and retrieval changes; swap the chat provider and routing
+    changes. Either way the delta is incomparability, not quality -- and a gate that called it
+    a regression would be wrong exactly when someone runs it on different infrastructure."""
+    from rag_assistant.eval.baseline import provenance_mismatch
+
+    path = tmp_path / "baseline.json"
+    save_baseline(aggregate([scored()]), path)
+    assert provenance_mismatch(path) is None
+
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_EMBEDDING_BASE_URL", "http://box.example.ts.net:11434/v1")
+    monkeypatch.setenv("LOCAL_EMBEDDING_MODEL", "qwen3-embedding:0.6b")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+
+    mismatch = provenance_mismatch(path)
+
+    assert mismatch and "embedding_model" in mismatch
+
+
+def test_a_baseline_without_provenance_says_so(tmp_path):
+    from rag_assistant.eval.baseline import provenance_mismatch
+
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps({"question_count": 3, "metrics": {"route_accuracy": 0.9}}))
+
+    assert "predates provenance" in provenance_mismatch(path)

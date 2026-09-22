@@ -184,7 +184,7 @@ def test_grading_fences_documents_and_counts_attempts(monkeypatch):
             captured["prompt"] = prompt
             return DocGradeBatch(grades=[DocGrade(relevant=True, score=0.9)])
 
-    monkeypatch.setattr(relevance_grader, "get_structured_llm", lambda schema: _FakeLLM())
+    monkeypatch.setattr(relevance_grader, "get_structured_llm", lambda schema, **kw: _FakeLLM())
     monkeypatch.setattr(
         relevance_grader.metrics, "record_injection_signals", lambda c: recorded.append(c)
     )

@@ -318,6 +318,12 @@ class Settings(BaseSettings):
     # prompt, and run several per row. The structured-call timeout is far too short for that:
     # it turned a judged eval run into a column of NaN.
     judge_request_timeout_seconds: float = 90.0
+    # Grading is structured like routing but sized like synthesis: one call carrying every
+    # fused document. At the default retrieval depth that prompt is an order of magnitude
+    # larger than the router's, and a timeout here is not a failed request -- the grader
+    # degrades to "trust retrieval", which silently disables the corrective search that a
+    # low-confidence answer depends on.
+    grading_request_timeout_seconds: float = 30.0
     llm_max_retries: int = 1
 
     @model_validator(mode="after")

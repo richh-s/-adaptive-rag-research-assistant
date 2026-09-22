@@ -91,3 +91,48 @@ def purge_tenant(owner: str, persist_dir: Path | None = None) -> PurgeResult:
         },
     )
     return result
+
+
+@dataclass
+class TenantUsage:
+    """What one tenant currently occupies and has spent today."""
+
+    sources: int
+    chunks: int
+    corpus_bytes: int
+    tokens_used_today: int
+    daily_token_budget: int
+
+
+def tenant_usage(owner: str, persist_dir: Path | None = None) -> TenantUsage:
+    """Index footprint and today's token spend for one tenant.
+
+    Spend was already metered per tenant and index size was not, which left the two halves of
+    "what is this tenant costing me" in different places -- one queryable, one only knowable by
+    reading the manifest by hand. Both are cheap to read: the manifest already records an owner
+    and chunk ids per source, and the corpus subtree is a stat() walk.
+    """
+    from rag_assistant import budget
+    from rag_assistant.auth import PUBLIC_OWNER
+    from rag_assistant.ingestion.manifest import load_manifest
+    from rag_assistant.ingestion.ownership import owner_corpus_dir
+
+    settings = get_settings()
+    persist_dir = persist_dir or settings.chroma_persist_dir
+    manifest = load_manifest(persist_dir)
+    mine = [entry for entry in manifest.values() if entry.get("owner", PUBLIC_OWNER) == owner]
+    corpus_dir = owner_corpus_dir(settings.corpus_dir, owner)
+    # Only this tenant's own subtree: for the public tenant that is the corpus root, which is
+    # also where a single-tenant deployment keeps everything.
+    corpus_bytes = (
+        sum(p.stat().st_size for p in corpus_dir.rglob("*") if p.is_file())
+        if corpus_dir.exists()
+        else 0
+    )
+    return TenantUsage(
+        sources=len(mine),
+        chunks=sum(len(entry.get("chunk_ids", [])) for entry in mine),
+        corpus_bytes=corpus_bytes,
+        tokens_used_today=budget.used_tokens(owner),
+        daily_token_budget=settings.tenant_daily_token_budget,
+    )
