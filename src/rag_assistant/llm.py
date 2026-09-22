@@ -113,19 +113,19 @@ def _local_chat_model(temperature: float, streaming: bool = False) -> _LocalChat
     )
 
 
-def _gemini_chat_model(temperature: float) -> ChatGoogleGenerativeAI:
+def _gemini_chat_model(temperature: float, timeout: float | None = None) -> ChatGoogleGenerativeAI:
     settings = get_settings()
     return ChatGoogleGenerativeAI(
         model=settings.gemini_chat_model,
         temperature=temperature,
         google_api_key=settings.google_api_key,
-        timeout=settings.llm_request_timeout_seconds,
+        timeout=timeout or settings.llm_request_timeout_seconds,
         max_retries=settings.llm_max_retries,
         callbacks=[MetricsCallbackHandler("gemini", settings.gemini_chat_model)],
     )
 
 
-def _anthropic_chat_model(streaming: bool = False) -> ChatAnthropic:
+def _anthropic_chat_model(streaming: bool = False, timeout: float | None = None) -> ChatAnthropic:
     """`temperature` is rejected (HTTP 400) by current Claude models, so it's never passed here.
 
     `streaming=True` makes `.invoke()` consume the streaming API and fire token callbacks --
@@ -136,14 +136,16 @@ def _anthropic_chat_model(streaming: bool = False) -> ChatAnthropic:
     return ChatAnthropic(
         model=settings.anthropic_chat_model,
         api_key=settings.anthropic_api_key,
-        default_request_timeout=settings.llm_request_timeout_seconds,
+        default_request_timeout=timeout or settings.llm_request_timeout_seconds,
         max_retries=settings.llm_max_retries,
         streaming=streaming,
         callbacks=[MetricsCallbackHandler("anthropic", settings.anthropic_chat_model)],
     )
 
 
-def _provider_chain(temperature: float, streaming: bool) -> list[Callable[[], BaseChatModel]]:
+def _provider_chain(
+    temperature: float, streaming: bool, timeout: float | None = None
+) -> list[Callable[[], BaseChatModel]]:
     """Configured providers in priority order, as *builders* rather than instances.
 
     Nothing is constructed for an unconfigured provider: the Gemini client validates its API
@@ -156,9 +158,9 @@ def _provider_chain(temperature: float, streaming: bool) -> list[Callable[[], Ba
     if settings.local_llm_base_url:
         builders.append(lambda: _local_chat_model(temperature, streaming=streaming))
     if settings.anthropic_api_key:
-        builders.append(lambda: _anthropic_chat_model(streaming=streaming))
+        builders.append(lambda: _anthropic_chat_model(streaming=streaming, timeout=timeout))
     if settings.google_api_key:
-        builders.append(lambda: _gemini_chat_model(temperature))
+        builders.append(lambda: _gemini_chat_model(temperature, timeout=timeout))
     if not builders:
         raise RuntimeError(
             "No chat provider configured. Set at least one of LOCAL_LLM_BASE_URL, "
@@ -175,11 +177,17 @@ def _with_fallbacks(runnables: list[Any]) -> Any:
     return first.with_fallbacks(rest) if rest else first
 
 
-def get_chat_model(temperature: float = 0.0) -> BaseChatModel:
+def get_chat_model(temperature: float = 0.0, timeout: float | None = None) -> BaseChatModel:
     """Primary chat model for plain `.invoke()` calls, with every lower-priority configured
     provider attached as an automatic fallback on error (rate limit, outage, unreachable
-    local endpoint)."""
-    return _with_fallbacks([build() for build in _provider_chain(temperature, streaming=True)])
+    local endpoint).
+
+    `timeout` overrides the per-attempt request timeout for callers whose call is legitimately
+    slower than a structured one -- synthesis writing a cited answer over a dozen documents.
+    """
+    return _with_fallbacks(
+        [build() for build in _provider_chain(temperature, streaming=True, timeout=timeout)]
+    )
 
 
 def _local_structured_runnable(model: _LocalChatOpenAI, schema: type) -> Runnable:

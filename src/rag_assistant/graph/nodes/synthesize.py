@@ -123,7 +123,9 @@ def synthesize_answer(state: ResearchState) -> dict:
             prompt = NO_CONTEXT_PROMPT.format(question=question, history_block=history_block)
         else:
             prompt = EMPTY_RETRIEVAL_PROMPT.format(question=question, history_block=history_block)
-        answer = get_chat_model().invoke(prompt)
+        answer = get_chat_model(timeout=get_settings().synthesis_request_timeout_seconds).invoke(
+            prompt
+        )
         result = {"final_answer": answer.text, "citations": []}
     else:
         # Every document here is attacker-influenceable -- uploaded by a tenant or fetched
@@ -147,7 +149,9 @@ def synthesize_answer(state: ResearchState) -> dict:
         prompt = SYNTHESIS_PROMPT.format(
             question=question, context=context, history_block=history_block
         )
-        answer = get_chat_model().invoke(prompt)
+        answer = get_chat_model(timeout=get_settings().synthesis_request_timeout_seconds).invoke(
+            prompt
+        )
         citations = [
             Citation(marker=f"[{i + 1}]", source_id=display_source(d.source_id))
             for i, d in enumerate(docs)

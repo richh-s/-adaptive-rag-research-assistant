@@ -133,7 +133,7 @@ def test_synthesis_fences_retrieved_documents_and_counts_attempts(monkeypatch):
             return type("R", (), {"text": "An answer [1]."})()
 
     recorded = []
-    monkeypatch.setattr(synthesize_module, "get_chat_model", lambda: _FakeModel())
+    monkeypatch.setattr(synthesize_module, "get_chat_model", lambda **kw: _FakeModel())
     monkeypatch.setattr(
         synthesize_module.metrics, "record_injection_signals", lambda c: recorded.append(c)
     )

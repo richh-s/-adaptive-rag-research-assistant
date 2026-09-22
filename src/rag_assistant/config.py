@@ -302,6 +302,12 @@ class Settings(BaseSettings):
     # seconds, which is most of graph_timeout_seconds for a single node. Bounding both keeps
     # a stuck provider from starving the rest of the graph's budget.
     llm_request_timeout_seconds: float = 12.0
+    # Synthesis gets its own, longer budget. The short one above bounds the structured calls
+    # (routing, decomposition, grading), which return a few tokens; writing a cited answer
+    # over a dozen documents legitimately takes longer, and a real eval run lost a question
+    # to a 12s read timeout mid-answer. Still under graph_timeout_seconds, so the deadline
+    # around the whole graph remains the outer bound.
+    synthesis_request_timeout_seconds: float = 30.0
     llm_max_retries: int = 1
 
     @model_validator(mode="after")

@@ -12,7 +12,9 @@ def _fake_llm(content: str) -> MagicMock:
 
 def test_empty_retrieval_uses_empty_retrieval_prompt(monkeypatch):
     fake_llm = _fake_llm("No sources found.")
-    monkeypatch.setattr("rag_assistant.graph.nodes.synthesize.get_chat_model", lambda: fake_llm)
+    monkeypatch.setattr(
+        "rag_assistant.graph.nodes.synthesize.get_chat_model", lambda **kw: fake_llm
+    )
 
     result = synthesize_answer(
         {"question": "What is the price of Bitcoin?", "route": "web", "fused_documents": []}
@@ -30,7 +32,9 @@ def test_empty_retrieval_uses_empty_retrieval_prompt(monkeypatch):
 
 def test_synthesize_returns_cached_answer_without_calling_llm(monkeypatch):
     fake_llm = _fake_llm("should not be used")
-    monkeypatch.setattr("rag_assistant.graph.nodes.synthesize.get_chat_model", lambda: fake_llm)
+    monkeypatch.setattr(
+        "rag_assistant.graph.nodes.synthesize.get_chat_model", lambda **kw: fake_llm
+    )
     monkeypatch.setattr(
         "rag_assistant.graph.nodes.synthesize.cache_get",
         lambda key: {
@@ -49,7 +53,9 @@ def test_synthesize_returns_cached_answer_without_calling_llm(monkeypatch):
 
 def test_synthesize_caches_result_after_llm_call(monkeypatch):
     fake_llm = _fake_llm("No sources found.")
-    monkeypatch.setattr("rag_assistant.graph.nodes.synthesize.get_chat_model", lambda: fake_llm)
+    monkeypatch.setattr(
+        "rag_assistant.graph.nodes.synthesize.get_chat_model", lambda **kw: fake_llm
+    )
     monkeypatch.setattr("rag_assistant.graph.nodes.synthesize.cache_get", lambda key: None)
     captured = {}
     monkeypatch.setattr(

@@ -22,6 +22,15 @@ services:
         sync: false # secret -- Sentry error tracking; empty string = disabled
       - key: APP_ENV
         value: production
+      # Embeddings must come from a provider this host can actually reach. A self-hosted
+      # server on a tailnet cannot be one: embeddings have no fallback, so every question
+      # would fail here (and /ready would correctly report the service as unavailable).
+      - key: EMBEDDING_PROVIDER
+        value: gemini
+      # One short chat call per file at startup ingest labels each document for the router.
+      # Set to "false" to skip it on a free instance that re-indexes on every cold start.
+      - key: DESCRIBE_DOCUMENTS
+        value: "true"
       # No Redis on the free tier: caching degrades gracefully to "no cache" (see cache.py),
       # so disable it outright rather than pay for a Key Value instance.
       - key: USE_CACHE

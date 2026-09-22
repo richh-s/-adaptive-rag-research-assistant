@@ -274,7 +274,7 @@ def test_synthesis_expands_only_when_parent_context_is_enabled(tmp_path, monkeyp
     replace_parents_for_source(tmp_path, "a.md", "public", {"p1": "THE FULL SECTION"})
     fake_llm = MagicMock()
     fake_llm.invoke.return_value = MagicMock(text="answer")
-    monkeypatch.setattr(synthesize_module, "get_chat_model", lambda: fake_llm)
+    monkeypatch.setattr(synthesize_module, "get_chat_model", lambda **kw: fake_llm)
     docs = [doc("small chunk", parent_id="p1")]
 
     synthesize_module.synthesize_answer(

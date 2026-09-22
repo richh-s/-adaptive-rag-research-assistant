@@ -235,3 +235,25 @@ def test_chunks_are_prefixed_with_the_filename_when_labelling_is_off(
         include=["documents"]
     )
     assert any(doc.startswith("anthropic\n\n") for doc in stored["documents"])
+
+
+def test_parent_sections_carry_the_label_too(
+    sample_corpus_dir, fake_embeddings, tmp_path, describing
+):
+    """With PARENT_CONTEXT on the section replaces the chunk in the synthesis prompt, so an
+    unlabelled section would drop the document context the chunk was retrieved for."""
+    persist_dir = tmp_path / "chroma"
+
+    build_index(source_dir=sample_corpus_dir, persist_dir=persist_dir, embeddings=fake_embeddings)
+
+    from rag_assistant.retrieval.parent_store import get_parents
+    from rag_assistant.retrieval.vector_store import get_vector_store
+
+    stored = get_vector_store(embeddings=fake_embeddings, persist_dir=persist_dir)._collection.get(
+        include=["metadatas"]
+    )
+    parent_ids = sorted({m["parent_id"] for m in stored["metadatas"]})
+    parents = get_parents(persist_dir, parent_ids)
+
+    assert parents
+    assert all(text.startswith("Label for ") for text in parents.values())

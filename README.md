@@ -917,7 +917,32 @@ has none.
 - **Retrieval-quality features are correctness-tested, not quality-measured.** Semantic
   chunking, reranking and small-to-big all behave as specified and are covered by tests, but
   whether they *improve* answers on a given corpus is exactly what the eval gate answers — and
-  that requires recording a baseline against real models first.
+  that requires recording a baseline against real models first. The embedding model, the
+  per-document labels and the chunk context lines *have* been measured this way, on a private
+  30-report corpus; the three knobs under [Retrieval tuning](#retrieval-tuning) have not.
+- **Vision transcription of scanned pages is sampled, not verified end to end.** Roughly 370
+  scanned pages in that corpus were read by the chat provider's vision capability. A random
+  sample of 12 was re-checked against the original page images: **142 figures compared, none
+  disagreeing**, and two individually verified earlier (an audited income statement matched line
+  for line; a key-figures page surfaced the duplicate-read bug above). The caveat is that the
+  checker is the same model family that produced the transcript, so this is a careful re-read
+  rather than independent ground truth, and 12 of 370 pages is a sample. A misread digit in a
+  scanned table still becomes a confidently wrong answer with a correct citation. Figures beyond
+  `MAX_IMAGES_PER_PDF` per file remain undescribed.
+- **A self-hosted embedding server is a single point of failure, by construction.** Chat falls
+  back between providers; embeddings cannot, because only the model that built the index can
+  query it. `/ready` probes the server and the client fails fast, so the failure is visible and
+  quick rather than silent — but while that server is unreachable the service cannot answer at
+  all. A deployment that needs to survive it should embed with a hosted provider, or keep the
+  embedding model in the same failure domain as the app.
+- **Questions are only evaluated in English, and cross-language retrieval is uneven.** Every
+  golden question is in English; non-English scanned pages carry an English summary line, which
+  is what makes them retrievable from those questions at all. Probed in the other direction with
+  Amharic translations of golden questions, an Amharic query found its **Amharic-source document
+  at rank 1 in both cases tried**, but reached an English-source document only once out of two
+  (rank 2, then absent from the top 8). So Amharic questions about the Amharic documents work;
+  Amharic questions about the English reports are unreliable, and nothing in the gate measures
+  it.
 - **The optional backends are still verified to differing depths.** The two Postgres-backed
   paths — conversations and the pgvector index — now run against a real `pgvector/pgvector:pg17`
   service container in CI, and that job fails rather than passes if the suites skip, since a
@@ -989,9 +1014,24 @@ existing data aside rather than deleting it, so a corrupt archive fails with the
 untouched.
 
 The restore path is exercised by `tests/test_backup.py`, including the case where an archive
-was built with a different embedding model. What has **not** happened is a drill against a
-real deployment: restoring into a running service, with real corpus volume, and timing it. Until
-that has been done, RTO is an estimate rather than a number.
+was built with a different embedding model, and **timed once against real corpus volume**: 30
+PDFs (550MB on disk, 5,421 chunks, ~370 vision-transcribed pages) backed up in **7s** into a
+128MB archive and restored in **3s**, after which the manifest, chunk count and corpus file
+count all matched and a real query returned the expected document. RTO is therefore a measured
+number at this size rather than an estimate — dominated by archive extraction, so it grows with
+corpus size, not with chunk count.
+
+Two caveats remain. The drill restored into clean directories rather than over a *running*
+service, so it measures recovery time, not the cutover; and the process-local caches (vector
+store client, BM25, conversations) still hold pre-restore state, which is why the command tells
+you to restart the server. RPO is untouched by any of this: `rag-assistant backup` is a manual
+command, so schedule it (cron, launchd, a CI job) or RPO stays "whenever someone last
+remembered".
+
+```bash
+# One line of crontab is the difference between a stated RPO and none:
+0 * * * * cd /path/to/repo && .venv/bin/rag-assistant backup --output /backups --keep 24
+```
 
 ## Future improvements
 

@@ -447,3 +447,19 @@ def test_local_embeddings_fail_fast_when_the_box_is_unreachable(monkeypatch):
     assert timeout.connect == settings.local_embedding_connect_timeout_seconds
     assert timeout.connect < settings.graph_timeout_seconds
     assert timeout.read == settings.local_embedding_timeout_seconds
+
+
+def test_synthesis_gets_a_longer_request_timeout_than_the_structured_calls(monkeypatch):
+    """Routing/grading return a few tokens; writing a cited answer over a dozen documents
+    legitimately takes longer, and a real eval run lost a question to the short timeout
+    mid-answer. Still bounded well under the graph deadline."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    monkeypatch.setenv("GOOGLE_API_KEY", "")
+    settings = get_settings()
+
+    default_model = llm.get_chat_model()
+    synthesis_model = llm.get_chat_model(timeout=settings.synthesis_request_timeout_seconds)
+
+    assert default_model.default_request_timeout == settings.llm_request_timeout_seconds
+    assert synthesis_model.default_request_timeout == settings.synthesis_request_timeout_seconds
+    assert settings.synthesis_request_timeout_seconds < settings.graph_timeout_seconds

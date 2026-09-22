@@ -21,6 +21,13 @@ If the question's subject matter plausibly matches one of the local knowledge ba
 listed above, prefer "vector" or "both" over "web" -- judge by the contents listed, not by the \
 topic of the examples below.
 
+Matching the subject is not the same as containing the answer. When the question asks for \
+something those documents would not normally state -- an individual's pay, internal meeting \
+minutes, losing bids, a customer or borrower list, a figure for a period they cannot cover -- \
+choose "both" rather than "vector", even though the organisation is clearly one they describe. \
+"vector" there can only end in "I don't have information on that" without anything having \
+looked.
+
 Examples, assuming a knowledge base containing profiles of major AI labs:
 
 Question: Who founded Anthropic and what is Constitutional AI?

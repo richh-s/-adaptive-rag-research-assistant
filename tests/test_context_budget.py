@@ -99,7 +99,7 @@ def test_synthesis_applies_the_budget_and_aligns_citations_with_it(monkeypatch):
     monkeypatch.setenv("SYNTHESIS_CONTEXT_BUDGET_TOKENS", "25")
     fake_llm = MagicMock()
     fake_llm.invoke.return_value = MagicMock(text="An answer [1].")
-    monkeypatch.setattr(synthesize_module, "get_chat_model", lambda: fake_llm)
+    monkeypatch.setattr(synthesize_module, "get_chat_model", lambda **kw: fake_llm)
 
     docs = [doc("x" * 40, source_id=f"{i}.md") for i in range(5)]
     result = synthesize_module.synthesize_answer(

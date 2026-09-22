@@ -227,7 +227,15 @@ def build_index(
             # Written even when PARENT_CONTEXT is off, so enabling it later doesn't require a
             # re-index -- the sections are cheap to store and useless to reconstruct after
             # the fact without re-parsing.
-            replace_parents_for_source(persist_dir, source, corpus_file.owner, split.parents)
+            # Prefixed too: with PARENT_CONTEXT on, the section replaces the chunk in the
+            # synthesis prompt, and an unlabelled section would drop exactly the document
+            # context the chunk was retrieved for.
+            replace_parents_for_source(
+                persist_dir,
+                source,
+                corpus_file.owner,
+                {pid: f"{context_line}\n\n{text}" for pid, text in split.parents.items()},
+            )
             manifest[source] = {
                 "file_hash": corpus_file.fingerprint,
                 "chunk_ids": chunk_ids,
