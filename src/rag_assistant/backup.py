@@ -467,7 +467,7 @@ def restore_backup(
         restored_chroma = swap(staged_chroma, persist_dir)
         restored_corpus = swap(staged_corpus, corpus_dir)
 
-    configured_model = settings.gemini_embedding_model
+    configured_model = settings.embedding_model_name
     embedding_model_changed = bool(
         metadata.embedding_model and metadata.embedding_model != configured_model
     )

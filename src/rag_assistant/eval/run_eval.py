@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,8 @@ from rag_assistant.schemas.models import GoldenQuestion
 
 _RECURSION_LIMIT = 50
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class QuestionResult:
@@ -45,9 +48,16 @@ class QuestionResult:
 
 
 def _run_question(graph, golden_question: GoldenQuestion) -> QuestionResult:
-    result = graph.invoke(
-        {"question": golden_question.question}, config={"recursion_limit": _RECURSION_LIMIT}
-    )
+    try:
+        result = graph.invoke(
+            {"question": golden_question.question}, config={"recursion_limit": _RECURSION_LIMIT}
+        )
+    except Exception:
+        # Scored as the failure it is -- no route, no sources, no answer -- rather than
+        # aborting the run: one provider hiccup at question 40 used to discard the 39 results
+        # before it, and a question that errors is exactly what the scores should reflect.
+        logger.warning("Eval question failed: %r", golden_question.question, exc_info=True)
+        result = {"final_answer": ""}
     # Normalized to bare filenames: `source_id` is a corpus-relative path now that documents
     # are tenant-scoped, while the dataset's `expected_sources` are filenames.
     actual_sources = [display_source(d.source_id) for d in result.get("fused_documents", [])]
@@ -89,6 +99,7 @@ def compute_metrics(results: list[QuestionResult]) -> EvalMetrics:
                 expected_sources=r.expected_sources,
                 actual_sources=r.actual_sources,
                 citation_count=r.citation_count,
+                response=r.response,
             )
             for r in results
         ]

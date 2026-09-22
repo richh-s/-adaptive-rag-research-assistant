@@ -12,6 +12,7 @@ from rag_assistant.config import get_settings
 from rag_assistant.ingestion.loaders import LOADER_VERSION, iter_corpus_files, load_corpus_file
 from rag_assistant.ingestion.index_metadata import read_embedding_dimension, save_index_metadata
 from rag_assistant.ingestion import vision
+from rag_assistant.ingestion.describe import describe_document
 from rag_assistant.ingestion.manifest import load_manifest, save_manifest
 from rag_assistant.ingestion.splitter import CHUNKING_VERSION, split_with_parents
 from rag_assistant.ingestion.ownership import owner_of_relative_path
@@ -51,6 +52,18 @@ class IndexResult:
     # budget.py, rather than at every call site.
     embedded_chars: int = 0
     vision_calls: int = 0
+    # One-line router labels written this run, new files and backfills alike (describe.py).
+    description_calls: int = 0
+
+
+def _stored_text(store, chunk_ids: list[str]) -> str:
+    """A file's opening text read back from the index, in chunk order -- what a backfill
+    describes, so labelling an already-indexed file never re-parses it (and never repeats its
+    vision calls)."""
+    head = chunk_ids[:12]
+    got = store.get(ids=head, include=["documents"])
+    by_id = dict(zip(got.get("ids", []), got.get("documents", [])))
+    return "\n\n".join(by_id[i] for i in head if by_id.get(i))
 
 
 def _chunk_ids(source: str, chunks: list[Document]) -> list[str]:
@@ -151,6 +164,8 @@ def build_index(
         changed_files = 0
         skipped_files = 0
         parsed_files = 0
+        description_calls = 0
+        describe = get_settings().describe_documents
         for source, corpus_file in files_by_source.items():
             existing = manifest.get(source)
             # Three independent reasons to re-index, all checkable without parsing: the bytes
@@ -166,6 +181,14 @@ def build_index(
                 and existing.get("loader_version") == LOADER_VERSION
             ):
                 skipped_files += 1
+                if describe and "description" not in existing:
+                    # Backfill for files indexed before descriptions existed. Recorded even
+                    # when None, so a document that cannot be labelled is tried once rather
+                    # than on every ingest.
+                    description_calls += 1
+                    existing["description"] = describe_document(
+                        Path(source).name, _stored_text(store, existing["chunk_ids"])
+                    )
                 continue
 
             docs = load_corpus_file(corpus_file)
@@ -202,6 +225,11 @@ def build_index(
                 # answer "what is in this corpus for me".
                 "owner": corpus_file.owner,
             }
+            if describe:
+                description_calls += 1
+                manifest[source]["description"] = describe_document(
+                    Path(source).name, "\n\n".join(d.page_content for d in docs)
+                )
             indexed_chunks += len(chunks)
             embedded_chars += sum(len(chunk.page_content) for chunk in chunks)
             changed_files += 1
@@ -212,7 +240,7 @@ def build_index(
         # the configured model matches what is stored.
         save_index_metadata(
             persist_dir,
-            embedding_model=get_settings().gemini_embedding_model,
+            embedding_model=get_settings().embedding_model_name,
             embedding_dimension=read_embedding_dimension(store),
         )
 
@@ -260,4 +288,5 @@ def build_index(
         parsed_files=parsed_files,
         embedded_chars=embedded_chars,
         vision_calls=vision.calls_made() - vision_calls_before,
+        description_calls=description_calls,
     )

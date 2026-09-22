@@ -478,7 +478,9 @@ def _run_ingest_in_background(trace_id: str, task_id: str, owner: str) -> None:
             # before any of this has happened and the cost is not knowable until it has.
             # Embeddings and vision calls do not report usage the way chat completions do,
             # so the amounts are estimates -- see budget.charge_ingest.
-            budget.charge_ingest(owner, result.embedded_chars, result.vision_calls)
+            budget.charge_ingest(
+                owner, result.embedded_chars, result.vision_calls, result.description_calls
+            )
             logger.info(
                 "background ingestion complete",
                 extra={

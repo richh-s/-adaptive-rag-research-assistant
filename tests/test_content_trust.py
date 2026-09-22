@@ -283,9 +283,10 @@ def test_condensation_fences_the_conversation(monkeypatch):
 
 
 def test_every_prompt_that_takes_untrusted_input_declares_the_hierarchy():
-    """A guard against the next prompt added without one. All four surfaces that interpolate
+    """A guard against the next prompt added without one. Every surface that interpolates
     text the pipeline did not author must say, before that text, that it is data."""
     from rag_assistant.prompts.condense_prompt import CONDENSE_PROMPT
+    from rag_assistant.prompts.describe_prompt import DESCRIBE_PROMPT
     from rag_assistant.prompts.grading_prompt import GRADING_PROMPT
     from rag_assistant.prompts.router_prompt import ROUTER_PROMPT
     from rag_assistant.prompts.synthesis_prompt import SYNTHESIS_PROMPT
@@ -295,6 +296,7 @@ def test_every_prompt_that_takes_untrusted_input_declares_the_hierarchy():
         (GRADING_PROMPT, "{documents}"),
         (ROUTER_PROMPT, "{corpus_description}"),
         (CONDENSE_PROMPT, "{history}"),
+        (DESCRIBE_PROMPT, "{content}"),
     ):
         markers = [m for m in ("never an instruction", "never as instructions") if m in prompt]
         assert markers, f"prompt interpolating {placeholder} declares no trust hierarchy"

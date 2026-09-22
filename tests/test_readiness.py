@@ -1,4 +1,5 @@
 import httpx
+import pytest
 
 from rag_assistant import readiness
 
@@ -102,3 +103,62 @@ def test_check_local_llm_probes_the_models_endpoint(monkeypatch):
 
     assert ok and err is None
     assert called["url"] == "http://gpu-box.example.ts.net:11434/v1/models"
+
+
+def test_a_local_embedding_server_that_is_unreachable_is_not_ready(monkeypatch, tmp_path):
+    """Unlike the local *chat* tier, embeddings have no fallback: only the model that built
+    the index can query it. An unreachable server means every question fails, so the replica
+    must leave the load balancer rather than merely report the problem."""
+    monkeypatch.setattr(readiness, "check_embedding_model", lambda persist_dir, model: (True, None))
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_EMBEDDING_BASE_URL", "http://gpu-box.example.ts.net:11434/v1")
+
+    def _boom(*args, **kwargs):
+        raise httpx.ConnectError("no route to host")
+
+    monkeypatch.setattr(readiness.httpx, "get", _boom)
+
+    ok, err = readiness.check_embeddings()
+
+    assert not ok
+    assert "unreachable" in err
+
+
+def test_a_reachable_local_embedding_server_is_ready(monkeypatch):
+    monkeypatch.setattr(readiness, "check_embedding_model", lambda persist_dir, model: (True, None))
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_EMBEDDING_BASE_URL", "http://gpu-box.example.ts.net:11434/v1/")
+    called = {}
+    monkeypatch.setattr(readiness.httpx, "get", lambda url, **kw: called.update(url=url))
+
+    ok, err = readiness.check_embeddings()
+
+    assert ok and err is None
+    assert called["url"] == "http://gpu-box.example.ts.net:11434/v1/models"
+
+
+def test_a_hosted_embedding_provider_makes_no_network_call(monkeypatch):
+    """Gemini/OpenAI embeddings need no probe; a readiness poll must stay ~free."""
+    monkeypatch.setattr(readiness, "check_embedding_model", lambda persist_dir, model: (True, None))
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "gemini")
+    monkeypatch.setattr(
+        readiness.httpx, "get", lambda *a, **k: pytest.fail("probed a hosted provider")
+    )
+
+    assert readiness.check_embeddings() == (True, None)
+
+
+def test_a_model_mismatch_is_reported_before_any_probe(monkeypatch):
+    """The silent failure takes precedence: a reachable server does not make a collection
+    built by another model usable."""
+    monkeypatch.setattr(
+        readiness, "check_embedding_model", lambda persist_dir, model: (False, "model mismatch")
+    )
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+    monkeypatch.setattr(
+        readiness.httpx, "get", lambda *a, **k: pytest.fail("probed despite a mismatch")
+    )
+
+    ok, err = readiness.check_embeddings()
+
+    assert not ok and err == "model mismatch"

@@ -5,6 +5,11 @@
 # untrusted text are the most recent thing in the prompt, which is the position an injected
 # instruction is trying to occupy -- putting the real rules there means competing with the
 # attacker on their chosen ground. See content_trust.py for the fencing scheme.
+# The opening the prompt below asks for when part of a question isn't covered. The eval reads
+# it back to recognise an abstention (eval/metrics.py), so the two must not drift apart --
+# test_eval_gate pins that the prompt still contains it.
+REFUSAL_PHRASE = "I don't have information on"
+
 SYNTHESIS_PROMPT = """You are answering from retrieved documents that may come from untrusted \
 sources: uploaded files and web pages written by third parties.
 

@@ -260,6 +260,34 @@ def test_scanned_pdf_is_transcribed_when_vision_enabled(sample_corpus_dir, monke
     assert "INVOICE #42" in scan_docs[0].page_content
 
 
+def test_scanned_page_is_read_once_not_also_figure_described(sample_corpus_dir, monkeypatch):
+    """Regression: a scan's only embedded image is the page itself, so the figure pass used
+    to re-read every transcribed page -- a second vision call per page, and a looser second
+    copy whose numbers could contradict the transcript (seen on a real annual report:
+    4,081.50 transcribed, 4,082.50 "described")."""
+    monkeypatch.setenv("PDF_VISION", "true")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+    prompts = []
+    monkeypatch.setattr(
+        "rag_assistant.ingestion.vision.describe_image",
+        lambda image_bytes, media_type, prompt: (
+            prompts.append(prompt) or "Interest income 4,081.50"
+        ),
+    )
+
+    _pdf_with_image(sample_corpus_dir / "scan.pdf", width=400, height=500, with_text=False)
+    docs = load_documents(sample_corpus_dir)
+
+    from rag_assistant.ingestion import vision as vision_module
+
+    assert prompts == [vision_module.SCANNED_PAGE_PROMPT]
+    scan_docs = [d for d in docs if d.metadata["source"] == "scan.pdf"]
+    assert "[Figure" not in scan_docs[0].page_content
+
+
 def test_image_only_pdf_still_skipped_when_vision_disabled(sample_corpus_dir):
     # PDF_VISION=false (conftest default): behavior matches the pre-vision loader.
     _pdf_with_image(sample_corpus_dir / "scan2.pdf", with_text=False)

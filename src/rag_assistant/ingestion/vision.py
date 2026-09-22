@@ -35,7 +35,9 @@ data, labels, numbers, or names visible in it. No preamble; output only the desc
 SCANNED_PAGE_PROMPT = """This image is a scanned page from a document being indexed for search. \
 Transcribe ALL visible text faithfully, preserving headings and reading order; render tables as \
 markdown tables. If part of the page is illegible, note '[illegible]' at that spot rather than \
-guessing. No preamble; output only the transcription."""
+guessing. If the page is not in English, end with one line starting '[English summary:' that \
+states in 2-3 sentences what the page is and its key names, figures and dates. No preamble; \
+output only the transcription (and that summary line, when it applies)."""
 
 
 # Vision calls are the most expensive thing an ingest does -- one per figure and per scanned

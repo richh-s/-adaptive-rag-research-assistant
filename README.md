@@ -10,9 +10,10 @@ streamed live to the browser as each step of the pipeline runs. The knowledge ba
 PDF, Word, HTML, Markdown, and text files, or any public web page by URL.
 
 Built with LangGraph, Chroma, and DuckDuckGo web search. Chat/reasoning defaults to Anthropic's Claude when an
-`ANTHROPIC_API_KEY` is set, with automatic fallback to Google Gemini (free tier) on error;
-Gemini always handles embeddings. No paid services are required — leave `ANTHROPIC_API_KEY`
-blank to run entirely on Gemini's free tier.
+`ANTHROPIC_API_KEY` is set, with automatic fallback to Google Gemini (free tier) on error.
+Embeddings are a separate choice (`EMBEDDING_PROVIDER`): Gemini by default, OpenAI, or any
+OpenAI-compatible server you host yourself. No paid services are required — leave
+`ANTHROPIC_API_KEY` blank to run entirely on Gemini's free tier.
 
 <!--
   TODO(portfolio polish): drop a screenshot or short GIF of the web UI here, e.g.
@@ -68,7 +69,21 @@ blank to run entirely on Gemini's free tier.
   that isn't configured: a self-hosted local model (when `LOCAL_LLM_BASE_URL` is set), then
   Anthropic Claude (when `ANTHROPIC_API_KEY` is set), then Gemini, wired with
   `.with_fallbacks()` so a rate limit, an outage, or an unreachable GPU box degrades to the
-  next tier instead of failing the request. Embeddings always go through Gemini.
+  next tier instead of failing the request. Embeddings deliberately have no such chain — see
+  **Embedding providers** below.
+- **Embedding providers** — `EMBEDDING_PROVIDER` selects Gemini (default), OpenAI, or a
+  self-hosted OpenAI-compatible `/v1/embeddings` server (Ollama, vLLM, TEI) for the one model
+  that builds *and* queries the index. Unlike chat there is no fallback, because only the model
+  that built a collection can query it: the active model is recorded in the index metadata,
+  `/ready` refuses to serve a collection built by another one, and a self-hosted server is
+  probed on every readiness poll so an unreachable box pulls the replica from the load balancer
+  instead of failing every question.
+- **Per-document router labels** — one short chat call per file at ingest records
+  `publisher -- document type -- period`, which the router sees next to the filename. Built
+  from filenames alone the corpus list fails where it matters: on a 30-report corpus,
+  `Annual_Report_JUNE-2021.pdf` told the router nothing about *whose* report it was, so every
+  question naming the publisher was routed to web search. Files indexed before the labels
+  existed are backfilled from their stored text on the next ingest, without re-parsing.
 - **Self-hosted inference** — the primary tier can be your own hardware on any
   OpenAI-compatible `/v1` endpoint (Ollama, vLLM, LM Studio, llama.cpp), so every graph node
   runs at $0 while the box is reachable and silently falls back to Claude when it isn't. See
@@ -169,6 +184,10 @@ cp .env.example .env
 uv run rag-assistant hello    # confirms chat model connectivity (Anthropic if set, else Gemini)
 uv run rag-assistant ingest   # embeds the sample corpus (data/corpus/) into Chroma, incrementally
 ```
+
+To index your own documents instead of the sample corpus, point `CORPUS_DIR` at a directory
+git ignores (`data/private_corpus/` is ignored for this) rather than adding files to
+`data/corpus/`, which is what CI and the demo image index.
 
 Or run the API + Redis via Docker Compose instead:
 
@@ -426,6 +445,25 @@ carry the most weight: a dataset of only answerable questions cannot catch the f
 matters most in RAG, which is answering confidently from documents that don't contain the
 answer. It is still small and hand-authored, with no baseline system to compare against.
 
+**Evaluating against your own corpus.** A golden set is only meaningful against the corpus it
+was written from, so `--dataset` and `--baseline` keep separate suites separate — scores are
+comparable only against a baseline recorded on the same questions *and* the same documents.
+Keep a private set beside a private corpus (both git-ignored; `tests/test_private_eval_dataset.py`
+applies the same structural checks to it whenever it exists, and skips in CI):
+
+```bash
+uv run rag-assistant eval --dataset data/golden_eval/private/dataset.jsonl \
+    --baseline data/golden_eval/private/baseline.json --limit 50 --record-baseline
+uv run rag-assistant eval --dataset data/golden_eval/private/dataset.jsonl \
+    --baseline data/golden_eval/private/baseline.json --limit 50 --check
+```
+
+Worth stating plainly, because it is the argument for doing this at all: run against 30 real
+scanned annual reports, this harness found four defects the unit suite could not (see
+[Self-audit](#self-audit-findings--fixes)) and measured an embedding-model change that unit
+tests can only assert *happened* — source recall 0.868 → 1.000 and MRR 0.882 → 0.961 on the
+same 50 questions.
+
 ### Retrieval tuning
 
 Three knobs, all off by default, because each trades cost or a dependency for quality. Turning
@@ -650,12 +688,13 @@ only one of them would still relay a stream of empty SSE tokens). Truncation at 
 with nothing in `content` is treated differently — that's a config problem, not an answer, so it
 raises and lets the fallback chain answer while the error stays visible in the logs.
 
-**Why do embeddings stay on Gemini when chat can go local?** Chat providers are interchangeable
-mid-flight; embeddings are not. The Chroma collection is built at one provider's vector
+**Why can chat fall back between providers but embeddings cannot?** Chat providers are
+interchangeable mid-flight; embeddings are not. The collection is built at one provider's vector
 dimension, and pointing queries at a different embedding model doesn't error — it silently
-returns nonsense neighbours. Switching would require a full re-index
-(`rag-assistant ingest --full`), so it's a deliberate one-way decision rather than something the
-graph can fall back into at runtime.
+returns nonsense neighbours. So `EMBEDDING_PROVIDER` is a deliberate one-way choice (switching
+means `rag-assistant ingest --full`) rather than something the graph can fall back into at
+runtime, and the consequence is accepted openly: with a self-hosted embedding server, an
+unreachable box is an outage rather than a cost regression, which is why readiness probes it.
 
 **Why hybrid (vector + BM25) retrieval, not vector-only?** Dense embeddings are strong on
 semantic/paraphrased queries but can under-rank exact keyword matches — model names, acronyms,
@@ -824,6 +863,17 @@ happy-path correctness. Fixed:
 | Non-streaming API | `/research` only caught `RuntimeError`; any other exception fell through to a bare, contentless 500 | Broadened to `except Exception`, still raised as a proper `HTTPException` with `detail` |
 | Documentation | README implied RAGAS's semantic, LLM-judged `context_precision`/`context_recall`, when the harness actually runs the non-LLM overlap variants | Relabeled accurately, and noted the eval set is small and non-adversarial with no baseline comparison |
 
+A second pass, against a 30-document corpus of real scanned annual reports rather than the
+sample corpus, surfaced four more — every one of them invisible to the unit suite, and three
+found by running the eval rather than by reading code:
+
+| Area | Finding | Fix |
+| --- | --- | --- |
+| Structured output | Claude intermittently returns a list argument as a JSON *string* (`grades='{"grades": [...]}'`). Validation failed, which silently disabled relevance grading ("trusting retrieval") and crashed decomposition outright — a failed question for the user | A `mode="before"` validator decodes the string, unwraps the re-encoded object, and still rejects anything that isn't the expected shape |
+| PDF vision | Every scanned page was read **twice**: transcribed, then "figure described" — because a scan's only embedded image is the page itself. Double the vision cost, the 20-image budget spent on scans instead of real charts, and a second looser copy whose numbers could contradict the transcript (4,081.50 transcribed vs 4,082.50 described, on a real CBE key-figures page) | The figure pass now runs only on pages that have a text layer. Figure-described pages fell 273 → 151 on the same corpus |
+| Non-English scans | Removing that duplicate pass also removed the one thing it did well — an English gloss that let English questions match an Amharic scan. Two eval rows regressed from correct to not-found | The transcription prompt now ends with an `[English summary: ...]` line when the page isn't in English — same single call. Both rows returned to rank 1 |
+| Eval harness | One provider timeout at question 40 aborted the whole run and discarded the 39 results before it; and a correct refusal that cites its context ("I don't have information on X; the procedure covers Y [1]") was scored as a confident answer | A failing question is scored as the failure it is and the run continues; abstention counts a citation-free answer *or* one opening with the refusal phrase the synthesis prompt mandates (shared constant, pinned by a test) |
+
 Verified with the full offline suite (68/68) plus a live end-to-end run: a real router call
 picked the `web` route for a live-price question, a simulated web-search outage was forced, and the
 resulting Research Summary (`retrieval_counts: 0`, `confidence_score: 0.0`, `citations: []`) and
@@ -898,7 +948,7 @@ has none.
   What `API_THREADPOOL_SIZE` concurrent *research* calls actually do to p99 — against real
   provider rate limits — has not been measured, and the arithmetic below is a bound, not a
   benchmark.
-- **Embeddings are Gemini-only and one-way.** Switching means a full re-index. `/ready` detects
+- **Choosing an embedding provider is one-way.** Switching means a full re-index. `/ready` detects
   the mismatch rather than serving nonsense, and on the pgvector backend a model of a *different*
   width is rejected outright at insert — but a model of the *same* width is still caught only by
   the recorded embedding-model name, and there is no migration path that keeps the service

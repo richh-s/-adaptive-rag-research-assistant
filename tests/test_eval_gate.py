@@ -368,3 +368,64 @@ def test_the_committed_baseline_is_currently_marked_stale():
 
     assert payload.get("stale") is True
     assert "re-record" in payload["stale_reason"].lower()
+
+
+def test_a_question_that_errors_is_scored_as_a_failure_not_a_crash():
+    """One provider hiccup mid-run used to abort the whole eval and discard every result
+    before it. An erroring question should cost that row, not the run."""
+    from rag_assistant.eval.run_eval import _run_question, compute_metrics
+    from rag_assistant.schemas.models import GoldenQuestion
+
+    class _ExplodingGraph:
+        def invoke(self, *args, **kwargs):
+            raise RuntimeError("provider unavailable")
+
+    question = GoldenQuestion(
+        question="What were CBE's total deposits in 2010/11?",
+        ground_truth="Birr 85.2 billion.",
+        reference_contexts=["..."],
+        expected_route="vector",
+        acceptable_routes=["vector"],
+        expected_sources=["cbe.pdf"],
+    )
+
+    result = _run_question(_ExplodingGraph(), question)
+    metrics = compute_metrics([result])
+
+    assert result.actual_route is None and result.response == ""
+    assert metrics.route_accuracy == 0.0
+    assert metrics.source_recall == 0.0
+
+
+def test_a_refusal_that_explains_itself_with_citations_still_counts_as_abstaining():
+    """Seen on the real corpus: "I don't have information on X; the procedure covers Y [1]"
+    is the correct answer to an unanswerable question, and counting citations alone scored
+    it as a confident one."""
+    metrics = scored(
+        category="unanswerable",
+        expected_sources=[],
+        actual_sources=["procedure.pdf"],
+        citation_count=3,
+        response="I don't have information on how many reports were received. The procedure "
+        "itself covers scope and timelines [1][2].",
+    )
+
+    assert metrics.abstained is True
+    assert metrics.abstention_correct is True
+
+
+def test_an_answer_that_opens_with_a_refusal_on_an_answerable_question_is_penalised():
+    metrics = scored(
+        expected_sources=["a.md"],
+        actual_sources=["a.md"],
+        citation_count=1,
+        response="I don't have information on the prior-year figure, but this year was X [1].",
+    )
+
+    assert metrics.abstention_correct is False
+
+
+def test_the_synthesis_prompt_still_asks_for_the_refusal_phrase_the_eval_detects():
+    from rag_assistant.prompts.synthesis_prompt import REFUSAL_PHRASE, SYNTHESIS_PROMPT
+
+    assert REFUSAL_PHRASE in SYNTHESIS_PROMPT

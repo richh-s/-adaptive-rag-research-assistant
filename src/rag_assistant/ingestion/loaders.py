@@ -17,7 +17,7 @@ SUPPORTED_SUFFIXES = {".md", ".txt", ".pdf", ".docx", ".html", ".htm"}
 # a different HTML boilerplate rule. Recorded in the ingestion manifest alongside the file
 # fingerprint, so improving a loader re-indexes affected files instead of leaving the
 # collection full of text the old loader produced. Same mechanism as CHUNKING_VERSION.
-LOADER_VERSION = 1
+LOADER_VERSION = 2
 
 logger = logging.getLogger(__name__)
 
@@ -163,11 +163,18 @@ def _load_pdf(path: Path) -> list[Document]:
 
         if vision_doc is not None:
             if not text:
-                # No text layer: a scanned/photographed page -- transcribe it.
+                # No text layer: a scanned/photographed page -- transcribe it. The transcript
+                # already covers the page's charts, and the page's only embedded image is
+                # usually the scan itself, so a figure pass would read the same page twice:
+                # double the cost, the budget spent on scans instead of real charts, and a
+                # second, looser copy whose numbers can contradict the transcript. The one
+                # thing that second copy did well -- an English gloss that let English
+                # questions find a non-English scan -- is asked of the transcription itself.
                 text = _transcribe_scanned_page(vision_doc, page_index).strip()
-            figures = _describe_page_figures(vision_doc, page_index, figure_budget)
-            if figures:
-                text = f"{text}\n\n{figures}".strip()
+            else:
+                figures = _describe_page_figures(vision_doc, page_index, figure_budget)
+                if figures:
+                    text = f"{text}\n\n{figures}".strip()
 
         if not text:
             continue

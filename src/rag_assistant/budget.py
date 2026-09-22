@@ -136,7 +136,9 @@ def charge(owner: str, tokens: int) -> int:
         return total
 
 
-def charge_ingest(owner: str, embedded_chars: int, vision_calls: int) -> int:
+def charge_ingest(
+    owner: str, embedded_chars: int, vision_calls: int, description_calls: int = 0
+) -> int:
     """Charges an ingest's cost: embeddings plus vision calls.
 
     Neither reports usage the way a chat completion does. Embedding models do not surface
@@ -155,14 +157,16 @@ def charge_ingest(owner: str, embedded_chars: int, vision_calls: int) -> int:
     settings = get_settings()
     embedding_tokens = int(embedded_chars / max(settings.synthesis_chars_per_token, 1))
     vision_tokens = vision_calls * settings.vision_call_token_estimate
-    total = embedding_tokens + vision_tokens
+    description_tokens = description_calls * settings.description_call_token_estimate
+    total = embedding_tokens + vision_tokens + description_tokens
     if total <= 0:
         return used_tokens(owner)
     logger.info(
-        "charging ingest to %s: %d embedding + %d vision tokens",
+        "charging ingest to %s: %d embedding + %d vision + %d description tokens",
         owner,
         embedding_tokens,
         vision_tokens,
+        description_tokens,
     )
     return charge(owner, total)
 

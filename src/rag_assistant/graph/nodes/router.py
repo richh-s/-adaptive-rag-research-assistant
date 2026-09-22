@@ -38,7 +38,11 @@ def _describe_local_corpus(owner: str = PUBLIC_OWNER) -> str:
     topics = []
     for source in sorted(visible):
         stem = _HASH_SUFFIX_RE.sub("", Path(display_source(source)).stem)
-        topics.append(stem.replace("_", " ").replace("-", " ").strip())
+        topic = stem.replace("_", " ").replace("-", " ").strip()
+        # The ingest-time label names the publisher and period, which a filename like
+        # "Annual Report JUNE 2021" does not -- see ingestion/describe.py.
+        description = visible[source].get("description")
+        topics.append(f"{topic} ({description})" if description else topic)
     return "; ".join(topics)
 
 

@@ -18,6 +18,8 @@ prose, just about the wrong documents.
 
 from dataclasses import dataclass, field
 
+from rag_assistant.prompts.synthesis_prompt import REFUSAL_PHRASE
+
 
 @dataclass
 class QuestionMetrics:
@@ -77,6 +79,7 @@ def score_question(
     actual_sources: list[str],
     citation_count: int,
     acceptable_routes: list[str] | None = None,
+    response: str = "",
 ) -> QuestionMetrics:
     """Scores one golden question against what the graph actually did.
 
@@ -95,9 +98,12 @@ def score_question(
                 reciprocal_rank = 1.0 / rank
                 break
 
-    # "Abstained" means the answer cited nothing -- the observable signal that the system
-    # declined to ground a claim, rather than an attempt to parse hedging out of prose.
-    abstained = citation_count == 0
+    # "Abstained" means the answer cited nothing, or opened with the refusal the synthesis
+    # prompt mandates. Both are fixed, observable signals rather than an attempt to parse
+    # hedging out of prose. The second exists because a good refusal explains itself --
+    # "I don't have information on X; the report covers Y [1]" -- and counting only citations
+    # scored every such correct refusal as a confident answer.
+    abstained = citation_count == 0 or response.lstrip().lower().startswith(REFUSAL_PHRASE.lower())
     abstention_correct: bool | None = None
     if category == "unanswerable":
         abstention_correct = abstained

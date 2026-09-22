@@ -284,7 +284,7 @@ def restore(
         # case index_metadata.py exists to catch -- say so now rather than let /ready say it.
         console.print(
             f"[red]Warning:[/red] this backup was built with embeddings "
-            f"{metadata.embedding_model!r} but {get_settings().gemini_embedding_model!r} is "
+            f"{metadata.embedding_model!r} but {get_settings().embedding_model_name!r} is "
             f"configured. /ready will report unavailable until you re-index with "
             f"`rag-assistant ingest --full` or restore the previous model setting."
         )
@@ -343,6 +343,15 @@ def eval_(
     tolerance: float = typer.Option(
         DEFAULT_TOLERANCE, help="How far a metric may fall below baseline before --check fails."
     ),
+    dataset: Path | None = typer.Option(
+        None, help="Golden dataset to run. Defaults to the sample-corpus set CI gates on."
+    ),
+    baseline_path: Path | None = typer.Option(
+        None,
+        "--baseline",
+        help="Baseline to record to or check against. Each dataset needs its own: scores "
+        "are only comparable against a baseline recorded on the same questions and corpus.",
+    ),
 ) -> None:
     """Run the RAGAS eval harness against the golden dataset. `limit` defaults to 3 (not the
     full dataset) because graph execution alone costs ~4 chat-model calls/question -- the
@@ -370,7 +379,7 @@ def eval_(
     from rag_assistant.eval.run_eval import compute_metrics, run_eval
 
     try:
-        results, eval_result = run_eval(limit=limit, llm_judge=llm_judge)
+        results, eval_result = run_eval(limit=limit, llm_judge=llm_judge, dataset_path=dataset)
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -415,13 +424,13 @@ def eval_(
         console.print(f"[green]Wrote results to {output}[/green]")
 
     if record_baseline:
-        written = save_baseline(deterministic)
+        written = save_baseline(deterministic, baseline_path)
         console.print(f"[green]Recorded baseline to {written}[/green]")
 
     if check:
         # A partial run can't be compared against a whole-dataset baseline: --limit 3 scores
         # three questions, and whether those three are the easy ones is luck, not quality.
-        dataset_size = len(load_golden_dataset())
+        dataset_size = len(load_golden_dataset(dataset))
         if limit < dataset_size:
             console.print(
                 f"[red]--check needs the full dataset ({dataset_size} questions); "
@@ -430,7 +439,7 @@ def eval_(
             raise typer.Exit(code=2)
 
         try:
-            baseline = load_baseline()
+            baseline = load_baseline(baseline_path)
         except (BaselineNotFound, BaselineStale) as exc:
             # Exit 2, distinct from the exit 1 a real regression produces: "the gate could not
             # run" and "the gate ran and failed" call for completely different responses, and

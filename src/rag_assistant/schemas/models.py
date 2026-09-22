@@ -1,6 +1,24 @@
-from typing import Literal
+import json
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _decode_stringified_list(value: Any, field: str) -> Any:
+    """Undoes a tool-calling quirk: models occasionally return a list argument as a JSON
+    *string* -- sometimes the bare list, sometimes the whole object re-encoded, as in
+    `grades='{"grades": [...]}'`. Seen from Claude on real traffic, where it failed decomposition
+    outright and silently disabled grading. Anything that doesn't decode to the expected shape
+    is passed through untouched so validation still rejects it."""
+    if not isinstance(value, str):
+        return value
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return value
+    if isinstance(decoded, dict) and field in decoded:
+        decoded = decoded[field]
+    return decoded if isinstance(decoded, list) else value
 
 
 class RetrievedDoc(BaseModel):
@@ -19,8 +37,8 @@ class RouteDecision(BaseModel):
 
     route: Literal["vector", "web", "both", "none"] = Field(
         description=(
-            "'vector' if the local knowledge base likely has this (AI company facts as of "
-            "early 2025), 'web' if it needs current/recent information, 'both' if it needs "
+            "'vector' if the local knowledge base likely has this (judge by its listed "
+            "contents), 'web' if it needs current/recent information, 'both' if it needs "
             "both, 'none' if it's general knowledge that needs no retrieval at all."
         )
     )
@@ -49,6 +67,11 @@ class SubQueries(BaseModel):
             "containing the original question, unchanged."
         )
     )
+
+    @field_validator("sub_queries", mode="before")
+    @classmethod
+    def _decode(cls, value: Any) -> Any:
+        return _decode_stringified_list(value, "sub_queries")
 
 
 class SubQueryResult(BaseModel):
@@ -88,6 +111,11 @@ class DocGradeBatch(BaseModel):
     grades: list[DocGrade] = Field(
         description="Exactly one grade per document, in the same order the documents were given."
     )
+
+    @field_validator("grades", mode="before")
+    @classmethod
+    def _decode(cls, value: Any) -> Any:
+        return _decode_stringified_list(value, "grades")
 
 
 class Citation(BaseModel):

@@ -15,7 +15,7 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.outputs import ChatGenerationChunk, ChatResult
 from langchain_core.runnables import Runnable
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 from rag_assistant.config import get_settings
 from rag_assistant.metrics import MetricsCallbackHandler
@@ -268,8 +268,8 @@ def primary_chat_provider_name() -> str:
     return "Anthropic" if settings.anthropic_api_key else "Gemini"
 
 
-def get_embeddings_model() -> GoogleGenerativeAIEmbeddings:
-    """Always Gemini, even when a local chat provider is configured.
+def get_embeddings_model() -> GoogleGenerativeAIEmbeddings | OpenAIEmbeddings:
+    """The EMBEDDING_PROVIDER's model -- never the local chat provider, and never a fallback.
 
     Embeddings are not interchangeable the way chat models are: the Chroma collection is
     built at one provider's vector dimension, and pointing queries at a different embedding
@@ -278,6 +278,29 @@ def get_embeddings_model() -> GoogleGenerativeAIEmbeddings:
     rather than a fallback the graph can take at runtime.
     """
     settings = get_settings()
+    if settings.embedding_provider == "openai":
+        # max_retries covers the transient 429/5xx a long ingest will eventually meet;
+        # without it one dropped request fails the whole run.
+        return OpenAIEmbeddings(
+            model=settings.openai_embedding_model,
+            api_key=settings.openai_api_key,
+            max_retries=6,
+        )
+    if settings.embedding_provider == "local":
+        return OpenAIEmbeddings(
+            model=settings.local_embedding_model,
+            base_url=settings.local_embedding_base_url,
+            timeout=httpx.Timeout(
+                settings.local_embedding_timeout_seconds,
+                connect=settings.local_embedding_connect_timeout_seconds,
+            ),
+            # Self-hosted servers ignore the key, but the client refuses to start without one.
+            api_key=settings.local_llm_api_key or "unused",
+            # The ctx-length check tokenizes with tiktoken and sends token ids, which only
+            # hosted OpenAI accepts; Ollama and friends need the raw strings.
+            check_embedding_ctx_length=False,
+            max_retries=6,
+        )
     return GoogleGenerativeAIEmbeddings(
         model=settings.gemini_embedding_model,
         google_api_key=settings.google_api_key,

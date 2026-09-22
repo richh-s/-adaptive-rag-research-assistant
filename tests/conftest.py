@@ -18,6 +18,8 @@ def _default_test_env(request, monkeypatch, tmp_path):
     if request.node.get_closest_marker("live"):
         return
     monkeypatch.setenv("GOOGLE_API_KEY", "test-google-key")
+    # Pinned so a developer's .env choosing OpenAI embeddings can't reroute the suite.
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "gemini")
     # Tests run fully offline by default -- no local Redis is assumed to be running, and
     # caching behavior itself is tested separately with an explicit fake client.
     monkeypatch.setenv("USE_CACHE", "false")
@@ -37,6 +39,9 @@ def _default_test_env(request, monkeypatch, tmp_path):
     # PDF vision ingestion would otherwise attempt real API calls whenever a test PDF has
     # an image-only page; tests that exercise the vision path mock describe_image directly.
     monkeypatch.setenv("PDF_VISION", "false")
+    # Same for the per-file router label: a real chat call per ingested file. Tests that
+    # exercise it patch describe_document directly.
+    monkeypatch.setenv("DESCRIBE_DOCUMENTS", "false")
     # Ingest retries are real sleeps. Tests that exercise the retry path assert the attempt
     # count, not the wall clock, and a 2s default would add seconds per failing-ingest test.
     monkeypatch.setenv("INGEST_RETRY_DELAY_SECONDS", "0")

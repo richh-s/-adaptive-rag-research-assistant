@@ -52,7 +52,8 @@ class Settings(BaseSettings):
     local_llm_chat_model: str = "gemma-4-26b"
     # Deliberately NOT a local embeddings switch: the Chroma collection is built at one
     # embedding dimension, and swapping providers under an existing index yields silent
-    # garbage retrieval rather than an error. Embeddings stay on Gemini -- see llm.py.
+    # garbage retrieval rather than an error. The provider is chosen by EMBEDDING_PROVIDER
+    # below instead, which is recorded in the index metadata so a swap is detected.
 
     # Local generation is slow (a 26B on one GPU scores a draft in ~20-25s), so the read
     # timeout is long -- but the connect timeout is short on purpose. Off the tailnet there is
@@ -78,6 +79,25 @@ class Settings(BaseSettings):
     gemini_chat_model: str = "gemini-2.5-flash"
     gemini_embedding_model: str = "models/gemini-embedding-001"
     anthropic_chat_model: str = "claude-sonnet-5"
+
+    # Which provider embeds the corpus and queries. Gemini's free tier caps embedding requests
+    # low enough that a real PDF corpus exhausts it mid-ingest; "openai" is the paid way out.
+    # Switching is a one-way move that needs `rag-assistant ingest --full`: the index records
+    # `embedding_model_name` and /ready refuses to serve a collection built by another model.
+    embedding_provider: Literal["gemini", "openai", "local"] = "gemini"
+    openai_api_key: str = ""
+    openai_embedding_model: str = "text-embedding-3-small"
+    # "local" is any OpenAI-compatible /v1/embeddings server (Ollama, vLLM, TEI). Unlike the
+    # local *chat* tier there is no fallback: when the server is unreachable, ingest and every
+    # query fail, because no other model can embed into this index.
+    local_embedding_base_url: str = ""
+    local_embedding_model: str = "all-minilm"
+    # Embedding a batch of chunks is slower than a chat turn, so the read timeout is
+    # generous -- but the connect timeout is short on purpose, as for the local chat tier:
+    # when the box is off the tailnet there is no route at all, and embeddings have no
+    # fallback, so every query should fail in seconds rather than hang.
+    local_embedding_timeout_seconds: float = 60.0
+    local_embedding_connect_timeout_seconds: float = 3.0
 
     corpus_dir: Path = PROJECT_ROOT / "data" / "corpus"
     # Where the vector index lives. "chroma" is the default and is correct for one container:
@@ -200,6 +220,12 @@ class Settings(BaseSettings):
     # transcribe scanned pages with the chat provider's vision capability. Costs one
     # vision call per figure/scanned page at ingest time; PDF_VISION=false disables.
     pdf_vision: bool = True
+    # One short chat call per ingested file writes a one-line label (publisher, document
+    # type, period) that the router sees in place of the bare filename -- see
+    # ingestion/describe.py for the failure it fixes. Off means the router sees filenames.
+    describe_documents: bool = True
+    # Charged per description call; deliberately high like the vision estimate (budget.py).
+    description_call_token_estimate: int = 1500
 
     # caching (Redis) -- see cache.py. `use_cache` lets tests/offline runs disable it outright.
     use_cache: bool = True
@@ -310,6 +336,25 @@ class Settings(BaseSettings):
                 "individual backends explicitly if you meant something narrower."
             )
         return self
+
+    @model_validator(mode="after")
+    def _require_embedding_key(self) -> "Settings":
+        # Failing at startup beats failing on the first ingest, minutes into a parse.
+        if self.embedding_provider == "openai" and not self.openai_api_key:
+            raise ValueError("EMBEDDING_PROVIDER=openai needs OPENAI_API_KEY.")
+        if self.embedding_provider == "local" and not self.local_embedding_base_url:
+            raise ValueError("EMBEDDING_PROVIDER=local needs LOCAL_EMBEDDING_BASE_URL.")
+        return self
+
+    @property
+    def embedding_model_name(self) -> str:
+        """The model that actually embeds, as recorded in the index metadata. Prefixed by
+        provider so a name can never collide across providers in the mismatch check."""
+        if self.embedding_provider == "openai":
+            return f"openai/{self.openai_embedding_model}"
+        if self.embedding_provider == "local":
+            return f"local/{self.local_embedding_model}"
+        return self.gemini_embedding_model
 
     def cors_origins(self) -> list[str]:
         """CORS_ALLOW_ORIGINS split into the list CORSMiddleware wants. Blank means no

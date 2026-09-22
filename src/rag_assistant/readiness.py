@@ -1,4 +1,4 @@
-"""Liveness checks for the two external dependencies the graph can't function without.
+"""Liveness checks for the external dependencies the graph can't function without.
 Kept lightweight and side-effect-free: no embedding calls, no web-search requests spent —
 these run on every `/ready` poll from a load balancer/orchestrator, so cost has to stay ~0."""
 
@@ -20,14 +20,34 @@ def check_chroma() -> tuple[bool, str | None]:
 def check_embeddings() -> tuple[bool, str | None]:
     """Whether the configured embedding model matches the one the index was built with.
 
-    A pure file read -- no embedding call, so it stays free enough to run on every `/ready`
-    poll. This is the one readiness check whose failure mode is *silent*: the other
-    dependencies error when they're broken, whereas a mismatched embedding model keeps
-    answering, plausibly and wrongly. That is exactly why it belongs in readiness rather
-    than in a log line somebody might notice later.
+    Two failures, both fatal to answering. The model recorded in the index not matching the
+    configured one is the *silent* failure: other dependencies error when broken, while a
+    mismatched embedding model keeps answering, plausibly and wrongly. The second is a
+    self-hosted embedding server that has gone away -- unlike the local *chat* tier there is
+    no fallback, because only the model that built the index can query it, so an unreachable
+    server means every question fails and this replica should leave the load balancer.
+
+    Still cheap: a file read, plus (for a local server) one HEAD-weight GET of /models. No
+    embedding call is ever spent on a readiness poll.
     """
     settings = get_settings()
-    return check_embedding_model(settings.chroma_persist_dir, settings.gemini_embedding_model)
+    matches, error = check_embedding_model(
+        settings.chroma_persist_dir, settings.embedding_model_name
+    )
+    if not matches:
+        return matches, error
+    if settings.embedding_provider == "local":
+        url = f"{settings.local_embedding_base_url.rstrip('/')}/models"
+        try:
+            httpx.get(
+                url,
+                timeout=httpx.Timeout(
+                    3.0, connect=settings.local_embedding_connect_timeout_seconds
+                ),
+            )
+        except httpx.HTTPError as exc:
+            return False, f"embedding server {settings.local_embedding_base_url} unreachable: {exc}"
+    return True, None
 
 
 def check_web_search() -> tuple[bool, str | None]:

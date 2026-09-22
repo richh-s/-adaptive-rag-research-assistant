@@ -857,7 +857,7 @@ def test_the_embedding_model_record_is_readable_from_a_replica_that_did_not_inge
     elsewhere = tmp_path / "never-written"
     recorded = load_index_metadata(elsewhere)
     assert recorded is not None
-    assert recorded.embedding_model == get_settings().gemini_embedding_model
+    assert recorded.embedding_model == get_settings().embedding_model_name
 
     ok, error = check_embedding_model(elsewhere, "models/some-other-embedding-model")
 

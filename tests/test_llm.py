@@ -6,6 +6,7 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.outputs import ChatGenerationChunk
 from langchain_core.runnables import RunnableWithFallbacks
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
 
 from rag_assistant import llm
 from rag_assistant.config import get_settings
@@ -221,6 +222,50 @@ def test_embeddings_stay_on_gemini_even_with_a_local_chat_provider(monkeypatch):
     assert isinstance(llm.get_embeddings_model(), GoogleGenerativeAIEmbeddings)
 
 
+def test_embeddings_use_openai_when_selected(monkeypatch):
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+
+    model = llm.get_embeddings_model()
+
+    assert isinstance(model, OpenAIEmbeddings)
+    assert model.model == "text-embedding-3-small"
+    # Recorded under a provider prefix, so the index-mismatch check sees a Gemini-built
+    # collection as foreign rather than comparing bare model names.
+    assert get_settings().embedding_model_name == "openai/text-embedding-3-small"
+
+
+def test_embeddings_use_a_local_server_when_selected(monkeypatch):
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_EMBEDDING_BASE_URL", LOCAL_URL)
+    monkeypatch.setenv("LOCAL_EMBEDDING_MODEL", "all-minilm")
+
+    model = llm.get_embeddings_model()
+
+    assert isinstance(model, OpenAIEmbeddings)
+    assert model.model == "all-minilm"
+    assert str(model.openai_api_base).rstrip("/") == LOCAL_URL
+    # Token-id inputs are a hosted-OpenAI-only format; a local server needs raw strings.
+    assert model.check_embedding_ctx_length is False
+    assert get_settings().embedding_model_name == "local/all-minilm"
+
+
+def test_local_embeddings_without_a_url_fail_at_startup(monkeypatch):
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_EMBEDDING_BASE_URL", "")
+
+    with pytest.raises(RuntimeError, match="Missing or invalid configuration"):
+        get_settings()
+
+
+def test_openai_embeddings_without_a_key_fail_at_startup(monkeypatch):
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+
+    with pytest.raises(RuntimeError, match="Missing or invalid configuration"):
+        get_settings()
+
+
 # --- local-server response quirks -----------------------------------------------------
 
 
@@ -388,3 +433,17 @@ def test_hello_names_the_provider_that_answered_not_the_configured_one(monkeypat
     assert "gemini" in output.lower()
     # And it says so explicitly, rather than leaving the reader to notice.
     assert "did not answer" in output
+
+
+def test_local_embeddings_fail_fast_when_the_box_is_unreachable(monkeypatch):
+    """Embeddings have no fallback, so a dead box must fail in seconds rather than hang
+    every query: short connect timeout, generous read timeout for large batches."""
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_EMBEDDING_BASE_URL", LOCAL_URL)
+
+    timeout = llm.get_embeddings_model().client._client.timeout
+    settings = get_settings()
+
+    assert timeout.connect == settings.local_embedding_connect_timeout_seconds
+    assert timeout.connect < settings.graph_timeout_seconds
+    assert timeout.read == settings.local_embedding_timeout_seconds
