@@ -1,0 +1,86 @@
+# The quality gate that runs against a *private* corpus -- the one the committed sample
+# corpus cannot stand in for.
+#
+# It is a separate workflow rather than a job in ci.yml because it cannot run on a
+# GitHub-hosted runner: the corpus is git-ignored and the embedding model may be reachable
+# only from a private network. Point PRIVATE_EVAL_RUNNER at a self-hosted runner that has
+# both, and this gates; leave it unset and every run skips with a notice rather than a
+# failure, which is the honest state for a fork or a fresh clone.
+#
+# Scheduled rather than per-push: the run costs real provider calls, and a private corpus
+# changes far less often than the code does.
+name: Private eval
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays, 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    runs-on: ${{ vars.PRIVATE_EVAL_RUNNER || 'ubuntu-latest' }}
+    env:
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # The private corpus and its golden set live on the runner, not in the repo.
+      CORPUS_DIR: ${{ vars.PRIVATE_CORPUS_DIR }}
+      EMBEDDING_PROVIDER: ${{ vars.PRIVATE_EMBEDDING_PROVIDER }}
+      LOCAL_EMBEDDING_BASE_URL: ${{ vars.PRIVATE_EMBEDDING_BASE_URL }}
+      LOCAL_EMBEDDING_MODEL: ${{ vars.PRIVATE_EMBEDDING_MODEL }}
+      USE_CACHE: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Every precondition is reported rather than assumed, and a missing one skips instead
+      # of failing: a gate that goes red for reasons unrelated to quality trains everyone to
+      # ignore it.
+      - name: Check preconditions
+        id: guard
+        shell: bash
+        run: |
+          missing=""
+          [ -n "${{ vars.PRIVATE_CORPUS_DIR }}" ] || missing="$missing PRIVATE_CORPUS_DIR"
+          [ -d "data/golden_eval/private" ] || missing="$missing data/golden_eval/private"
+          [ -f "data/golden_eval/private/baseline.json" ] || missing="$missing baseline.json"
+          [ -n "${{ secrets.GOOGLE_API_KEY }}" ] || missing="$missing GOOGLE_API_KEY"
+          if [ -n "$missing" ]; then
+            echo "::notice::Private eval skipped -- missing:$missing"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.guard.outputs.enabled == 'true'
+        run: uv sync --frozen
+
+      # Incremental: unchanged files cost nothing, so this is a no-op unless the corpus moved.
+      - name: Index the private corpus
+        if: steps.guard.outputs.enabled == 'true'
+        run: uv run rag-assistant ingest
+
+      - name: Eval gate
+        if: steps.guard.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set +e
+          uv run rag-assistant eval \
+            --dataset data/golden_eval/private/dataset.jsonl \
+            --baseline data/golden_eval/private/baseline.json \
+            --limit 50 --check
+          status=$?
+          set -e
+          # Exit 2 is "the gate could not run" (no baseline, or one marked stale) -- a signal
+          # to re-record deliberately, not evidence that retrieval got worse. Exit 1 is a real
+          # regression and fails the run.
+          if [ "$status" = "2" ]; then
+            echo "::warning::Private eval could not run -- re-record its baseline."
+            exit 0
+          fi
+          exit $status

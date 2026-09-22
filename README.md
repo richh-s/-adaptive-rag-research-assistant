@@ -599,6 +599,33 @@ carry the load beyond that:
   mutation. An HNSW index built with the wrong operator class never errors either; the `<=>`
   query silently stops using it and falls back to a sequential scan.
 
+### When the embedding server is unreachable
+
+The one dependency with no fallback, so it gets a runbook rather than a paragraph. Chat degrades
+between providers; embeddings cannot, because only the model that built the index can query it.
+
+**Symptom.** `/ready` returns 503 with `embeddings.error` naming the server, and every question
+fails. `/health` stays 200: the process is fine, the dependency is not.
+
+```bash
+curl -s localhost:8000/ready | jq .embeddings      # what readiness saw
+curl -sS $LOCAL_EMBEDDING_BASE_URL/models          # is the server itself up?
+```
+
+**If the server is coming back:** nothing to do. Requests fail fast (short connect timeout) and
+recover the moment it answers; the index is untouched and no re-ingest is needed.
+
+**If it is not coming back**, switch to a hosted provider — which means re-embedding the corpus,
+because the stored vectors belong to the old model:
+
+```bash
+EMBEDDING_PROVIDER=gemini   # or openai
+uv run rag-assistant ingest --full     # re-parses and re-embeds; PDFs pay vision calls again
+```
+
+Avoiding that outage entirely is a deployment choice, not a code one: run the embedding model
+in the same failure domain as the app, or embed with a hosted provider and accept the bill.
+
 ### Concurrency ceiling
 
 Worth stating explicitly because it is arithmetic, not a benchmark, and nothing else in this
