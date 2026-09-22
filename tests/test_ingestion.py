@@ -294,3 +294,72 @@ def test_image_only_pdf_still_skipped_when_vision_disabled(sample_corpus_dir):
     docs = load_documents(sample_corpus_dir)
 
     assert all(d.metadata["source"] != "scan2.pdf" for d in docs)
+
+
+def _pdf_with_repeated_image(path, pages: int = 3) -> None:
+    """A logo re-embedded on every page, as real reports do."""
+    import pymupdf
+
+    logo = _png_bytes(200, 150)
+    doc = pymupdf.open()
+    for i in range(pages):
+        page = doc.new_page()
+        page.insert_text((72, 72), f"Page {i + 1} text.")
+        page.insert_image(pymupdf.Rect(72, 100, 272, 250), stream=logo)
+    doc.save(str(path))
+    doc.close()
+
+
+def test_a_repeated_image_is_described_once(sample_corpus_dir, monkeypatch):
+    """A report's logo and header band are re-embedded on every page. Describing each one
+    spent the per-PDF budget on the same image over and over -- measured on a real 20-page
+    annual report, 320 images cleared the size filter for perhaps a dozen distinct figures."""
+    monkeypatch.setenv("PDF_VISION", "true")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+    calls = []
+    monkeypatch.setattr(
+        "rag_assistant.ingestion.vision.describe_image",
+        lambda image_bytes, media_type, prompt: calls.append(image_bytes) or "A logo.",
+    )
+
+    _pdf_with_repeated_image(sample_corpus_dir / "report.pdf", pages=4)
+    docs = load_documents(sample_corpus_dir)
+
+    assert len(calls) == 1
+    described = [
+        d for d in docs if d.metadata["source"] == "report.pdf" and "[Figure" in d.page_content
+    ]
+    assert len(described) == 1
+
+
+def test_the_figure_budget_is_configurable(sample_corpus_dir, monkeypatch):
+    monkeypatch.setenv("PDF_VISION", "true")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("PDF_VISION_MAX_IMAGES", "2")
+    from rag_assistant.config import get_settings
+
+    get_settings.cache_clear()
+    calls = []
+    monkeypatch.setattr(
+        "rag_assistant.ingestion.vision.describe_image",
+        lambda image_bytes, media_type, prompt: calls.append(1) or "figure",
+    )
+
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Charts follow.")
+    for i in range(5):  # five *distinct* images
+        page.insert_image(
+            pymupdf.Rect(72, 100 + i, 272, 250 + i), stream=_png_bytes(200 + i, 150 + i)
+        )
+    doc.save(str(sample_corpus_dir / "charts.pdf"))
+    doc.close()
+
+    load_documents(sample_corpus_dir)
+
+    assert len(calls) == 2

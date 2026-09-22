@@ -237,6 +237,37 @@ def get_structured_llm(schema: type, temperature: float = 0.0) -> Runnable:
     return _with_fallbacks(structured)
 
 
+class _JudgeChatAnthropic(ChatAnthropic):
+    """Claude for RAGAS's judged metrics, deaf to temperature.
+
+    Current Claude models reject `temperature` with an HTTP 400, and RAGAS assigns it onto the
+    wrapped model before every judge call (`langchain_llm.temperature = ...`). Every judged
+    metric therefore failed and the run reported `faithfulness: nan` -- a metric that silently
+    evaluates to "no result" is worse than one that errors, because the report still prints.
+    Ignoring the assignment keeps the field at the None this codebase always passes.
+    """
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "temperature":
+            return
+        super().__setattr__(name, value)
+
+
+def get_judge_chat_model() -> BaseChatModel:
+    """The model behind `eval --llm-judge`. Not the graph's model: it needs a far longer
+    timeout (whole-row prompts, several per row) and must tolerate RAGAS setting temperature."""
+    settings = get_settings()
+    if settings.anthropic_api_key:
+        return _JudgeChatAnthropic(
+            model=settings.anthropic_chat_model,
+            api_key=settings.anthropic_api_key,
+            default_request_timeout=settings.judge_request_timeout_seconds,
+            max_retries=settings.llm_max_retries,
+            callbacks=[MetricsCallbackHandler("anthropic", settings.anthropic_chat_model)],
+        )
+    return _gemini_chat_model(0.0, timeout=settings.judge_request_timeout_seconds)
+
+
 def get_raw_chat_model(temperature: float = 0.0) -> BaseChatModel:
     """The highest-priority chat model with no fallback wrapping.
 

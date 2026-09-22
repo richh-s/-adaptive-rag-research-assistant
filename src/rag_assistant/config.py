@@ -223,6 +223,12 @@ class Settings(BaseSettings):
     # One short chat call per ingested file writes a one-line label (publisher, document
     # type, period) that the router sees in place of the bare filename -- see
     # ingestion/describe.py for the failure it fixes. Off means the router sees filenames.
+    # How many distinct figures per PDF get a vision description. Duplicates (a logo repeated
+    # on every page) are described once and cost one, so this counts real figures: measured on
+    # a 30-report corpus, 20 covered every file except the chart-heavy annual reports, which
+    # had 30-60 distinct figures each. Raising it costs one vision call per extra figure, at
+    # ingest only.
+    pdf_vision_max_images: int = 20
     describe_documents: bool = True
     # Charged per description call; deliberately high like the vision estimate (budget.py).
     description_call_token_estimate: int = 1500
@@ -308,6 +314,10 @@ class Settings(BaseSettings):
     # to a 12s read timeout mid-answer. Still under graph_timeout_seconds, so the deadline
     # around the whole graph remains the outer bound.
     synthesis_request_timeout_seconds: float = 30.0
+    # RAGAS's judged metrics send the question, the answer and every retrieved context in one
+    # prompt, and run several per row. The structured-call timeout is far too short for that:
+    # it turned a judged eval run into a column of NaN.
+    judge_request_timeout_seconds: float = 90.0
     llm_max_retries: int = 1
 
     @model_validator(mode="after")

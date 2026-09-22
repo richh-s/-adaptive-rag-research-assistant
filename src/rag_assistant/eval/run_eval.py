@@ -18,7 +18,7 @@ from rag_assistant.eval.metrics import EvalMetrics, aggregate, score_question
 from rag_assistant.graph.build_graph import build_graph
 from rag_assistant.graph.nodes.report import used_citations
 from rag_assistant.ingestion.ownership import display_source
-from rag_assistant.llm import get_embeddings_model, get_raw_chat_model
+from rag_assistant.llm import get_embeddings_model, get_judge_chat_model
 from rag_assistant.schemas.models import GoldenQuestion
 
 _RECURSION_LIMIT = 50
@@ -132,7 +132,7 @@ def run_eval(
     llm = None
     embeddings = None
     if llm_judge:
-        llm = LangchainLLMWrapper(get_raw_chat_model())
+        llm = LangchainLLMWrapper(get_judge_chat_model())
         embeddings = LangchainEmbeddingsWrapper(get_embeddings_model())
         metrics += [Faithfulness(llm=llm), ResponseRelevancy(llm=llm, embeddings=embeddings)]
 

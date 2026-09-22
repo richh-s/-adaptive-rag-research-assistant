@@ -8,6 +8,7 @@ import pymupdf4llm
 from bs4 import BeautifulSoup
 from langchain_core.documents import Document
 
+from rag_assistant.config import get_settings
 from rag_assistant.ingestion import vision
 from rag_assistant.ingestion.ownership import owner_of_relative_path
 
@@ -25,10 +26,19 @@ logger = logging.getLogger(__name__)
 _SCAN_RENDER_ZOOM = 2.0
 
 
-def _describe_page_figures(doc: "pymupdf.Document", page_index: int, budget: list[int]) -> str:
+def _describe_page_figures(
+    doc: "pymupdf.Document", page_index: int, budget: list[int], seen: set[str]
+) -> str:
     """Vision pass over one page's embedded images: returns "[Figure on page N: ...]" blocks
-    to append to the page text, so charts/diagrams/photos become searchable. `budget` is a
-    single-element mutable counter shared across the whole PDF (MAX_IMAGES_PER_PDF)."""
+    to append to the page text, so charts/diagrams/photos become searchable.
+
+    `budget` is a single-element mutable counter shared across the whole PDF
+    (PDF_VISION_MAX_IMAGES) and `seen` the content hashes already described in it. The second
+    is what makes the first worth having: a report's logo and header band are re-embedded on
+    every page, so on a real 20-page annual report 320 of the images cleared the size filter
+    for perhaps a dozen distinct figures. Describing each byte-identical image once spends the
+    budget on charts instead of on the same logo twenty times.
+    """
     blocks = []
     try:
         images = doc[page_index].get_images(full=True)
@@ -49,6 +59,10 @@ def _describe_page_figures(doc: "pymupdf.Document", page_index: int, budget: lis
             or extracted.get("height", 0) < vision.MIN_IMAGE_DIMENSION_PX
         ):
             continue
+        digest = hashlib.sha256(extracted["image"]).hexdigest()
+        if digest in seen:
+            continue
+        seen.add(digest)
         budget[0] -= 1
         description = vision.describe_image(
             extracted["image"], f"image/{extracted.get('ext', 'png')}", vision.FIGURE_PROMPT
@@ -154,7 +168,8 @@ def _load_pdf(path: Path) -> list[Document]:
             vision_doc = pymupdf.open(str(path))
         except Exception:
             logger.warning("Could not reopen %s for vision passes", path.name, exc_info=True)
-    figure_budget = [vision.MAX_IMAGES_PER_PDF]
+    figure_budget = [get_settings().pdf_vision_max_images]
+    described_digests: set[str] = set()
 
     documents = []
     for page_index, page in enumerate(pages):
@@ -172,7 +187,9 @@ def _load_pdf(path: Path) -> list[Document]:
                 # questions find a non-English scan -- is asked of the transcription itself.
                 text = _transcribe_scanned_page(vision_doc, page_index).strip()
             else:
-                figures = _describe_page_figures(vision_doc, page_index, figure_budget)
+                figures = _describe_page_figures(
+                    vision_doc, page_index, figure_budget, described_digests
+                )
                 if figures:
                     text = f"{text}\n\n{figures}".strip()
 

@@ -463,3 +463,17 @@ def test_synthesis_gets_a_longer_request_timeout_than_the_structured_calls(monke
     assert default_model.default_request_timeout == settings.llm_request_timeout_seconds
     assert synthesis_model.default_request_timeout == settings.synthesis_request_timeout_seconds
     assert settings.synthesis_request_timeout_seconds < settings.graph_timeout_seconds
+
+
+def test_the_judge_model_ignores_ragas_setting_temperature(monkeypatch):
+    """RAGAS assigns `temperature` onto the wrapped model before every judged call, and
+    current Claude models reject it with a 400 -- which showed up as `faithfulness: nan`
+    rather than as an error, because a judged run still prints its report."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+
+    judge = llm.get_judge_chat_model()
+    judge.temperature = 0.3  # what RAGAS does
+
+    assert judge.temperature is None
+    assert judge.default_request_timeout == get_settings().judge_request_timeout_seconds
+    assert get_settings().judge_request_timeout_seconds > get_settings().llm_request_timeout_seconds

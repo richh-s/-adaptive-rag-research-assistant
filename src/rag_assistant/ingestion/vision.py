@@ -25,6 +25,8 @@ MIN_IMAGE_DIMENSION_PX = 100
 # to keep this module dependency-free.
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 # Backstop against pathological PDFs (e.g. one image per bullet point across 200 pages).
+# Default for PDF_VISION_MAX_IMAGES (config.py), kept here beside the other vision limits.
+# Per *distinct* image since duplicates are described once -- see loaders._describe_page_figures.
 MAX_IMAGES_PER_PDF = 20
 
 FIGURE_PROMPT = """This image is a figure from a document being indexed for search. Describe it \

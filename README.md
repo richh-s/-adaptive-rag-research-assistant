@@ -473,6 +473,27 @@ The last row is the one that would have been hardest to guess: prefixing each ch
 document's label costs one line per chunk and moved context recall further than changing the
 embedding model did.
 
+**Against naive RAG.** Same index, same questions, same synthesis prompt — but retrieval as a
+first implementation would write it: embed the question as typed, take the top 6 chunks,
+answer. No routing, decomposition, BM25, fusion, grading or corrective search. Scored over the
+34 rows that name a source document, since naive RAG has no path to the web or abstention rows:
+
+| | Naive RAG (top-6) | This pipeline |
+| --- | --- | --- |
+| Source recall | 0.897 | **0.985** |
+| MRR | 0.919 | **1.000** |
+| Abstention accuracy | 0.882 | **1.000** |
+
+Both ran against the *improved* index, so this isolates the pipeline from retrieval quality:
+the labels and context lines help naive RAG too, and the remaining gap is what routing, hybrid
+retrieval, fusion and grading add on top.
+
+**Judged metrics.** `--llm-judge` adds RAGAS faithfulness and answer relevancy, scored by the
+chat model rather than by string overlap. On 8 rows: **faithfulness 0.970, answer relevancy
+0.939**. Worth reading with the deterministic metrics rather than instead of them — they cost
+several model calls per row and move a little between runs, which is why the gate uses the
+free ones.
+
 ### Retrieval tuning
 
 Three knobs, all off by default, because each trades cost or a dependency for quality. Turning
@@ -612,6 +633,13 @@ that matters.
 
 Measured on a laptop, single worker, concurrency 25: **376 rps on `/health`** and **407 rps on a
 SQLite-backed endpoint**, p95 172ms and 109ms, no errors.
+
+The pipeline itself, measured once against the 30-report corpus (12 requests at concurrency 4,
+a `vector`-routed question, Claude for chat and a tailnet-hosted embedding model): **p50 10.3s,
+p95 11.0s, p99 11.1s**, 0.4 rps. Two of the twelve came back 429 — the per-IP limiter
+(`RATE_LIMIT_RPM`, default 10/min) doing its job, which is worth knowing before reading a load
+test's error rate as failure. p95 sits inside the 12s objective below, and the flat spread
+between p50 and p99 says the time is provider latency rather than queueing at this concurrency.
 
 ### Running on self-hosted models
 
@@ -882,6 +910,8 @@ found by running the eval rather than by reading code:
 | PDF vision | Every scanned page was read **twice**: transcribed, then "figure described" — because a scan's only embedded image is the page itself. Double the vision cost, the 20-image budget spent on scans instead of real charts, and a second looser copy whose numbers could contradict the transcript (4,081.50 transcribed vs 4,082.50 described, on a real CBE key-figures page) | The figure pass now runs only on pages that have a text layer. Figure-described pages fell 273 → 151 on the same corpus |
 | Non-English scans | Removing that duplicate pass also removed the one thing it did well — an English gloss that let English questions match an Amharic scan. Two eval rows regressed from correct to not-found | The transcription prompt now ends with an `[English summary: ...]` line when the page isn't in English — same single call. Both rows returned to rank 1 |
 | Eval harness | One provider timeout at question 40 aborted the whole run and discarded the 39 results before it; and a correct refusal that cites its context ("I don't have information on X; the procedure covers Y [1]") was scored as a confident answer | A failing question is scored as the failure it is and the run continues; abstention counts a citation-free answer *or* one opening with the refusal phrase the synthesis prompt mandates (shared constant, pinned by a test) |
+| Judged metrics | `eval --llm-judge` reported `faithfulness: nan` and `answer_relevancy: nan` rather than failing. RAGAS assigns `temperature` onto the wrapped model before every judge call and current Claude models reject it with an HTTP 400; the judge also inherited the 12s structured-call timeout, too short for whole-row prompts. Every judged run had been silently empty | A judge model that ignores the temperature assignment, with its own 90s timeout (`JUDGE_REQUEST_TIMEOUT_SECONDS`). Faithfulness 0.970 / answer relevancy 0.939 on the first run that produced numbers at all |
+| Figure budget | The per-PDF vision budget was spent on duplicates: a report's logo and header band are re-embedded on every page, so one 20-page annual report offered 320 images that cleared the size filter for perhaps a dozen distinct figures. Across the corpus, 1,043 eligible images were only **454 distinct** ones | Byte-identical images are described once per PDF, and the cap became `PDF_VISION_MAX_IMAGES` so a chart-heavy corpus can raise it deliberately |
 | Chunk context | A chunk carried its heading breadcrumb but nothing naming the document it came from. Across four near-identical Ethio Re reports and four CBE ones, the passage answering "Ethiopian Reinsurance's 2020/21 profit before tax" — "During the period under review, the Company has registered Birr 220 million profit before tax" — did not reach the top 20 for that question, though its own report took the first four places | Every chunk is prefixed with its document's label before embedding. That passage now ranks 8th, and across the 50 questions MRR reached 1.000 with context recall 0.561 → 0.926 |
 
 Verified with the full offline suite (68/68) plus a live end-to-end run: a real router call
@@ -909,13 +939,15 @@ has none.
   stale nor recorded over a different number of questions, because either one turns the gate
   inert while leaving it in the workflow. It still measures the five-file sample corpus; a
   private corpus keeps its own dataset and baseline (see [Evaluation](#evaluation)).
-- **The eval set is 50 hand-authored questions with no baseline system to compare against.**
+- **The eval set is 50 hand-authored questions.**
   Larger than the 28 it started at, and balanced across all five categories and all four
   routes, but still small enough that one flipped routing decision moves an aggregate by about
   two points — which is why it compares against a recorded baseline with a tolerance rather
   than against absolute thresholds. It tells you whether a change made things *worse*; it
   cannot tell you how good the system is in absolute terms. Every row is authored against the
-  same five-document corpus, so it measures this system on this corpus and nothing wider.
+  same five-document corpus, so it measures this system on this corpus and nothing wider. A
+  naive-RAG comparison now exists for the private corpus (see [Evaluation](#evaluation)), but
+  not for this one.
 - **Retrieval-quality features are correctness-tested, not quality-measured.** Semantic
   chunking, reranking and small-to-big all behave as specified and are covered by tests, but
   whether they *improve* answers on a given corpus is exactly what the eval gate answers — and
@@ -980,11 +1012,13 @@ has none.
   pass notices the stale record. A broker is the right answer once ingest volume justifies
   operating one.
 
-- **The concurrency ceiling is stated but not load-tested at the pipeline level.** The published
-  throughput numbers are `/health` and a SQLite-backed endpoint; they measure the HTTP stack.
-  What `API_THREADPOOL_SIZE` concurrent *research* calls actually do to p99 — against real
-  provider rate limits — has not been measured, and the arithmetic below is a bound, not a
-  benchmark.
+- **The pipeline is load-tested only at low concurrency.** `/api/v1/research` has now been
+  measured end to end (12 requests at concurrency 4: p50 10.3s, p95 11.0s, p99 11.1s), which is
+  enough to confirm the latency objective and that the tail is provider latency rather than
+  queueing. What it does *not* establish is behaviour at the `API_THREADPOOL_SIZE` ceiling: the
+  per-IP rate limiter starts returning 429 long before 40 concurrent research calls, so testing
+  that ceiling means raising `RATE_LIMIT_RPM` deliberately and spending real provider quota. The
+  arithmetic below remains a bound, not a benchmark.
 - **Choosing an embedding provider is one-way.** Switching means a full re-index. `/ready` detects
   the mismatch rather than serving nonsense, and on the pgvector backend a model of a *different*
   width is rejected outright at insert — but a model of the *same* width is still caught only by
