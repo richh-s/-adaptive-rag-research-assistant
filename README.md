@@ -902,11 +902,13 @@ documents fusion returns — has since been closed; see **Context budget** in
 Stated plainly, because knowing where a system's edges are is more useful than pretending it
 has none.
 
-- **`route_accuracy` is now scored against `acceptable_routes`, and the baseline predates
-  it.** The dataset lists every defensible route per question rather than asserting one, so
-  the metric finally means "the router chose defensibly". The recorded baseline (0.786) was
-  measured before that change, against 28 rows, and is marked stale -- the gate refuses to
-  compare until someone re-records it with real API keys. **Nobody has re-measured it yet.**
+- **The committed baseline is current, and that is what makes the gate real.** It was
+  re-recorded on 2026-09-22 over all 50 rows with Gemini embeddings -- the combination CI runs
+  -- so `--check` compares instead of exiting "could not run": route accuracy 0.940, source
+  recall 0.981, MRR 0.981, abstention 1.000. A test asserts the committed baseline is neither
+  stale nor recorded over a different number of questions, because either one turns the gate
+  inert while leaving it in the workflow. It still measures the five-file sample corpus; a
+  private corpus keeps its own dataset and baseline (see [Evaluation](#evaluation)).
 - **The eval set is 50 hand-authored questions with no baseline system to compare against.**
   Larger than the 28 it started at, and balanced across all five categories and all four
   routes, but still small enough that one flipped routing decision moves an aggregate by about

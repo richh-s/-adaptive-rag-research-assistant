@@ -356,18 +356,27 @@ def test_recording_a_baseline_clears_the_stale_marker(tmp_path):
     assert load_baseline(path)["route_accuracy"] == 1.0
 
 
-def test_the_committed_baseline_is_currently_marked_stale():
-    """Documents the live state rather than asserting a number nobody has re-measured. The
-    committed baseline was recorded against a 28-row dataset and the pre-trust-preamble
-    prompts; it must not be compared against until re-recorded with real API keys."""
+def test_the_committed_baseline_can_actually_gate():
+    """The failure this guards is a silently inert gate. A baseline that is stale, or recorded
+    over a different number of questions than the dataset now holds, makes `--check` exit 2 --
+    "could not run" -- which CI reports as a warning and passes. The gate then protects
+    nothing while still appearing in the workflow. Re-recorded 2026-09-22 against the 50-row
+    dataset with Gemini embeddings, the combination CI runs."""
     import json
 
     from rag_assistant.eval.baseline import DEFAULT_BASELINE_PATH
+    from rag_assistant.eval.golden_dataset import load_golden_dataset
 
     payload = json.loads(DEFAULT_BASELINE_PATH.read_text())
 
-    assert payload.get("stale") is True
-    assert "re-record" in payload["stale_reason"].lower()
+    assert not payload.get("stale"), payload.get("stale_reason")
+    assert payload["question_count"] == len(load_golden_dataset())
+    assert set(payload["metrics"]) == {
+        "route_accuracy",
+        "source_recall",
+        "mean_reciprocal_rank",
+        "abstention_accuracy",
+    }
 
 
 def test_a_question_that_errors_is_scored_as_a_failure_not_a_crash():
