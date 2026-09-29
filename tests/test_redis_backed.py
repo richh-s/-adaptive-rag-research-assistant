@@ -88,3 +88,63 @@ def test_an_ingest_task_is_visible_to_another_replica(redis_env):
     assert fetched is not None, "task was not visible outside the process that created it"
     assert fetched.stage == "indexing"
     assert fetched.message == "Embedding..."
+
+
+def test_rate_limit_counters_are_shared_between_replicas(redis_env, monkeypatch):
+    """The multi-replica bug, against a real Redis.
+
+    Two `Limiter` objects built separately stand in for two replicas. What has to be true is
+    that the second one sees the first one's hits -- with in-process storage it does not, and
+    a cap documented as global is enforced N times over. A fake cannot check this: it would
+    be the same object twice.
+    """
+    monkeypatch.setenv("RATE_LIMIT_STORAGE_URI", REDIS_URL)
+    get_settings.cache_clear()
+
+    from limits import parse
+
+    from rag_assistant import api
+
+    bucket = f"tenant-{uuid.uuid4()}"
+    limit = parse("2/minute")
+
+    replica_a = api._build_limiter(lambda request: bucket, "rag:test")
+    replica_b = api._build_limiter(lambda request: bucket, "rag:test")
+
+    assert replica_a.limiter.hit(limit, "rag:test", bucket) is True
+    assert replica_b.limiter.hit(limit, "rag:test", bucket) is True
+    # The third hit crosses the cap. It only fails on the second replica if the first
+    # replica's two hits were visible to it.
+    assert replica_b.limiter.hit(limit, "rag:test", bucket) is False, (
+        "the second replica did not see the first's hits -- limiter counters are not shared"
+    )
+
+
+def test_the_per_caller_and_global_buckets_do_not_collide_in_shared_redis(redis_env, monkeypatch):
+    """Both limiters write to one Redis under the multi-replica profile. If their keyspaces
+    overlapped, one caller's requests would consume the global allowance and vice versa."""
+    monkeypatch.setenv("RATE_LIMIT_STORAGE_URI", REDIS_URL)
+    get_settings.cache_clear()
+
+    from limits import parse
+
+    from rag_assistant import api
+
+    identity = f"caller-{uuid.uuid4()}"
+    limit = parse("1/minute")
+
+    caller = api._build_limiter(lambda request: identity, api.limiter._key_prefix)
+    everyone = api._build_limiter(lambda request: identity, api.global_limiter._key_prefix)
+
+    assert caller.limiter.hit(limit, api.limiter._key_prefix, identity) is True
+    # Same identity string, different limiter: it must still have its own allowance.
+    assert everyone.limiter.hit(limit, api.global_limiter._key_prefix, identity) is True
+
+
+def test_readiness_sees_a_reachable_rate_limit_store(redis_env, monkeypatch):
+    monkeypatch.setenv("RATE_LIMIT_STORAGE_URI", REDIS_URL)
+    get_settings.cache_clear()
+
+    from rag_assistant.readiness import check_rate_limit_storage
+
+    assert check_rate_limit_storage() == (True, None)

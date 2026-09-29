@@ -32,6 +32,8 @@ from langchain_core.documents import Document
 
 from rag_assistant.auth import PUBLIC_OWNER
 from rag_assistant.config import get_settings
+from rag_assistant.ingestion.acl import principals_can_read
+from rag_assistant.ingestion.generations import active_index_dir, generation_of_dir
 from rag_assistant.ingestion.ownership import visible_owners
 from rag_assistant.retrieval.incremental_bm25 import IncrementalBM25
 from rag_assistant.retrieval.vector_store import get_vector_store
@@ -99,7 +101,7 @@ def _build_index(persist_dir: Path) -> Bm25State:
     # poll sees a mismatch and rebuilds -- one wasted rebuild. Reading the chunks first would
     # record a version newer than the data it describes, and this replica would serve a stale
     # keyword index forever with nothing to signal it.
-    version = _shared_index_version()
+    version = _shared_index_version(persist_dir)
     state = Bm25State(built_at_version=version, last_version_check=time.monotonic())
     for chunk_id, document in _fetch_chunks(persist_dir):
         state.index.add(chunk_id, _tokenize(document.page_content))
@@ -111,7 +113,7 @@ def _shared_backend() -> bool:
     return get_settings().vector_backend == "pgvector"
 
 
-def _shared_index_version() -> int:
+def _shared_index_version(persist_dir: Path) -> int:
     """The current index version, or 0 when there is no shared backend to ask.
 
     Best-effort: a database blip here must not take keyword search down. Failing closed
@@ -124,7 +126,7 @@ def _shared_index_version() -> int:
     try:
         from rag_assistant.retrieval.pgvector_store import current_index_version
 
-        return current_index_version()
+        return current_index_version(generation_of_dir(persist_dir))
     except Exception:
         logger.warning("Could not read the shared index version", exc_info=True)
         return 0
@@ -147,7 +149,7 @@ def get_bm25_index(persist_dir: Path | None = None) -> Bm25State:
     because vector retrieval and grading still see the new chunks.
     """
     settings = get_settings()
-    resolved = str(persist_dir or settings.chroma_persist_dir)
+    resolved = str(persist_dir or active_index_dir())
     if resolved not in _index_cache:
         with _index_lock:
             if resolved not in _index_cache:
@@ -162,7 +164,7 @@ def get_bm25_index(persist_dir: Path | None = None) -> Bm25State:
     if now - state.last_version_check < settings.bm25_version_poll_seconds:
         return state
     state.last_version_check = now
-    current = _shared_index_version()
+    current = _shared_index_version(Path(resolved))
     if current == state.built_at_version:
         return state
 
@@ -188,8 +190,7 @@ def apply_bm25_delta(
     when there is no cached index to update -- in that case the next query builds a fresh one
     from the collection anyway, so there is nothing to do and nothing has been missed.
     """
-    settings = get_settings()
-    resolved = str(persist_dir or settings.chroma_persist_dir)
+    resolved = str(persist_dir or active_index_dir())
     with _index_lock:
         state = _index_cache.get(resolved)
         if state is None:
@@ -212,8 +213,7 @@ def invalidate_bm25_index(persist_dir: Path | None = None) -> None:
     sees the old index (a plain dict-key read, safe to interleave under the GIL) or triggers
     a fresh build; it never observes a torn/half-rebuilt one.
     """
-    settings = get_settings()
-    resolved = str(persist_dir or settings.chroma_persist_dir)
+    resolved = str(persist_dir or active_index_dir())
     with _index_lock:
         _index_cache.pop(resolved, None)
 
@@ -245,8 +245,10 @@ def bm25_search(
     persist_dir: Path | None = None,
     owner: str = PUBLIC_OWNER,
     filters=None,
+    principals: frozenset[str] | None = None,
 ) -> list[RetrievedDoc]:
-    """Keyword search over the chunks `owner` may see.
+    """Keyword search over the chunks `owner` may see -- and, within them, only the ones
+    whose document ACL admits one of `principals` (None bypasses ACLs; see ingestion/acl.py).
 
     One index spans the whole collection and is filtered per query, rather than one index per
     tenant: BM25's IDF term is corpus-wide statistics, so per-tenant indexes would both
@@ -254,6 +256,16 @@ def bm25_search(
     narrowed *before* the top-k cut so a tenant always gets k of their own documents rather
     than k minus however many of someone else's outranked them.
     """
+    if get_settings().keyword_backend == "postgres":
+        return _postgres_keyword_search(
+            sub_query,
+            k=k,
+            owner=owner,
+            filters=filters,
+            principals=principals,
+            persist_dir=persist_dir,
+        )
+
     state = get_bm25_index(persist_dir)
     if not state.documents:
         return []
@@ -264,6 +276,7 @@ def bm25_search(
         chunk_id
         for chunk_id, document in state.documents.items()
         if document.metadata.get("owner", PUBLIC_OWNER) in allowed
+        and principals_can_read(document.metadata, principals)
         and _passes_filters(document.metadata, filters)
     ]
     ranked_ids = sorted(visible_ids, key=lambda i: scores.get(i, 0.0), reverse=True)[:k]
@@ -278,4 +291,44 @@ def bm25_search(
         for chunk_id in ranked_ids
         # no keyword overlap at all -- don't pad results with noise
         if scores.get(chunk_id, 0.0) > 0
+    ]
+
+
+def _postgres_keyword_search(
+    sub_query: str,
+    k: int,
+    owner: str,
+    filters,
+    principals: frozenset[str] | None = None,
+    persist_dir: Path | None = None,
+) -> list[RetrievedDoc]:
+    """Keyword search delegated to the full-text index beside the vectors.
+
+    Degrades to an empty result rather than raising, matching what this module already does
+    when nothing is indexed: keyword search is one of two local retrieval paths, and losing it
+    to a database blip should cost recall, not the request. The vector path reads through to
+    the same database and will fail loudly on its own if the problem is not transient.
+    """
+    from rag_assistant.retrieval.pgvector_store import keyword_search
+
+    try:
+        rows = keyword_search(
+            sub_query,
+            k=k,
+            owner=owner,
+            filters=filters,
+            principals=principals,
+            generation=generation_of_dir(persist_dir),
+        )
+    except Exception:
+        logger.warning("Postgres keyword search failed; returning no keyword hits", exc_info=True)
+        return []
+    return [
+        RetrievedDoc(
+            content=content,
+            metadata=metadata,
+            source_id=metadata.get("source", ""),
+            score=score,
+        )
+        for content, metadata, score in rows
     ]

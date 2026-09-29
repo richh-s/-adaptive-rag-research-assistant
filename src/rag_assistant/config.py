@@ -113,7 +113,40 @@ class Settings(BaseSettings):
     # window this opens is stale *keyword ranking*, not stale answers -- vector retrieval and
     # grading read through to the shared store on every query.
     bm25_version_poll_seconds: float = 5.0
+    # Where keyword search runs. "memory" is the in-process BM25 index (retrieval/bm25_store.py)
+    # and is correct for one container and a corpus of a few thousand chunks. "postgres" uses
+    # a full-text index in the same table the vectors live in, which removes the ceiling the
+    # in-memory index has: it reads every chunk in the collection into the process and keeps
+    # it there, on every replica, so build time and resident memory both scale with the whole
+    # corpus and a restart pays for it again before the first keyword query is served.
+    #
+    # The trade is ranking, not correctness: Postgres ranks with `ts_rank_cd` rather than
+    # BM25, so the two backends order results differently. Fusion combines retrieval paths by
+    # rank position rather than by score (see fusion/rrf.py), which is what makes a differently
+    # -ranked keyword path an acceptable input rather than an incomparable one.
+    keyword_backend: Literal["memory", "postgres"] = "memory"
     chroma_persist_dir: Path = PROJECT_ROOT / "chroma_db"
+    # How long a replica trusts its cached reading of which index generation serves (see
+    # ingestion/generations.py). After `rag-assistant reindex activate`, every replica has
+    # switched within this interval; each one serves a complete generation throughout, so the
+    # window is one of mixed generations across replicas, never of a half-built index.
+    index_pointer_poll_seconds: float = 2.0
+    # Documents re-embedded per batch by `rag-assistant reindex build`. Bounded so a large
+    # corpus never holds more than one batch of chunks and vectors in memory at once.
+    reindex_batch_size: int = 256
+    # How tenants are separated inside the index.
+    #
+    # "filter" is one shared collection with a tenant predicate on every query -- correct,
+    # tested, and one bug away from a cross-tenant leak, because the predicate is the only
+    # thing standing between tenants.
+    #
+    # "strict" adds a boundary that does not depend on every query remembering the predicate:
+    # on Chroma each tenant gets its own collection, so another tenant's vectors are not in
+    # the search space at all; on pgvector the chunks table is protected by row-level security,
+    # so a query that forgot its WHERE clause still returns only the caller's rows. Switching
+    # an existing Chroma index from "filter" needs `rag-assistant tenants migrate`, which moves
+    # chunks into per-tenant collections without re-embedding them.
+    tenant_isolation: Literal["filter", "strict"] = "filter"
     # Point at a Chroma server to share the index across replicas. Embedded Chroma is
     # SQLite-backed and locks its file to one process, which is the single hardest constraint
     # on running more than one worker; server mode removes it. Blank keeps the embedded,
@@ -177,6 +210,29 @@ class Settings(BaseSettings):
 
     confidence_threshold: float = 0.6
 
+    # How much wider the refinement pass searches than the first attempt (see
+    # graph/nodes/refine.py). A low grade has two causes -- the right document ranked below
+    # the cutoff, or it never matched the query -- and the retry addresses the second with a
+    # rewrite, so it addresses the first by widening. 1 disables the widening and leaves the
+    # rewrite, which is the useful setting when context budget is the binding constraint.
+    refine_k_multiplier: int = 2
+
+    # Post-synthesis groundedness verification (see grading/groundedness.py). Everything else
+    # in the graph grades *retrieval*; this is the only thing that checks the answer against
+    # the documents it was written from. On by default, unlike the retrieval-tuning knobs,
+    # because it is the difference between reporting a number that describes retrieval and
+    # reporting one that describes the answer -- and the panel prints it next to the answer
+    # either way. Costs one structured call per question that retrieved anything; abstentions
+    # and the "none" route skip it because there is nothing to ground.
+    groundedness_check: bool = True
+    # Below this fraction of supported claims, the report carries a visible caveat. 0.7 leaves
+    # room for the check itself mislabelling one claim in a multi-claim answer, while an
+    # answer where a third of the claims are unsupported is flagged.
+    groundedness_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    # Sized like grading, not like routing: the prompt carries the answer *and* every
+    # document, and a timeout here silently turns verification off for that request.
+    groundedness_request_timeout_seconds: float = 30.0
+
     # Chunking strategy within a section (see ingestion/semantic_splitter.py). "structural"
     # is fixed-size inside each heading section -- free and deterministic. "semantic" embeds
     # sentences and breaks where similarity drops, which cuts at topic shifts instead of at
@@ -186,6 +242,25 @@ class Settings(BaseSettings):
     # means fewer, larger chunks. A percentile rather than an absolute distance because
     # cosine distances aren't comparable across embedding models or prose styles.
     semantic_chunk_percentile: float = 85.0
+
+    # How many documents each retrieval path returns per sub-query. Previously hardcoded at
+    # 4 in the retrieval nodes, which made the one number that most directly controls recall
+    # the only retrieval knob that could not be tuned per deployment or swept in the eval
+    # harness. Raising it costs context budget and grading tokens, not extra round trips.
+    retrieval_k: int = 4
+    # Candidates fetched before diversity selection narrows them to `retrieval_k`. Ignored
+    # unless RETRIEVAL_MMR is on. Too close to `retrieval_k` and MMR has nothing to choose
+    # between; far beyond it and the tail is noise that the diversity term can still promote.
+    retrieval_fetch_k: int = 20
+    # Maximal Marginal Relevance over local retrieval (see retrieval/mmr.py). Dense retrieval
+    # ranks candidates against the query independently, so the top-k may be k restatements of
+    # one passage -- likely on a corpus of structurally similar documents, and not something
+    # fusion's near-duplicate collapsing catches, since those are different texts making the
+    # same point rather than the same text. Off by default: it changes which documents reach
+    # synthesis, so it wants an eval run behind it rather than a silent default flip.
+    retrieval_mmr: bool = False
+    # 1.0 is plain similarity ranking, 0.0 ignores the query and maximises dissimilarity.
+    retrieval_mmr_lambda: float = Field(default=0.5, ge=0.0, le=1.0)
 
     # Cross-encoder reranking of fused documents (see retrieval/reranker.py). RRF ranks by
     # retriever consensus and never compares a document against the question; a cross-encoder
@@ -233,6 +308,17 @@ class Settings(BaseSettings):
     # Charged per description call; deliberately high like the vision estimate (budget.py).
     description_call_token_estimate: int = 1500
 
+    # What to do about personal data in ingested documents (see pii.py). "flag" detects,
+    # counts and logs while storing the text unchanged; "redact" replaces each match with a
+    # category marker before the text is embedded, keyword-indexed or stored as a parent
+    # section, leaving the uploaded file on disk untouched; "off" skips the scan entirely.
+    #
+    # "flag" is the default for the same reason injection detection never blocks: these are
+    # format patterns, not a classifier, and silently mangling a legitimate document is a
+    # worse failure than indexing one that needed review. A mode change applies to what is
+    # ingested after it -- reapplying it to an existing corpus needs `ingest --full`.
+    pii_mode: Literal["off", "flag", "redact"] = "flag"
+
     # caching (Redis) -- see cache.py. `use_cache` lets tests/offline runs disable it outright.
     use_cache: bool = True
     # Where background ingest task state lives (see ingestion/tasks.py). "memory" is correct
@@ -266,6 +352,55 @@ class Settings(BaseSettings):
     # secrets out of the process listing and lets a key be revoked by editing one file.
     api_keys_file: Path | None = None
 
+    # Single sign-on (see oidc.py). Setting OIDC_ISSUER makes the API accept bearer tokens
+    # (JWTs) issued by that identity provider -- Okta, Entra ID, Auth0, Google, Keycloak --
+    # alongside any configured API keys. Tokens are verified locally against the issuer's
+    # published signing keys; no call to the provider is made per request.
+    oidc_issuer: str = ""
+    # The `aud` a token must carry. Required whenever OIDC_ISSUER is set: without an audience
+    # check, a token the same provider issued for some *other* application is accepted here.
+    oidc_audience: str = ""
+    # Blank means discover it from the issuer's `/.well-known/openid-configuration`.
+    oidc_jwks_url: str = ""
+    # The public client the web UI signs in with (authorization code + PKCE). Only served to
+    # the browser; the API itself never uses it.
+    oidc_client_id: str = ""
+    oidc_scopes: str = "openid profile email"
+    # Which claim names the tenant. Blank puts every SSO user in OIDC_DEFAULT_TENANT -- the
+    # right answer for a single-company deployment. Multi-organisation IdPs expose one (Entra
+    # `tid`, Auth0 `org_id`, Okta custom claims).
+    oidc_tenant_claim: str = ""
+    oidc_default_tenant: str = "public"
+    oidc_user_claim: str = "sub"
+    oidc_email_claim: str = "email"
+    # Groups feed document-level permissions (see ingestion/acl.py). Entra and Okta both call
+    # it `groups` by default; Keycloak needs a mapper.
+    oidc_groups_claim: str = "groups"
+    # Comma-separated group names. Members of a write group may upload and delete; members of
+    # an admin group additionally bypass document ACLs within their tenant. Everyone else with
+    # a valid token may read and ask.
+    oidc_write_groups: str = ""
+    oidc_admin_groups: str = ""
+    # A token carrying this OAuth scope (in `scope` or `scp`) is granted write as well, for
+    # machine clients using the client-credentials flow, which have no groups.
+    oidc_write_scope: str = "rag.write"
+    oidc_algorithms: str = "RS256,ES256"
+    # Clock skew tolerated on `exp`/`nbf`/`iat`.
+    oidc_leeway_seconds: int = 60
+
+    # Source connectors (see connectors/). A JSON file describing which external systems to
+    # sync into which tenant's corpus -- Confluence spaces, Google Drive folders, mounted file
+    # shares. Blank disables connectors.
+    connectors_file: Path | None = None
+    # Run due connector syncs on a background thread inside the API process. Off by default:
+    # `rag-assistant connectors sync` from cron is the simpler operational shape, and with
+    # several replicas exactly one should run the scheduler (or rely on the advisory lock).
+    connector_scheduler: bool = False
+    # A sync that would delete more than this fraction of a connector's documents is refused.
+    # An expired token or a permissions change upstream can make a source *list* as empty,
+    # and deletion sync would otherwise faithfully propagate that as "everything was deleted".
+    connector_max_delete_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
+
     # Browser origins allowed to call this API cross-origin. The defaults cover the Vite dev
     # server; the single-container deploy serves the frontend from this same origin, so it
     # needs none of these. Set CORS_ALLOW_ORIGINS (comma-separated) when the frontend is
@@ -298,6 +433,16 @@ class Settings(BaseSettings):
     # rate limiting -- see api.py's limiter setup.
     rate_limit_rpm: int = 10
     rate_limit_rpm_global: int = 30
+    # Where the limiter keeps its counters. Blank means in-process memory, which is correct
+    # for the single-container default and wrong the moment there are two replicas: each one
+    # then keeps its own buckets, so RATE_LIMIT_RPM_GLOBAL -- documented as a cap on
+    # aggregate load regardless of client -- silently becomes N times the configured number.
+    # Point this at Redis and the buckets are shared, which is what makes the global cap
+    # global. `multi-replica` fills it in from REDIS_URL for exactly that reason.
+    #
+    # A `memory://` value is also accepted and means the same as blank; anything else is
+    # passed to `limits` (redis://, rediss://, redis+sentinel://, memcached://).
+    rate_limit_storage_uri: str = ""
 
     # request timeouts
     web_search_timeout_seconds: float = 10.0
@@ -346,6 +491,17 @@ class Settings(BaseSettings):
             self.conversations_backend = "postgres"
         if "task_backend" not in explicit:
             self.task_backend = "redis"
+        # The keyword index is the remaining piece of per-replica state. Left on "memory",
+        # every replica holds its own full copy of the corpus and rebuilds it on restart --
+        # which is the ceiling `multi-replica` exists to remove, and the one that does not
+        # announce itself as a failure, only as memory and a slow first query.
+        if "keyword_backend" not in explicit and self.vector_backend == "pgvector":
+            self.keyword_backend = "postgres"
+        # The rate limiter is shared state like the rest, and it was the one piece the
+        # profile used to leave behind: replicas sharing an index and a task registry while
+        # each enforced its own private copy of the global cap.
+        if "rate_limit_storage_uri" not in explicit:
+            self.rate_limit_storage_uri = self.redis_url
         # Checked rather than defaulted: there is no sensible guess for where the database
         # is, and starting without one would fail later, per request, inside a background
         # task -- far from the configuration that caused it.
@@ -360,6 +516,28 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _require_keyword_backend_support(self) -> "Settings":
+        """`KEYWORD_BACKEND=postgres` reads the full-text index on the pgvector chunks table,
+        so it needs that table to be the one being written.
+
+        Refused rather than degraded, because the degradation is invisible: keyword search
+        fails closed and returns no hits, the vector path still answers, and the result is a
+        pipeline quietly running on half its retrieval with nothing in the response to say so.
+        That is the same class of silently-half-configured state `multi-replica` exists to
+        prevent.
+        """
+        if self.keyword_backend == "postgres":
+            if self.vector_backend != "pgvector":
+                raise ValueError(
+                    "KEYWORD_BACKEND=postgres needs VECTOR_BACKEND=pgvector: it reads the "
+                    "full-text index on the chunks table that backend writes. Set both, or "
+                    "leave KEYWORD_BACKEND=memory."
+                )
+            if not self.database_url:
+                raise ValueError("KEYWORD_BACKEND=postgres needs DATABASE_URL.")
+        return self
+
+    @model_validator(mode="after")
     def _require_embedding_key(self) -> "Settings":
         # Failing at startup beats failing on the first ingest, minutes into a parse.
         if self.embedding_provider == "openai" and not self.openai_api_key:
@@ -367,6 +545,24 @@ class Settings(BaseSettings):
         if self.embedding_provider == "local" and not self.local_embedding_base_url:
             raise ValueError("EMBEDDING_PROVIDER=local needs LOCAL_EMBEDDING_BASE_URL.")
         return self
+
+    @model_validator(mode="after")
+    def _require_oidc_audience(self) -> "Settings":
+        # Refused at startup rather than defaulted: accepting any audience would honour a
+        # token the same identity provider minted for an unrelated application, which is the
+        # single most common JWT validation mistake and invisible until someone exploits it.
+        if self.oidc_issuer and not self.oidc_audience:
+            raise ValueError(
+                "OIDC_ISSUER is set but OIDC_AUDIENCE is not. Set it to the audience your "
+                "identity provider puts in tokens for this API (often the client id or an "
+                "API identifier such as api://rag-assistant)."
+            )
+        return self
+
+    def csv(self, field_name: str) -> frozenset[str]:
+        """A comma-separated setting as a set, blanks dropped."""
+        raw = getattr(self, field_name) or ""
+        return frozenset(part.strip() for part in raw.split(",") if part.strip())
 
     @property
     def embedding_model_name(self) -> str:

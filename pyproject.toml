@@ -26,6 +26,10 @@ dependencies = [
     "prometheus-client>=0.21",
     "pydantic-settings>=2.14.2",
     "pymupdf4llm>=0.0.28",
+    # Verifying SSO access tokens (oidc.py) and signing the Google Drive service-account
+    # grant (connectors/google_drive.py). Previously present only transitively, which is not
+    # something security-critical code should depend on.
+    "pyjwt[crypto]>=2.8",
     "python-docx>=1.2",
     "python-dotenv>=1.2.2",
     "python-multipart>=0.0.20",
@@ -88,6 +92,11 @@ line-length = 100
 [tool.pytest.ini_options]
 markers = ["live: hits real external APIs (Gemini/DuckDuckGo), excluded by default"]
 addopts = "-m 'not live'"
+# The graph's LLM-bound nodes are coroutines (see graph/build_graph.py), so the tests that
+# call them directly are async. "auto" rather than a `@pytest.mark.asyncio` on each one:
+# the marker adds nothing a reader needs and forgetting it makes a test silently pass by
+# never running its own body -- a coroutine that is never awaited asserts nothing.
+asyncio_mode = "auto"
 
 # Coverage is configured here but deliberately NOT in `addopts`: instrumenting every local
 # run slows the edit/test loop for no benefit, and the number that matters is the one CI

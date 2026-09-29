@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from rag_assistant.auth import CONVERSATION_OWNER_SEPARATOR
 from rag_assistant.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -445,8 +446,18 @@ def delete_all_for_owner(owner: str) -> tuple[int, int]:
         conn = _get_conn()
         # Messages follow via ON DELETE CASCADE, which is why this does not delete them
         # explicitly -- doing both would be two sources of truth for one relationship.
-        conversations = conn.execute("DELETE FROM conversations WHERE owner = ?", (owner,)).rowcount
-        feedback = conn.execute("DELETE FROM feedback WHERE owner = ?", (owner,)).rowcount
+        # The prefix clause reaches each user's own conversations inside the tenant (see
+        # auth.Principal.conversation_owner). substr rather than LIKE, whose `_` wildcard
+        # would let tenant "a_b" match tenant "axb"'s users.
+        prefix = owner + CONVERSATION_OWNER_SEPARATOR
+        conversations = conn.execute(
+            "DELETE FROM conversations WHERE owner = ? OR substr(owner, 1, ?) = ?",
+            (owner, len(prefix), prefix),
+        ).rowcount
+        feedback = conn.execute(
+            "DELETE FROM feedback WHERE owner = ? OR substr(owner, 1, ?) = ?",
+            (owner, len(prefix), prefix),
+        ).rowcount
         conn.commit()
     return conversations, feedback
 

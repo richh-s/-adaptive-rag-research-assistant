@@ -10,6 +10,7 @@ from langchain_core.documents import Document
 
 from rag_assistant.config import get_settings
 from rag_assistant.ingestion import vision
+from rag_assistant.ingestion.acl import OPEN, DocumentAcl, is_sidecar, read_acl
 from rag_assistant.ingestion.ownership import owner_of_relative_path
 
 SUPPORTED_SUFFIXES = {".md", ".txt", ".pdf", ".docx", ".html", ".htm"}
@@ -223,6 +224,10 @@ class CorpusFile:
     source: str
     owner: str
     fingerprint: str
+    # Who inside the tenant may read it (see acl.py). Read from the sidecar beside the file
+    # at enumeration time -- cheap, and it has to be known before deciding whether a file
+    # whose bytes did not change still needs its chunks' permissions rewritten.
+    acl: DocumentAcl = OPEN
 
 
 def _fingerprint(path: Path) -> str:
@@ -246,6 +251,11 @@ def iter_corpus_files(source_dir: Path, owner: str | None = None) -> list[Corpus
     for path in sorted(source_dir.rglob("*")):
         if not path.is_file():
             continue
+        # Permission sidecars and hidden bookkeeping files (a connector's sync state) are
+        # part of the corpus layout, not documents -- skipped without the "unsupported file"
+        # warning, which would otherwise fire once per restricted document on every ingest.
+        if is_sidecar(path) or path.name.startswith(".") or path.name.endswith(".tmp"):
+            continue
         if path.suffix not in SUPPORTED_SUFFIXES:
             logger.warning("Skipping unsupported file: %s", path.name)
             continue
@@ -260,6 +270,7 @@ def iter_corpus_files(source_dir: Path, owner: str | None = None) -> list[Corpus
                 source=relative.as_posix(),
                 owner=file_owner,
                 fingerprint=_fingerprint(path),
+                acl=read_acl(path),
             )
         )
     return files

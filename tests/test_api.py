@@ -6,6 +6,20 @@ from fastapi.testclient import TestClient
 from rag_assistant import api
 
 
+def _as_async(stub):
+    """Wraps a graph stub so it can stand in for `ainvoke`.
+
+    `/api/v1/research` awaits the graph now -- the LLM-bound nodes are coroutines, so there is
+    no synchronous `invoke` to patch. Without this the handler would fall through to the real
+    graph and make live provider calls from the test suite.
+    """
+
+    async def _ainvoke(*args, **kwargs):
+        return stub(*args, **kwargs)
+
+    return _ainvoke
+
+
 def test_health_returns_ok():
     client = TestClient(api.app)
 
@@ -24,12 +38,14 @@ def test_research_rate_limits_per_ip(monkeypatch):
     monkeypatch.setenv("RATE_LIMIT_RPM", "1")
     monkeypatch.setattr(
         api._graph,
-        "invoke",
-        lambda state, config=None: {
-            "research_report": "ok",
-            "route": "vector",
-            "confidence_score": 0.9,
-        },
+        "ainvoke",
+        _as_async(
+            lambda state, config=None: {
+                "research_report": "ok",
+                "route": "vector",
+                "confidence_score": 0.9,
+            }
+        ),
     )
     client = TestClient(api.app)
 
@@ -43,12 +59,14 @@ def test_research_rate_limits_per_ip(monkeypatch):
 def test_research_response_includes_trace_id_header(monkeypatch):
     monkeypatch.setattr(
         api._graph,
-        "invoke",
-        lambda state, config=None: {
-            "research_report": "ok",
-            "route": "vector",
-            "confidence_score": 0.9,
-        },
+        "ainvoke",
+        _as_async(
+            lambda state, config=None: {
+                "research_report": "ok",
+                "route": "vector",
+                "confidence_score": 0.9,
+            }
+        ),
     )
     client = TestClient(api.app)
 
@@ -65,7 +83,7 @@ def test_research_passes_trace_id_into_graph_state(monkeypatch):
         captured["trace_id"] = state.get("trace_id")
         return {"research_report": "ok", "route": "vector", "confidence_score": 0.9}
 
-    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_fake_invoke))
     client = TestClient(api.app)
 
     response = client.post("/research", json={"question": "anything"})
@@ -104,13 +122,15 @@ def test_ready_returns_503_when_a_dep_is_down(monkeypatch):
 def test_research_returns_report_and_metadata(monkeypatch):
     monkeypatch.setattr(
         api._graph,
-        "invoke",
-        lambda state, config=None: {
-            "research_report": "The answer is 42.\n\n**Sources:**\n- [1] doc_a.md",
-            "route": "vector",
-            "confidence_score": 0.9,
-            "node_timings": [{"node": "route_query", "latency_ms": 180.0}],
-        },
+        "ainvoke",
+        _as_async(
+            lambda state, config=None: {
+                "research_report": "The answer is 42.\n\n**Sources:**\n- [1] doc_a.md",
+                "route": "vector",
+                "confidence_score": 0.9,
+                "node_timings": [{"node": "route_query", "latency_ms": 180.0}],
+            }
+        ),
     )
     client = TestClient(api.app)
 
@@ -158,7 +178,7 @@ def test_research_strips_html_from_question(monkeypatch):
         captured["question"] = state["question"]
         return {"research_report": "ok", "route": "vector", "confidence_score": 0.9}
 
-    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_fake_invoke))
     client = TestClient(api.app)
 
     response = client.post("/research", json={"question": "<b>What is X?</b>"})
@@ -171,7 +191,7 @@ def test_research_returns_500_on_configuration_error(monkeypatch):
     def _raise(state, config=None):
         raise RuntimeError("Missing or invalid configuration.")
 
-    monkeypatch.setattr(api._graph, "invoke", _raise)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_raise))
     client = TestClient(api.app)
 
     response = client.post("/research", json={"question": "anything"})
@@ -490,7 +510,7 @@ def test_research_passes_history_into_graph_state(monkeypatch):
         captured["chat_history"] = state.get("chat_history")
         return {"research_report": "ok", "route": "vector", "confidence_score": 0.9}
 
-    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_fake_invoke))
     client = TestClient(api.app)
 
     history = [
@@ -512,7 +532,7 @@ def test_research_defaults_to_empty_history(monkeypatch):
         captured["chat_history"] = state.get("chat_history")
         return {"research_report": "ok", "route": "vector", "confidence_score": 0.9}
 
-    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_fake_invoke))
     client = TestClient(api.app)
 
     response = client.post("/research", json={"question": "anything"})
@@ -535,13 +555,15 @@ def test_research_rejects_invalid_history_role(monkeypatch):
 def test_research_response_includes_plain_answer(monkeypatch):
     monkeypatch.setattr(
         api._graph,
-        "invoke",
-        lambda state, config=None: {
-            "research_report": "# Report\nanswer plus transparency",
-            "final_answer": "answer only",
-            "route": "vector",
-            "confidence_score": 0.9,
-        },
+        "ainvoke",
+        _as_async(
+            lambda state, config=None: {
+                "research_report": "# Report\nanswer plus transparency",
+                "final_answer": "answer only",
+                "route": "vector",
+                "confidence_score": 0.9,
+            }
+        ),
     )
     client = TestClient(api.app)
 
@@ -601,7 +623,7 @@ def test_an_unreachable_embedding_server_is_a_503_not_a_500(monkeypatch):
     def _raise(state, config=None):
         raise RuntimeError("retrieve_vector failed") from httpx.ConnectError("no route to host")
 
-    monkeypatch.setattr(api._graph, "invoke", _raise)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_raise))
     client = TestClient(api.app)
 
     response = client.post("/api/v1/research", json={"question": "What were total deposits?"})

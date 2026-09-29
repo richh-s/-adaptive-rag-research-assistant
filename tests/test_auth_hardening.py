@@ -20,6 +20,20 @@ from rag_assistant.auth import (
 from rag_assistant.config import get_settings
 
 
+def _as_async(stub):
+    """Wraps a graph stub so it can stand in for `ainvoke`.
+
+    `/api/v1/research` awaits the graph now -- the LLM-bound nodes are coroutines, so there is
+    no synchronous `invoke` to patch. Without this the handler would fall through to the real
+    graph and make live provider calls from the test suite.
+    """
+
+    async def _ainvoke(*args, **kwargs):
+        return stub(*args, **kwargs)
+
+    return _ainvoke
+
+
 def write_key_file(tmp_path, keys: list[dict]):
     path = tmp_path / "keys.json"
     path.write_text(json.dumps({"keys": keys}))
@@ -265,7 +279,7 @@ def test_a_per_key_limit_is_actually_enforced(monkeypatch, tmp_path):
     api.limiter.reset()
     api.global_limiter.reset()
     monkeypatch.setattr(
-        api._graph, "invoke", lambda *a, **k: {"research_report": "ok", "route": "none"}
+        api._graph, "ainvoke", _as_async(lambda *a, **k: {"research_report": "ok", "route": "none"})
     )
     client = TestClient(api.app)
 

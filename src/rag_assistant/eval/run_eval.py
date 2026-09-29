@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,8 +50,21 @@ class QuestionResult:
 
 def _run_question(graph, golden_question: GoldenQuestion) -> QuestionResult:
     try:
-        result = graph.invoke(
-            {"question": golden_question.question}, config={"recursion_limit": _RECURSION_LIMIT}
+        # The graph's LLM-bound nodes are coroutines, so it is driven through `ainvoke`.
+        # One loop per question rather than one for the run: the harness scores questions
+        # sequentially on purpose (see the CLI's call-budget note), so there is no
+        # concurrency here to preserve across rows.
+        result = asyncio.run(
+            graph.ainvoke(
+                {
+                    "question": golden_question.question,
+                    # Empty for single-turn rows, which leaves the graph's behaviour
+                    # byte-identical to what it was before follow-up rows existed:
+                    # `condense_question` returns early on an empty history.
+                    "chat_history": golden_question.chat_history,
+                },
+                config={"recursion_limit": _RECURSION_LIMIT},
+            )
         )
     except Exception:
         # Scored as the failure it is -- no route, no sources, no answer -- rather than

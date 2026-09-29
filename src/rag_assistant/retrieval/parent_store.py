@@ -85,9 +85,10 @@ def replace_parents_for_source(
     orphans that no chunk points at and nothing ever cleans up.
     """
     if _shared_backend():
+        from rag_assistant.ingestion.generations import generation_of_dir
         from rag_assistant.retrieval.pgvector_store import replace_parents
 
-        replace_parents(source, owner, parents)
+        replace_parents(source, owner, parents, generation_of_dir(persist_dir))
         return
     with _LOCK:
         conn = _get_conn(persist_dir)
@@ -101,9 +102,10 @@ def replace_parents_for_source(
 
 def delete_parents_for_source(persist_dir: Path, source: str) -> None:
     if _shared_backend():
+        from rag_assistant.ingestion.generations import generation_of_dir
         from rag_assistant.retrieval.pgvector_store import delete_parents
 
-        delete_parents(source)
+        delete_parents(source, generation_of_dir(persist_dir))
         return
     with _LOCK:
         conn = _get_conn(persist_dir)
@@ -118,23 +120,41 @@ def get_parents(persist_dir: Path, parent_ids: list[str]) -> dict[str, str]:
     if not parent_ids:
         return {}
     if _shared_backend():
+        from rag_assistant.ingestion.generations import generation_of_dir
         from rag_assistant.retrieval.pgvector_store import get_parent_contents
 
-        return get_parent_contents(parent_ids)
+        return get_parent_contents(parent_ids, generation_of_dir(persist_dir))
     with _LOCK:
         conn = _get_conn(persist_dir)
         placeholders = ",".join("?" * len(parent_ids))
         rows = conn.execute(
-            f"SELECT parent_id, content FROM parents WHERE parent_id IN ({placeholders})",
+            f"SELECT parent_id, content FROM parents WHERE parent_id IN ({placeholders})",  # nosec B608  # table name is a module constant; every value is a bound parameter
             parent_ids,
+        ).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+def parents_for_source(persist_dir: Path, source: str) -> dict[str, str]:
+    """Every section recorded for one source -- what copying a document into a new index
+    generation carries across, since sections are text and need no re-embedding."""
+    if _shared_backend():
+        from rag_assistant.ingestion.generations import generation_of_dir
+        from rag_assistant.retrieval.pgvector_store import parents_for_source as pg_parents
+
+        return pg_parents(source, generation_of_dir(persist_dir))
+    with _LOCK:
+        conn = _get_conn(persist_dir)
+        rows = conn.execute(
+            "SELECT parent_id, content FROM parents WHERE source = ?", (source,)
         ).fetchall()
     return {row[0]: row[1] for row in rows}
 
 
 def count_parents(persist_dir: Path) -> int:
     if _shared_backend():
+        from rag_assistant.ingestion.generations import generation_of_dir
         from rag_assistant.retrieval.pgvector_store import count_parent_rows
 
-        return count_parent_rows()
+        return count_parent_rows(generation_of_dir(persist_dir))
     with _LOCK:
         return _get_conn(persist_dir).execute("SELECT COUNT(*) FROM parents").fetchone()[0]

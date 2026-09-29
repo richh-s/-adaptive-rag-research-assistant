@@ -163,14 +163,32 @@ def _pg_connection():
     """
     import psycopg
 
-    database_url = get_settings().database_url
+    settings = get_settings()
+    database_url = settings.database_url
     if not database_url:
         raise RuntimeError(
             "A Postgres-backed backend is configured but DATABASE_URL is not set, so the "
             "backup cannot include its tables. Refusing to write an archive that would "
             "silently omit the index."
         )
-    return psycopg.connect(database_url)
+    conn = psycopg.connect(database_url)
+    if settings.vector_backend == "pgvector":
+        from rag_assistant.ingestion.generations import active_generation, schema_for_generation
+
+        # Two settings every pgvector connection makes (see pgvector_store._connection), and
+        # backup is the one caller that bypasses that module's pool. Without the scope, row-
+        # level security shows this connection *no* chunks -- and the archive would be the
+        # well-formed, silently empty index this module's docstring exists to prevent. Without
+        # the search path, it would archive the legacy schema instead of the generation that
+        # is actually serving.
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT set_config('search_path', %s, false), "
+                "set_config('rag.visible_owners', '*', false)",
+                (f"{schema_for_generation(active_generation())}, public",),
+            )
+        conn.commit()
+    return conn
 
 
 def _dump_postgres(staging: Path, tables: list[str]) -> list[str]:
@@ -181,7 +199,7 @@ def _dump_postgres(staging: Path, tables: list[str]) -> list[str]:
     the divergence the shared-state work exists to prevent, and it would be reintroduced by
     reading the four tables at four different instants.
     """
-    from psycopg import IsolationLevel
+    from psycopg import IsolationLevel, sql
 
     if not tables:
         return []
@@ -193,14 +211,23 @@ def _dump_postgres(staging: Path, tables: list[str]) -> list[str]:
         with conn.cursor() as cur:
             for table in tables:
                 try:
-                    cur.execute(f"SELECT * FROM {table}")
+                    columns = _storable_columns(cur, table)
+                    if not columns:
+                        # No such table yet (nothing ingested, or conversations never used).
+                        conn.rollback()
+                        continue
+                    cur.execute(
+                        sql.SQL("SELECT {} FROM {}").format(
+                            sql.SQL(", ").join(sql.Identifier(c) for c in columns),
+                            sql.Identifier(table),
+                        )
+                    )
                 except Exception:
                     # A table that does not exist yet (nothing ingested, or conversations
                     # never used) is not an error -- there is simply nothing to archive.
                     logger.debug("skipping absent table %s", table, exc_info=True)
                     conn.rollback()
                     continue
-                columns = [d[0] for d in cur.description]
                 path = staging / f"{table}.jsonl"
                 count = 0
                 with path.open("w") as out:
@@ -210,6 +237,31 @@ def _dump_postgres(staging: Path, tables: list[str]) -> list[str]:
                 dumped.append(table)
                 logger.info("dumped %d row(s) from %s", count, table)
     return dumped
+
+
+def _storable_columns(cur, table: str) -> list[str]:
+    """The columns worth archiving: everything except generated ones.
+
+    `SELECT *` used to be fine because every column held data somebody wrote. The full-text
+    column added for Postgres keyword search does not -- it is `GENERATED ALWAYS AS ... STORED`,
+    so Postgres derives it from `content` on every write and *rejects* an insert that supplies
+    it. Dumping it produced an archive that restored with "cannot insert a non-DEFAULT value
+    into column", which is the good version of this failure; the bad version is a future
+    generated column silently doubling the archive's size with data that is recomputed anyway.
+
+    Read from the catalog rather than hardcoded so this keeps holding for columns added later.
+    """
+    # Resolved with `to_regclass`, which follows the connection's search_path, so the columns
+    # read are those of the table actually being dumped -- with index generations there are
+    # several tables of the same name in different schemas, and information_schema would list
+    # all of their columns at once.
+    cur.execute(
+        "SELECT attname FROM pg_attribute "
+        "WHERE attrelid = to_regclass(%s) AND attnum > 0 AND NOT attisdropped "
+        "AND attgenerated = '' ORDER BY attnum",
+        (table,),
+    )
+    return [row[0] for row in cur.fetchall()]
 
 
 def _adapt(column: str, value):
@@ -231,6 +283,8 @@ def _load_postgres(staging: Path, tables: list[str]) -> None:
     exist now and not in the archive must not survive it. One transaction so a failure
     partway leaves the database as it was rather than half-restored.
     """
+    from psycopg import sql
+
     present = [t for t in tables if (staging / f"{t}.jsonl").exists()]
     if not present:
         return
@@ -239,7 +293,7 @@ def _load_postgres(staging: Path, tables: list[str]) -> None:
             # Reverse order for the deletes: children before parents, or the FK from
             # `messages` to `conversations` rejects the delete.
             for table in reversed(present):
-                cur.execute(f"DELETE FROM {table}")
+                cur.execute(sql.SQL("DELETE FROM {}").format(sql.Identifier(table)))
             for table in present:
                 rows = [
                     json.loads(line)
@@ -249,9 +303,31 @@ def _load_postgres(staging: Path, tables: list[str]) -> None:
                 if not rows:
                     continue
                 columns = list(rows[0].keys())
-                placeholders = ", ".join(f"%s{_COLUMN_CASTS.get(column, '')}" for column in columns)
+                # Composed with `sql.Identifier` rather than interpolated. The table names are
+                # this deployment's own constants, but the *column* names are read straight out
+                # of the archive's JSON -- and the archive is whatever was on the backup disk,
+                # which is the same untrusted input `_safe_extract` exists for.
+                #
+                # Interpolating them raw was not demonstrably exploitable: psycopg's extended
+                # protocol refuses more than one command per statement, and its placeholder
+                # accounting rejects the malformed statements a crafted name produces. But
+                # that is a property of the driver, not of this code -- it would change under
+                # a different adapter, a client-side-binding cursor, or a `COPY` rewrite of
+                # this loop. Identifier quoting makes a hostile name fail as an unknown
+                # column, which is a property of the code.
+                statement = sql.SQL(
+                    "INSERT INTO {table} ({columns}) VALUES ({placeholders})"
+                ).format(
+                    table=sql.Identifier(table),
+                    columns=sql.SQL(", ").join(sql.Identifier(column) for column in columns),
+                    # The cast suffixes come from `_COLUMN_CASTS`, a module constant, never
+                    # from the archive.
+                    placeholders=sql.SQL(", ").join(
+                        sql.SQL("%s" + _COLUMN_CASTS.get(column, "")) for column in columns
+                    ),
+                )
                 cur.executemany(
-                    f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+                    statement,
                     [tuple(_adapt(column, row[column]) for column in columns) for row in rows],
                 )
                 logger.info("restored %d row(s) into %s", len(rows), table)
@@ -383,7 +459,13 @@ def _safe_extract(archive: tarfile.TarFile, destination: Path) -> None:
             raise ValueError(f"Refusing to extract {member.name!r}: path escapes the archive root.")
         if member.issym() or member.islnk():
             raise ValueError(f"Refusing to extract link member {member.name!r}.")
-    archive.extractall(destination)
+    # The checks above are the ones with the error messages an operator can act on, and they
+    # run first so a hostile archive is named rather than merely blocked. `filter="data"` is
+    # the belt to their braces: CPython's own tar sanitiser, which additionally rejects
+    # absolute paths, device and FIFO members, and strips setuid/setgid bits -- categories
+    # the loop above does not inspect at all. Defence in depth for the same reason the loop
+    # exists: the archive handed to `restore` is whatever was on the backup disk.
+    archive.extractall(destination, filter="data")
 
 
 def restore_backup(

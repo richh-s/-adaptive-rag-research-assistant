@@ -124,6 +124,19 @@ class ResearchSummary(BaseModel):
     context_documents_dropped: int = 0
     confidence_score: float | None
     correction_attempted: bool
+    # Whether the corpus was re-asked with rewritten queries before (or instead of) the web
+    # fallback. Distinct from `correction_attempted`, which means the web pass specifically --
+    # collapsing them would report "we tried again" without saying where.
+    refinement_attempted: bool = False
+    refined_sub_queries: list[str] = []
+    # Whether the answer itself was checked against the documents it was written from (see
+    # grading/groundedness.py). Distinct from a score of None, which a *checked* abstention
+    # also produces: False here means no check ran, so the absence of unsupported claims says
+    # nothing. `confidence_score` above grades retrieval; this grades the answer, and the two
+    # routinely disagree -- perfect retrieval can still be written up with an invented figure.
+    groundedness_checked: bool = False
+    groundedness_score: float | None = None
+    unsupported_claim_count: int = 0
     node_latencies_ms: list[NodeLatency]
     total_latency_ms: float
 
@@ -277,6 +290,62 @@ class IndexedSource(BaseModel):
     display_name: str
     chunk_count: int
     owner: str
+    # Whether the document carries an ACL narrower than its whole tenant. The ACL itself is
+    # not listed: who else may read a document is not something every reader needs to know.
+    restricted: bool = False
+
+
+_PRINCIPAL_NAME_RE = re.compile(r"^[^\s,]{1,256}$")
+
+
+class SourceAclRequest(BaseModel):
+    """PUT /api/v1/sources/{source}/acl body. Both lists empty means "visible to the whole
+    tenant". Names are the identity provider's: user ids or emails, group names."""
+
+    users: list[str] = Field(default_factory=list, max_length=500)
+    groups: list[str] = Field(default_factory=list, max_length=500)
+
+    @field_validator("users", "groups")
+    @classmethod
+    def _names_are_single_tokens(cls, values: list[str]) -> list[str]:
+        cleaned = [v.strip() for v in values if v.strip()]
+        for value in cleaned:
+            if not _PRINCIPAL_NAME_RE.match(value):
+                raise ValueError(f"{value!r} is not a valid user or group name")
+        return cleaned
+
+
+class SourceAclResponse(BaseModel):
+    source: str
+    users: list[str]
+    groups: list[str]
+    restricted: bool
+    # The ingest that applies the change to the index; poll GET /api/v1/ingest/{task_id}.
+    task_id: str
+
+
+class ReindexRequest(BaseModel):
+    """POST /api/v1/admin/index/reindex body."""
+
+    # As the index records it, e.g. "openai/text-embedding-3-large". None means the
+    # configured EMBEDDING_PROVIDER's model.
+    embedding_model: str | None = Field(default=None, max_length=200)
+    from_corpus: bool = False
+    activate: bool = False
+
+
+class ActivateGenerationRequest(BaseModel):
+    # "" is the legacy generation.
+    generation: str = Field(..., max_length=64)
+
+
+class SourceDeleteResponse(BaseModel):
+    """What removing one indexed document removed."""
+
+    source: str
+    display_name: str
+    chunks_removed: int
+    file_removed: bool
 
 
 class TenantUsageResponse(BaseModel):

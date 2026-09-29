@@ -45,9 +45,10 @@ def load_manifest(persist_dir: Path) -> dict[str, dict]:
     by an older version simply lack the newer fields, which makes them compare unequal and
     re-index -- the correct outcome, and the reason no explicit migration is needed here."""
     if _shared_backend():
+        from rag_assistant.ingestion.generations import generation_of_dir
         from rag_assistant.retrieval.pgvector_store import load_manifest_rows
 
-        return load_manifest_rows()
+        return load_manifest_rows(generation_of_dir(persist_dir))
     path = manifest_path(persist_dir)
     if not path.exists():
         return {}
@@ -64,9 +65,10 @@ def save_manifest(persist_dir: Path, manifest: dict[str, dict]) -> None:
     read as "nothing is indexed", which re-parses and re-embeds the entire corpus.
     """
     if _shared_backend():
+        from rag_assistant.ingestion.generations import generation_of_dir
         from rag_assistant.retrieval.pgvector_store import save_manifest_rows
 
-        save_manifest_rows(manifest)
+        save_manifest_rows(manifest, generation_of_dir(persist_dir))
         return
     path = manifest_path(persist_dir)
     path.parent.mkdir(parents=True, exist_ok=True)

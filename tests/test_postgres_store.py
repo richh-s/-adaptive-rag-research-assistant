@@ -213,6 +213,21 @@ def test_feedback_is_scoped_per_tenant(pg_store):
     assert [f.question for f in pg_store.list_feedback(owner="alice")] == ["mine"]
 
 
+def test_erasing_a_tenant_reaches_its_users_but_no_other_tenant(pg_store):
+    """Users' conversations are stored under `<tenant>::<user>`. Erasing the tenant must
+    reach them -- and must not reach a different tenant whose name merely starts the same
+    way, which is why the match is a literal prefix rather than a LIKE pattern."""
+    pg_store.create_conversation("tenant-wide", owner="acme")
+    pg_store.create_conversation("dana's", owner="acme::dana")
+    pg_store.record_feedback("q", "down", owner="acme::erin")
+    survivor = pg_store.create_conversation("other tenant", owner="acme_x::zed")
+
+    conversations, feedback = pg_store.delete_all_for_owner("acme")
+
+    assert (conversations, feedback) == (2, 1)
+    assert [c.id for c in pg_store.list_conversations(owner="acme_x::zed")] == [survivor.id]
+
+
 # ---- the point of the whole backend ----
 
 

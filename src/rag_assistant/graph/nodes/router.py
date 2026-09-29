@@ -4,8 +4,10 @@ from pathlib import Path
 from rag_assistant.auth import PUBLIC_OWNER
 from rag_assistant.cache import cache_get, cache_key, cache_set
 from rag_assistant.config import get_settings
+from rag_assistant.ingestion.generations import active_index_dir
 from rag_assistant.content_trust import fence_block, new_nonce
-from rag_assistant.graph.state import ResearchState
+from rag_assistant.graph.state import ResearchState, access_principals
+from rag_assistant.ingestion.acl import entry_readable
 from rag_assistant.ingestion.manifest import load_manifest
 from rag_assistant.ingestion.ownership import display_source, visible_owners
 from rag_assistant.llm import get_structured_llm
@@ -15,7 +17,9 @@ from rag_assistant.schemas.models import RouteDecision
 _HASH_SUFFIX_RE = re.compile(r"_[0-9a-f]{8}$")
 
 
-def _describe_local_corpus(owner: str = PUBLIC_OWNER) -> str:
+def _describe_local_corpus(
+    owner: str = PUBLIC_OWNER, principals: frozenset[str] | None = None
+) -> str:
     """Turns the ingestion manifest's indexed filenames into a human-readable topic list, so
     the router judges routes against what's actually indexed instead of a hardcoded, stale
     description -- otherwise a newly uploaded document outside the original topic set always
@@ -24,13 +28,14 @@ def _describe_local_corpus(owner: str = PUBLIC_OWNER) -> str:
     Scoped to what this tenant can retrieve. Listing another tenant's filenames would leak
     them through the router prompt even though retrieval itself filters them out -- and worse,
     it would route the question to a local corpus that then returns nothing for this caller.
+    The same holds inside a tenant for documents the caller's ACL excludes.
     """
-    manifest = load_manifest(get_settings().chroma_persist_dir)
+    manifest = load_manifest(active_index_dir())
     allowed = set(visible_owners(owner))
     visible = {
         source: entry
         for source, entry in manifest.items()
-        if entry.get("owner", PUBLIC_OWNER) in allowed
+        if entry.get("owner", PUBLIC_OWNER) in allowed and entry_readable(entry, principals)
     }
     if not visible:
         return "(empty -- no documents indexed yet)"
@@ -46,13 +51,15 @@ def _describe_local_corpus(owner: str = PUBLIC_OWNER) -> str:
     return "; ".join(topics)
 
 
-def route_query(state: ResearchState) -> dict:
+async def route_query(state: ResearchState) -> dict:
     """Agentic/Self-RAG routing: ask the LLM which retrieval path(s) this question needs,
     instead of always retrieving the same way. Routing depends on both the question text and
     the current corpus contents, so the cache key covers both -- a freshly uploaded document
     must not be masked by a decision cached before it existed."""
     question = state["question"]
-    corpus_description = _describe_local_corpus(state.get("owner") or PUBLIC_OWNER)
+    corpus_description = _describe_local_corpus(
+        state.get("owner") or PUBLIC_OWNER, access_principals(state)
+    )
     # The corpus description is part of the cache key, so tenants with different visible
     # corpora can't share a cached routing decision.
     key = cache_key("router", question, corpus_description)
@@ -61,7 +68,7 @@ def route_query(state: ResearchState) -> dict:
         return {"route": cached["route"], "route_reasoning": cached["route_reasoning"]}
 
     llm = get_structured_llm(RouteDecision)
-    decision: RouteDecision = llm.invoke(
+    decision: RouteDecision = await llm.ainvoke(
         ROUTER_PROMPT.format(
             question=question,
             corpus_description=fence_block(

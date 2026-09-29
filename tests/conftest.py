@@ -4,9 +4,10 @@ from pathlib import Path
 import pytest
 from langchain_core.embeddings import Embeddings
 
-from rag_assistant import auth, cache
+from rag_assistant import auth, cache, oidc
 from rag_assistant.config import get_settings
 from rag_assistant.conversations import store as conversations_store
+from rag_assistant.ingestion import generations
 from rag_assistant.ingestion import tasks as ingest_tasks
 from rag_assistant.retrieval import parent_store, reranker
 
@@ -59,7 +60,13 @@ def _clear_settings_cache():
     # content index used for upload idempotency -- without resetting it, one test's upload
     # makes an identical upload in a later test collapse onto the first test's task.
     ingest_tasks.reset_tasks()
+    # Which index generation serves is cached per process for a few seconds; a test that
+    # switches generations must not leak its pointer reading into the next test.
+    generations.reset_pointer_cache()
+    oidc.reset_oidc_cache()
     yield
+    generations.reset_pointer_cache()
+    oidc.reset_oidc_cache()
     get_settings.cache_clear()
     cache.reset_client_cache()
     auth.reset_api_key_cache()

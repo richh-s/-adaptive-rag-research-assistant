@@ -24,6 +24,11 @@ def build_research_summary(state: dict) -> ResearchSummary:
         context_documents_dropped=state.get("context_documents_dropped") or 0,
         confidence_score=state.get("confidence_score"),
         correction_attempted=bool(state.get("correction_attempted")),
+        refinement_attempted=bool(state.get("refinement_attempted")),
+        refined_sub_queries=state.get("refined_sub_queries") or [],
+        groundedness_checked=bool(state.get("groundedness_checked")),
+        groundedness_score=state.get("groundedness_score"),
+        unsupported_claim_count=len(state.get("unsupported_claims") or []),
         node_latencies_ms=[NodeLatency(**t) for t in node_timings],
         total_latency_ms=round(sum(t["latency_ms"] for t in node_timings), 1),
     )

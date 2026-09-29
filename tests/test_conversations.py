@@ -8,6 +8,20 @@ from rag_assistant import api
 from rag_assistant.conversations import store
 
 
+def _as_async(stub):
+    """Wraps a graph stub so it can stand in for `ainvoke`.
+
+    `/api/v1/research` awaits the graph now -- the LLM-bound nodes are coroutines, so there is
+    no synchronous `invoke` to patch. Without this the handler would fall through to the real
+    graph and make live provider calls from the test suite.
+    """
+
+    async def _ainvoke(*args, **kwargs):
+        return stub(*args, **kwargs)
+
+    return _ainvoke
+
+
 @pytest.fixture(autouse=True)
 def _no_rate_limit(monkeypatch):
     """The slowapi limiter's in-memory hit counts persist across the whole test process, and
@@ -83,7 +97,7 @@ def _fake_invoke(state, config=None):
 
 
 def test_research_creates_conversation_by_default(monkeypatch):
-    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_fake_invoke))
     client = TestClient(api.app)
 
     response = client.post("/research", json={"question": "Who founded Anthropic?"})
@@ -101,7 +115,7 @@ def test_research_creates_conversation_by_default(monkeypatch):
 
 
 def test_research_save_false_persists_nothing(monkeypatch):
-    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_fake_invoke))
     client = TestClient(api.app)
 
     response = client.post("/research", json={"question": "anything", "save": False})
@@ -118,7 +132,7 @@ def test_research_follow_up_uses_server_side_history(monkeypatch):
         captured["chat_history"] = state.get("chat_history")
         return _fake_invoke(state, config)
 
-    monkeypatch.setattr(api._graph, "invoke", _capturing_invoke)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_capturing_invoke))
     client = TestClient(api.app)
 
     first = client.post("/research", json={"question": "Who founded Anthropic?"}).json()
@@ -150,7 +164,7 @@ def test_research_unknown_conversation_is_404_before_llm_spend(monkeypatch):
     def _must_not_run(state, config=None):
         raise AssertionError("graph must not be invoked for an unknown conversation")
 
-    monkeypatch.setattr(api._graph, "invoke", _must_not_run)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_must_not_run))
     client = TestClient(api.app)
 
     response = client.post("/research", json={"question": "q", "conversation_id": "does-not-exist"})
@@ -162,7 +176,7 @@ def test_research_failure_persists_nothing(monkeypatch):
     def _boom(state, config=None):
         raise RuntimeError("provider down")
 
-    monkeypatch.setattr(api._graph, "invoke", _boom)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_boom))
     client = TestClient(api.app)
 
     response = client.post("/research", json={"question": "q"})
@@ -172,7 +186,7 @@ def test_research_failure_persists_nothing(monkeypatch):
 
 
 def test_conversation_list_get_delete_endpoints(monkeypatch):
-    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_fake_invoke))
     client = TestClient(api.app)
 
     conversation_id = client.post("/research", json={"question": "q1"}).json()["conversation_id"]
@@ -223,3 +237,17 @@ def test_store_migrates_pre_tenancy_database(monkeypatch, tmp_path):
     listed = store.list_conversations(owner="public")
     assert [c.id for c in listed] == ["old-conv"]
     assert store.list_conversations(owner="someone-else") == []
+
+
+def test_erasing_a_tenant_reaches_its_users_but_no_other_tenant():
+    """SQLite counterpart of the Postgres test: `substr` rather than LIKE, whose `_`
+    wildcard would let tenant "acme" erase tenant "acmeX"'s users via a pattern."""
+    from rag_assistant.conversations import store
+
+    store.create_conversation("tenant-wide", owner="acme")
+    store.create_conversation("dana's", owner="acme::dana")
+    store.record_feedback("q", "down", owner="acme::erin")
+    survivor = store.create_conversation("other", owner="acme_x::zed")
+
+    assert store.delete_all_for_owner("acme") == (2, 1)
+    assert [c.id for c in store.list_conversations(owner="acme_x::zed")] == [survivor.id]

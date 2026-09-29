@@ -11,6 +11,20 @@ from rag_assistant import api
 from rag_assistant.config import Settings, get_settings
 
 
+def _as_async(stub):
+    """Wraps a graph stub so it can stand in for `ainvoke`.
+
+    `/api/v1/research` awaits the graph now -- the LLM-bound nodes are coroutines, so there is
+    no synchronous `invoke` to patch. Without this the handler would fall through to the real
+    graph and make live provider calls from the test suite.
+    """
+
+    async def _ainvoke(*args, **kwargs):
+        return stub(*args, **kwargs)
+
+    return _ainvoke
+
+
 @pytest.fixture(autouse=True)
 def _no_rate_limit(monkeypatch):
     """slowapi's hit counts are process-wide and other test modules consume the default
@@ -33,13 +47,15 @@ def test_both_versioned_and_legacy_research_paths_are_served(client: TestClient,
     working; a 404 here would be a silent breaking change for them."""
     monkeypatch.setattr(
         api._graph,
-        "invoke",
-        lambda *args, **kwargs: {
-            "research_report": "# Report",
-            "final_answer": "An answer.",
-            "route": "vector",
-            "confidence_score": 0.9,
-        },
+        "ainvoke",
+        _as_async(
+            lambda *args, **kwargs: {
+                "research_report": "# Report",
+                "final_answer": "An answer.",
+                "route": "vector",
+                "confidence_score": 0.9,
+            }
+        ),
     )
 
     response = client.post(path, json={"question": "Who founded Anthropic?", "save": False})
@@ -84,8 +100,8 @@ def test_legacy_research_paths_are_still_rate_limited(client: TestClient, monkey
     api.global_limiter.reset()
     monkeypatch.setattr(
         api._graph,
-        "invoke",
-        lambda *args, **kwargs: {"research_report": "# Report", "route": "none"},
+        "ainvoke",
+        _as_async(lambda *args, **kwargs: {"research_report": "# Report", "route": "none"}),
     )
 
     first = client.post("/research", json={"question": "A question here.", "save": False})

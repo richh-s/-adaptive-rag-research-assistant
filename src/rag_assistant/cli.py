@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 
@@ -320,7 +321,12 @@ def ask(question: str) -> None:
     """Run the full adaptive research graph on a question."""
     configure_logging()
     try:
-        result = build_graph().invoke({"question": question}, config={"recursion_limit": 50})
+        # The graph's LLM-bound nodes are coroutines, so it is driven through `ainvoke`.
+        # `asyncio.run` is the whole event loop for a one-shot CLI command: there is nothing
+        # else to share it with, and it keeps this a plain synchronous Typer command.
+        result = asyncio.run(
+            build_graph().ainvoke({"question": question}, config={"recursion_limit": 50})
+        )
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -492,7 +498,9 @@ def labels(
     from rag_assistant.ingestion.build_index import relabel_source
     from rag_assistant.ingestion.manifest import load_manifest
 
-    persist_dir = get_settings().chroma_persist_dir
+    from rag_assistant.ingestion.generations import active_index_dir
+
+    persist_dir = active_index_dir()
     if relabel:
         try:
             new = relabel_source(relabel, persist_dir, label=set_to)
@@ -514,6 +522,316 @@ def labels(
         description = manifest[source].get("description")
         table.add_row(source, description or "[dim]none -- router sees the filename[/dim]")
     console.print(table)
+
+
+@app.command()
+def feedback(
+    export: bool = typer.Option(
+        False, "--export", help="Append downvoted questions to the eval candidates file."
+    ),
+    owner: str = typer.Option("public", help="Tenant whose feedback to read."),
+    limit: int = typer.Option(100, help="How many recent feedback rows to consider."),
+) -> None:
+    """Show answer ratings, and turn the downvoted questions into eval-dataset candidates.
+
+    The gate measures regressions against a fixed set of questions, which is what makes it a
+    regression test and what makes it go stale -- it cannot tell you the set stopped
+    resembling what people actually ask. Downvotes are the one signal here that comes from a
+    human, and this is what consumes them."""
+    configure_logging()
+    from rag_assistant.conversations import store as conversations_store
+    from rag_assistant.eval.golden_dataset import export_feedback_candidates
+
+    summary = conversations_store.feedback_summary(owner=owner)
+    console.print(
+        f"[bold]{summary['up']}[/bold] up, [bold]{summary['down']}[/bold] down"
+        + (
+            f" ({summary['satisfaction']:.0%} satisfaction)"
+            if summary.get("satisfaction") is not None
+            else ""
+        )
+    )
+
+    rows = [
+        {
+            "question": row.question,
+            "route": row.route,
+            "note": row.note,
+            "confidence_score": row.confidence_score,
+        }
+        for row in conversations_store.list_feedback(owner=owner, limit=limit)
+        if row.rating == "down"
+    ]
+    if not rows:
+        console.print("[dim]No downvoted answers to review.[/dim]")
+        return
+
+    table = Table(title="Downvoted questions")
+    table.add_column("Question")
+    table.add_column("Route")
+    table.add_column("Confidence")
+    for row in rows:
+        confidence = row["confidence_score"]
+        table.add_row(
+            row["question"][:90],
+            row["route"] or "[dim]-[/dim]",
+            f"{confidence:.2f}" if confidence is not None else "[dim]-[/dim]",
+        )
+    console.print(table)
+
+    if not export:
+        console.print("[dim]Re-run with --export to queue these for the golden dataset.[/dim]")
+        return
+
+    path, written, skipped = export_feedback_candidates(rows)
+    console.print(
+        f"[green]{written}[/green] candidate(s) appended to {path}"
+        + (f", {skipped} already known" if skipped else "")
+    )
+    console.print(
+        "[yellow]Each row needs a ground truth, reference contexts and expected sources "
+        "before it belongs in the dataset. They are left blank deliberately: filling them "
+        "from the answer that was downvoted would make the gate defend the bug.[/yellow]"
+    )
+
+
+@app.command(name="delete")
+def delete_(
+    source: str = typer.Argument(
+        ..., help="Manifest source key, as `rag-assistant labels` lists it."
+    ),
+    owner: str = typer.Option(
+        "public", help="Tenant that owns it. Tenant files are keyed `_t/<owner>/<file>`."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Remove one indexed document: its chunks, parent sections, manifest entry and file.
+
+    The CLI counterpart of `DELETE /api/v1/sources/{source}`, for the cases that never come
+    through the API -- a document pulled after a takedown request, or one whose parse was bad
+    enough that re-ingesting it would only reproduce the problem."""
+    configure_logging()
+    from rag_assistant import tenancy
+
+    if not yes:
+        typer.confirm(
+            f"Delete {source!r} (owner {owner!r}) from the index and the corpus?", abort=True
+        )
+    try:
+        result = tenancy.purge_source(source, owner)
+    except tenancy.SourceNotFound:
+        console.print(
+            f"[red]No indexed source {source!r} owned by {owner!r}.[/red] "
+            "Run `rag-assistant labels` to see what is indexed."
+        )
+        raise typer.Exit(code=1) from None
+
+    console.print(
+        f"[green]Removed[/green] {result.source}: {result.chunks} chunk(s)"
+        + (", corpus file deleted" if result.file_removed else ", no corpus file on disk")
+    )
+
+
+reindex_app = typer.Typer(
+    help="Rebuild the index beside the serving one and switch to it without downtime."
+)
+app.add_typer(reindex_app, name="reindex")
+
+
+@reindex_app.command(name="status")
+def reindex_status() -> None:
+    """List index generations: which serves, which is the rollback target, and what built
+    each one."""
+    configure_logging()
+    from rag_assistant.ingestion.reindex import describe_generations
+
+    table = Table(title="Index generations")
+    for column in ("generation", "state", "embedding model", "sources", "chunks", "notes"):
+        table.add_column(column)
+    for info in describe_generations():
+        state = "serving" if info.active else "rollback target" if info.previous else ""
+        table.add_row(
+            info.generation or "legacy",
+            state,
+            info.embedding_model or "(none recorded)",
+            str(info.sources),
+            str(info.chunks),
+            "; ".join(info.notes),
+        )
+    console.print(table)
+
+
+@reindex_app.command(name="build")
+def reindex_build(
+    embedding_model: str = typer.Option(
+        None,
+        help="Model to embed with, as the index records it: `models/gemini-embedding-001`, "
+        "`openai/text-embedding-3-large`, `local/nomic-embed-text`. Defaults to the "
+        "configured EMBEDDING_PROVIDER's model.",
+    ),
+    from_corpus: bool = typer.Option(
+        False,
+        "--from-corpus",
+        help="Re-parse every file instead of re-embedding the text already indexed. Repeats "
+        "every vision and description call; needed only when the text itself must change.",
+    ),
+    activate_after: bool = typer.Option(
+        False, "--activate", help="Switch to the new generation as soon as it is built."
+    ),
+) -> None:
+    """Build a new index generation beside the serving one. Serving is unaffected.
+
+    With embedded Chroma the API process holds the index open, so run this while the server
+    is stopped, or use POST /api/v1/admin/index/reindex instead. With Chroma server mode or
+    pgvector it is safe to run alongside a live deployment."""
+    configure_logging()
+    from rag_assistant.ingestion.reindex import activate, build_generation
+
+    result = build_generation(
+        embedding_model=embedding_model,
+        from_corpus=from_corpus,
+        on_progress=lambda message: console.print(f"  {message}"),
+    )
+    console.print(
+        f"[green]Built[/green] {result.generation} with {result.embedding_model}: "
+        f"{result.sources} source(s), {result.chunks} chunk(s) in {result.seconds}s"
+    )
+    if activate_after:
+        activate(result.generation)
+        console.print(f"[green]Now serving[/green] {result.generation}")
+    else:
+        console.print(f"Activate with: rag-assistant reindex activate {result.generation}")
+
+
+@reindex_app.command(name="activate")
+def reindex_activate(generation: str) -> None:
+    """Catch a built generation up with the corpus and make it the one that serves. Every
+    replica switches within INDEX_POINTER_POLL_SECONDS."""
+    configure_logging()
+    from rag_assistant.ingestion.reindex import ReindexError, activate
+
+    try:
+        pointer = activate("" if generation == "legacy" else generation)
+    except (ReindexError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[green]Serving[/green] {pointer.generation or 'legacy'} "
+        f"(previously {pointer.previous or 'legacy'}; `rag-assistant reindex rollback` undoes this)"
+    )
+
+
+@reindex_app.command(name="rollback")
+def reindex_rollback() -> None:
+    """Switch back to the generation that served before the last activation."""
+    configure_logging()
+    from rag_assistant.ingestion.reindex import ReindexError, rollback
+
+    try:
+        pointer = rollback()
+    except ReindexError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Serving[/green] {pointer.generation or 'legacy'} again")
+
+
+@reindex_app.command(name="gc")
+def reindex_gc(
+    keep_previous: bool = typer.Option(
+        True, help="Keep the rollback target. Without it, rollback is no longer possible."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Delete generations that neither serve nor are the rollback target."""
+    configure_logging()
+    from rag_assistant.ingestion.reindex import garbage_collect
+
+    doomed = garbage_collect(keep_previous=keep_previous, dry_run=True)
+    if not doomed:
+        console.print("Nothing to delete.")
+        return
+    if not yes:
+        typer.confirm(f"Delete generation(s) {', '.join(doomed)}?", abort=True)
+    garbage_collect(keep_previous=keep_previous)
+    console.print(f"[green]Deleted[/green] {', '.join(doomed)}")
+
+
+connectors_app = typer.Typer(help="Sync documents from Confluence, Google Drive and file shares.")
+app.add_typer(connectors_app, name="connectors")
+
+
+@connectors_app.command(name="list")
+def connectors_list() -> None:
+    """Show every configured connector and what its last sync did."""
+    configure_logging()
+    import datetime
+
+    from rag_assistant.connectors.base import load_connector_configs
+    from rag_assistant.connectors.sync import connector_status
+
+    table = Table(title="Connectors")
+    for column in ("name", "type", "tenant", "documents", "last success", "last outcome"):
+        table.add_column(column)
+    for config in load_connector_configs():
+        status = connector_status(config)
+        last = status["last_success_at"]
+        table.add_row(
+            config.name,
+            config.type,
+            config.owner,
+            str(status["documents"]),
+            datetime.datetime.fromtimestamp(last).isoformat(timespec="seconds")
+            if last
+            else "never",
+            (status["last_run"] or {}).get("outcome", "-"),
+        )
+    console.print(table)
+
+
+@connectors_app.command(name="sync")
+def connectors_sync(
+    name: str = typer.Argument(None, help="One connector; omit to sync them all."),
+    due: bool = typer.Option(
+        False, "--due", help="Only connectors whose interval has elapsed (for cron)."
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Apply deletions even past CONNECTOR_MAX_DELETE_FRACTION. Use after confirming "
+        "the documents really were deleted at the source.",
+    ),
+) -> None:
+    """Mirror connectors into their tenants' corpora and re-index what changed."""
+    configure_logging()
+    from rag_assistant.connectors.base import load_connector_configs
+    from rag_assistant.connectors.sync import SyncInProgress, connector_status, sync_connector
+
+    configs = load_connector_configs()
+    if name:
+        configs = [c for c in configs if c.name == name]
+        if not configs:
+            console.print(f"[red]No connector named {name!r}.[/red]")
+            raise typer.Exit(code=1)
+    exit_code = 0
+    for config in configs:
+        if due and not connector_status(config)["due"]:
+            continue
+        try:
+            result = sync_connector(config, force=force)
+        except SyncInProgress:
+            console.print(f"[yellow]{config.name}: already syncing elsewhere; skipped[/yellow]")
+            continue
+        colour = {"ok": "green", "partial": "yellow"}.get(result.outcome, "red")
+        console.print(
+            f"[{colour}]{config.name}: {result.outcome}[/{colour}] -- listed {result.listed}, "
+            f"added {result.added}, updated {result.updated}, deleted {result.deleted}, "
+            f"permissions {result.permissions_changed}, failed {len(result.failed)}"
+        )
+        if result.error:
+            console.print(f"  {result.error}")
+        if result.outcome in ("error", "refused"):
+            exit_code = 1
+    raise typer.Exit(code=exit_code)
 
 
 def main() -> None:

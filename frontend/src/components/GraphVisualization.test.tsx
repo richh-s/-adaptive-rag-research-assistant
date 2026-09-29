@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import { GraphVisualization } from './GraphVisualization'
 import type { NodeVisit } from '../hooks/useResearchStream'
@@ -67,7 +67,69 @@ describe('GraphVisualization', () => {
 
     const corrective = screen.getByText('Corrective web search').closest('li')
     expect(corrective).toHaveClass('graph-viz-skipped')
-    expect(screen.getByText('not needed')).toBeInTheDocument()
+    // Scoped to this stage: both escalations are conditional, so a bare query for the note
+    // would match whichever one the DOM happened to render first.
+    expect(within(corrective as HTMLElement).getByText('not needed')).toBeInTheDocument()
+  })
+
+  it('marks refine_retrieval as skipped when confidence never dropped', () => {
+    render(
+      <GraphVisualization
+        visits={[
+          visit('route_query', 1),
+          visit('decompose_query', 2),
+          visit('retrieve_vector', 3),
+          visit('fuse_results', 4),
+          visit('grade_and_score', 5),
+          visit('synthesize_answer', 6),
+        ]}
+        loading={false}
+      />,
+    )
+
+    const refine = screen.getByText('Re-ask the corpus').closest('li')
+    expect(refine).toHaveClass('graph-viz-skipped')
+  })
+
+  it('shows the corpus re-ask as done and the web fallback as skipped when only the first fired', () => {
+    render(
+      <GraphVisualization
+        visits={[
+          visit('route_query', 1),
+          visit('decompose_query', 2),
+          visit('retrieve_vector', 3),
+          visit('fuse_results', 4),
+          visit('grade_and_score', 5),
+          visit('refine_retrieval', 6),
+          visit('fuse_results', 7),
+          visit('grade_and_score', 8),
+          visit('synthesize_answer', 9),
+        ]}
+        loading={false}
+      />,
+    )
+
+    expect(screen.getByText('Re-ask the corpus').closest('li')).toHaveClass('graph-viz-done')
+    expect(screen.getByText('Corrective web search').closest('li')).toHaveClass(
+      'graph-viz-skipped',
+    )
+  })
+
+  it('shows the grounding check once synthesis has run', () => {
+    render(
+      <GraphVisualization
+        visits={[
+          visit('synthesize_answer', 1),
+          visit('verify_groundedness', 2),
+          visit('format_report', 3),
+        ]}
+        loading={false}
+      />,
+    )
+
+    expect(screen.getByText('Check answer against sources').closest('li')).toHaveClass(
+      'graph-viz-done',
+    )
   })
 
   it('marks corrective_web_search as done when the correction loop actually fired', () => {
@@ -89,6 +151,6 @@ describe('GraphVisualization', () => {
 
     const corrective = screen.getByText('Corrective web search').closest('li')
     expect(corrective).toHaveClass('graph-viz-done')
-    expect(screen.queryByText('not needed')).not.toBeInTheDocument()
+    expect(within(corrective as HTMLElement).queryByText('not needed')).not.toBeInTheDocument()
   })
 })

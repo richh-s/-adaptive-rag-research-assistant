@@ -8,9 +8,16 @@ from pathlib import Path
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
+from rag_assistant import pii
 from rag_assistant.config import get_settings
+from rag_assistant.ingestion.acl import META_ACL, META_RESTRICTED
+from rag_assistant.ingestion.generations import active_index_dir
 from rag_assistant.ingestion.loaders import LOADER_VERSION, iter_corpus_files, load_corpus_file
-from rag_assistant.ingestion.index_metadata import read_embedding_dimension, save_index_metadata
+from rag_assistant.ingestion.index_metadata import (
+    index_embedding_model,
+    read_embedding_dimension,
+    save_index_metadata,
+)
 from rag_assistant.ingestion import vision
 from rag_assistant.ingestion.describe import describe_document, document_context_line
 from rag_assistant.ingestion.manifest import load_manifest, save_manifest
@@ -21,7 +28,11 @@ from rag_assistant.retrieval.parent_store import (
     delete_parents_for_source,
     replace_parents_for_source,
 )
-from rag_assistant.retrieval.vector_store import get_vector_store
+from rag_assistant.retrieval.vector_store import (
+    evict_store,
+    get_vector_store,
+    update_chunk_metadata,
+)
 
 # Serializes full build_index() runs. Needed for two reasons: (1) the manifest is a plain
 # JSON file with a read-modify-write cycle and no locking of its own -- two ingestion runs
@@ -32,7 +43,10 @@ from rag_assistant.retrieval.vector_store import get_vector_store
 # necessary. Chroma's own client cache (vector_store.py) and the BM25 index cache
 # (bm25_store.py) each already guard their *own* construction with a lock; this lock is
 # specifically for the higher-level ingest-pipeline sequence that calls into both.
-INGEST_LOCK = threading.Lock()
+# Re-entrant so a caller that must hold it across several runs -- activating an index
+# generation holds it across the final catch-up and the pointer flip -- can call build_index
+# inside its own hold.
+INGEST_LOCK = threading.RLock()
 
 
 @dataclass
@@ -54,6 +68,9 @@ class IndexResult:
     vision_calls: int = 0
     # One-line router labels written this run, new files and backfills alike (describe.py).
     description_calls: int = 0
+    # Files whose bytes were unchanged but whose permissions were not: their chunks' ACL
+    # metadata was rewritten in place, with no parse and no embedding call.
+    acl_updates: int = 0
 
 
 def _stored_text(store, chunk_ids: list[str]) -> str:
@@ -103,7 +120,9 @@ def build_index(
     """
     settings = get_settings()
     source_dir = source_dir or settings.corpus_dir
-    persist_dir = persist_dir or settings.chroma_persist_dir
+    # The serving generation unless told otherwise; `rag-assistant reindex` passes the
+    # directory of the generation it is building (see generations.py).
+    persist_dir = persist_dir or active_index_dir()
 
     if owner is not None and not incremental:
         # A full rebuild resets the whole collection, which would delete every other
@@ -126,8 +145,22 @@ def build_index(
         if not incremental:
             store.reset_collection()
             manifest: dict[str, dict] = {}
+            # A full rebuild re-embeds everything, so it adopts the configured embedding model
+            # -- the one moment an index may change models in place. Recorded before the store
+            # is rebuilt, because the store reads the model to embed with from this record.
+            model_name = settings.embedding_model_name
+            # The same holds for the tenant layout: a full rebuild writes every chunk again,
+            # so it may as well write them where the configured layout says.
+            save_index_metadata(
+                persist_dir, embedding_model=model_name, tenant_isolation=settings.tenant_isolation
+            )
+            evict_store(persist_dir)
+            store = get_vector_store(embeddings=embeddings, persist_dir=persist_dir)
         else:
             manifest = load_manifest(persist_dir)
+            # An incremental run adds to an index that already has a vector space; it must
+            # embed into that space, whatever is configured now.
+            model_name = index_embedding_model(persist_dir) or settings.embedding_model_name
 
         files_by_source = {f.source: f for f in corpus_files}
 
@@ -165,6 +198,9 @@ def build_index(
         skipped_files = 0
         parsed_files = 0
         description_calls = 0
+        acl_updates = 0
+        # Chunk ids whose ACL metadata changed in place; the keyword index re-reads them.
+        acl_changed_chunk_ids: list[str] = []
         describe = get_settings().describe_documents
         for source, corpus_file in files_by_source.items():
             existing = manifest.get(source)
@@ -181,6 +217,19 @@ def build_index(
                 and existing.get("loader_version") == LOADER_VERSION
             ):
                 skipped_files += 1
+                # Same bytes, different permissions: rewrite the ACL on the stored chunks and
+                # stop. A permission change is the most frequent kind of change a synced
+                # source produces, and re-embedding a document because someone was added to
+                # its sharing list would make keeping permissions current prohibitively
+                # expensive. Entries written before ACLs existed count as open.
+                acl_fingerprint = corpus_file.acl.fingerprint()
+                if existing.get("acl_hash", "open") != acl_fingerprint:
+                    update_chunk_metadata(
+                        store, existing["chunk_ids"], corpus_file.acl.chunk_metadata()
+                    )
+                    acl_changed_chunk_ids.extend(existing["chunk_ids"])
+                    _record_acl(existing, corpus_file.acl)
+                    acl_updates += 1
                 if describe and "description" not in existing:
                     # Backfill for files indexed before descriptions existed. Recorded even
                     # when None, so a document that cannot be labelled is tried once rather
@@ -217,9 +266,20 @@ def build_index(
             # a corpus of near-identical annual reports turns on (see describe.py). Bounded
             # by MAX_DESCRIPTION_CHARS, so it cannot crowd out the chunk it labels.
             context_line = document_context_line(Path(source).name, description)
+            acl_metadata = corpus_file.acl.chunk_metadata()
             for chunk in chunks:
                 chunk.metadata["ingested_at"] = indexed_at
-                chunk.page_content = f"{context_line}\n\n{chunk.page_content}"
+                # Stamped on every chunk so retrieval filters on permissions inside the
+                # search itself (see ingestion/acl.py) rather than after it.
+                chunk.metadata[META_RESTRICTED] = acl_metadata[META_RESTRICTED]
+                chunk.metadata[META_ACL] = acl_metadata[META_ACL]
+                # PII policy is applied here, on the last text before it is embedded and
+                # keyword-indexed -- not on the file and not on the parsed document. Applying
+                # it earlier would redact the text the describer and the splitter reason
+                # about; later is too late, because `add_documents` is what embeds it.
+                chunk.page_content = pii.apply(
+                    f"{context_line}\n\n{chunk.page_content}", source=source
+                )
             chunk_ids = _chunk_ids(source, chunks)
             if chunks:
                 store.add_documents(chunks, ids=chunk_ids)
@@ -234,7 +294,13 @@ def build_index(
                 persist_dir,
                 source,
                 corpus_file.owner,
-                {pid: f"{context_line}\n\n{text}" for pid, text in split.parents.items()},
+                # Parents get the same treatment: with PARENT_CONTEXT on, the section
+                # replaces the chunk in the synthesis prompt, so a redacted chunk whose
+                # parent still carried the original would put it straight back in the answer.
+                {
+                    pid: pii.apply(f"{context_line}\n\n{text}", source=source)
+                    for pid, text in split.parents.items()
+                },
             )
             manifest[source] = {
                 "file_hash": corpus_file.fingerprint,
@@ -247,6 +313,7 @@ def build_index(
                 # answer "what is in this corpus for me".
                 "owner": corpus_file.owner,
             }
+            _record_acl(manifest[source], corpus_file.acl)
             if describe:
                 manifest[source]["description"] = description
             indexed_chunks += len(chunks)
@@ -259,7 +326,7 @@ def build_index(
         # the configured model matches what is stored.
         save_index_metadata(
             persist_dir,
-            embedding_model=get_settings().embedding_model_name,
+            embedding_model=model_name,
             embedding_dimension=read_embedding_dimension(store),
         )
 
@@ -282,18 +349,24 @@ def build_index(
         # Published only after the manifest, parents and chunks are all committed. A replica
         # that polls this number treats it as "everything behind this version is readable",
         # so bumping it earlier would invite a rebuild against a half-written index.
-        if (changed_files or removed_sources) and get_settings().vector_backend == "pgvector":
+        index_changed = bool(changed_files or removed_sources or acl_updates)
+        if index_changed and get_settings().vector_backend == "pgvector":
+            from rag_assistant.ingestion.generations import generation_of_dir
             from rag_assistant.retrieval.pgvector_store import bump_index_version
 
-            bump_index_version()
+            bump_index_version(generation_of_dir(persist_dir))
 
-        if changed_files or removed_sources:
+        if index_changed:
             # Apply just the delta. `apply_bm25_delta` reports False when no index is cached
             # yet, in which case building one now keeps the eager-refresh guarantee: by the
             # time this returns, keyword search already reflects the new corpus, so a query
-            # landing immediately after an ingest doesn't pay a rebuild inline.
+            # landing immediately after an ingest doesn't pay a rebuild inline. A chunk whose
+            # permissions changed is removed and re-read, which is how its cached metadata --
+            # the thing the in-memory keyword filter checks -- picks up the new ACL.
             if not apply_bm25_delta(
-                persist_dir, added_ids=added_chunk_ids, removed_ids=removed_chunk_ids
+                persist_dir,
+                added_ids=added_chunk_ids + acl_changed_chunk_ids,
+                removed_ids=removed_chunk_ids + acl_changed_chunk_ids,
             ):
                 get_bm25_index(persist_dir)
             if on_stage:
@@ -308,7 +381,19 @@ def build_index(
         embedded_chars=embedded_chars,
         vision_calls=vision.calls_made() - vision_calls_before,
         description_calls=description_calls,
+        acl_updates=acl_updates,
     )
+
+
+def _record_acl(entry: dict, acl) -> None:
+    """Copies a document's ACL into its manifest entry: the fingerprint decides whether a
+    later run must rewrite chunk metadata, and the ACL itself is what source listings and the
+    router's corpus description filter on without reading the vector store."""
+    entry["acl_hash"] = acl.fingerprint()
+    if acl.restricted:
+        entry["acl"] = acl.to_json()
+    else:
+        entry.pop("acl", None)
 
 
 def relabel_source(
@@ -326,7 +411,7 @@ def relabel_source(
     The new label reaches retrieval at the next re-index of that file, since the prefix is
     baked into the stored chunks; the router sees it immediately.
     """
-    persist_dir = persist_dir or get_settings().chroma_persist_dir
+    persist_dir = persist_dir or active_index_dir()
     manifest = load_manifest(persist_dir)
     entry = manifest.get(source)
     if entry is None:

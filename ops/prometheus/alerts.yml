@@ -137,7 +137,38 @@ groups:
         annotations:
           summary: "Readiness probe is failing"
           description: >-
-            Chroma, web search, or the embedding-model check is failing. If it is embeddings,
-            queries are being embedded into a different vector space than the stored
-            documents: answers will look confident and be meaningless until the index is
-            rebuilt with `rag-assistant ingest --full`.
+            Chroma, web search, or the embedding check is failing. If it is embeddings, the
+            model the serving index generation was built with cannot be used -- its provider's
+            credentials were removed or its self-hosted server is down -- and no query can be
+            embedded until it is back. A *configured* model that merely differs is reported
+            on /ready but is not a failure; `rag-assistant reindex build` migrates to it.
+
+      - alert: RagAssistantConnectorStale
+        # A connector that has stopped syncing leaves its documents frozen: deletions upstream
+        # stay searchable and permission changes upstream are not applied. Nothing else
+        # reports that, because the service keeps answering perfectly well from the stale
+        # copy. Three hours covers an hourly connector missing two runs; tune per deployment.
+        expr: time() - rag_connector_last_success_timestamp_seconds > 3 * 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Connector {{ $labels.connector }} has not synced successfully in 3h"
+          description: >-
+            Run `rag-assistant connectors list` for the last outcome. "refused" means the
+            deletion guard stopped a sync that would have removed most of the source --
+            confirm at the source, then `rag-assistant connectors sync <name> --force`.
+
+      - alert: RagAssistantConnectorSyncRefused
+        # The deletion guard fired: a listing came back missing most of what was synced
+        # before. Usually an expired credential or a revoked share, occasionally a real mass
+        # deletion. Either way a person has to look, and nothing is deleted until they do.
+        expr: increase(rag_connector_syncs_total{outcome="refused"}[1h]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Connector {{ $labels.connector }} sync refused by the deletion guard"
+          description: >-
+            The source listed far fewer documents than were synced last time. Check the
+            connector's credentials and sharing before forcing the deletion through.

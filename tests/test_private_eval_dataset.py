@@ -6,13 +6,20 @@ there scores as a retrieval regression just as silently -- and skips cleanly in 
 has neither the dataset nor the corpus it quotes.
 """
 
+import json
+
 import pytest
 
 from rag_assistant.config import PROJECT_ROOT
 from rag_assistant.eval.golden_dataset import load_golden_dataset
 
-PRIVATE_DATASET = PROJECT_ROOT / "data" / "golden_eval" / "private" / "dataset.jsonl"
+PRIVATE_DIR = PROJECT_ROOT / "data" / "golden_eval" / "private"
+PRIVATE_DATASET = PRIVATE_DIR / "dataset.jsonl"
 PRIVATE_CORPUS = PROJECT_ROOT / "data" / "private_corpus"
+# Any other suite kept beside the main one -- a multilingual set, a domain-specific set. They
+# are too small to carry the main set's coverage rules, but the rules that make a row *valid*
+# apply to every one of them.
+OTHER_DATASETS = sorted(p for p in PRIVATE_DIR.glob("*.jsonl") if p != PRIVATE_DATASET)
 
 pytestmark = pytest.mark.skipif(
     not PRIVATE_DATASET.exists(), reason="no private golden dataset in this checkout"
@@ -65,3 +72,31 @@ def test_every_expected_source_names_a_document_that_exists(questions):
     for q in questions:
         for source in q.expected_sources:
             assert source in available, f"{q.question!r} names missing source {source!r}"
+
+
+@pytest.mark.skipif(not OTHER_DATASETS, reason="no additional private suites")
+@pytest.mark.parametrize("path", OTHER_DATASETS or [None], ids=lambda p: p.name if p else "none")
+def test_additional_suites_are_structurally_valid(path):
+    """Scores from a malformed row look like a regression, whichever suite it is in."""
+    questions = load_golden_dataset(path)
+
+    assert questions, f"{path.name} is empty"
+    for q in questions:
+        assert q.expected_route in q.acceptable_routes, q.question
+        if q.category in ("factual", "multi_hop"):
+            assert q.reference_contexts, q.question
+            assert q.expected_sources, q.question
+        else:
+            assert q.expected_sources == [], q.question
+
+
+@pytest.mark.skipif(not OTHER_DATASETS, reason="no additional private suites")
+@pytest.mark.parametrize("path", OTHER_DATASETS or [None], ids=lambda p: p.name if p else "none")
+def test_each_additional_suite_has_its_own_baseline(path):
+    """Scores are comparable only against a baseline recorded on the same questions, so a
+    suite sharing another's baseline would gate on numbers that never described it."""
+    baseline = path.with_name(f"{path.stem}-baseline.json")
+
+    assert baseline.exists(), f"{path.name} has no {baseline.name}"
+    payload = json.loads(baseline.read_text())
+    assert payload["question_count"] == len(load_golden_dataset(path))

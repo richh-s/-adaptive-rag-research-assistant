@@ -44,12 +44,12 @@ def _get_graph():
 
 
 @server.tool()
-def research_question(question: str) -> str:
+async def research_question(question: str) -> str:
     """Answer a research question with citations. Automatically decides whether to search
     the local knowledge base (the user's indexed documents), the live web, or both; fuses
     and grades results; falls back to web search when local confidence is low. Returns a
     markdown report ending with its sources and a transparency summary."""
-    result = _get_graph().invoke(
+    result = await _get_graph().ainvoke(
         {"question": question, "chat_history": [], "trace_id": "mcp"},
         config={"recursion_limit": 50},
     )
@@ -124,10 +124,10 @@ def ingest_url(url: str) -> str:
 def list_documents() -> str:
     """List every document currently indexed in the knowledge base, with chunk counts --
     useful for checking what research_question can draw on before asking."""
-    from rag_assistant.config import get_settings
+    from rag_assistant.ingestion.generations import active_index_dir
     from rag_assistant.ingestion.manifest import load_manifest
 
-    manifest = load_manifest(get_settings().chroma_persist_dir)
+    manifest = load_manifest(active_index_dir())
     if not manifest:
         return "The knowledge base is empty -- ingest_file or ingest_url can add documents."
     lines = [

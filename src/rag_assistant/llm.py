@@ -340,27 +340,66 @@ def primary_chat_provider_name() -> str:
     return "Anthropic" if settings.anthropic_api_key else "Gemini"
 
 
-def get_embeddings_model() -> GoogleGenerativeAIEmbeddings | OpenAIEmbeddings:
-    """The EMBEDDING_PROVIDER's model -- never the local chat provider, and never a fallback.
+def parse_embedding_model_name(model_name: str) -> tuple[str, str]:
+    """(provider, model) from a recorded `Settings.embedding_model_name` -- the inverse of
+    that property, so an index can name the model that must query it."""
+    if model_name.startswith("openai/"):
+        return "openai", model_name.removeprefix("openai/")
+    if model_name.startswith("local/"):
+        return "local", model_name.removeprefix("local/")
+    return "gemini", model_name
 
-    Embeddings are not interchangeable the way chat models are: the Chroma collection is
-    built at one provider's vector dimension, and pointing queries at a different embedding
-    model doesn't error -- it silently returns nonsense neighbours. Switching would mean a
-    full re-index (`rag-assistant ingest --full`), so it stays a deliberate one-way decision
-    rather than a fallback the graph can take at runtime.
+
+class EmbeddingModelUnavailable(RuntimeError):
+    """An index names an embedding model this deployment has no credentials or endpoint
+    for. Raised at construction rather than at the first query, so /ready can report it."""
+
+
+def get_embeddings_model(
+    model_name: str | None = None,
+) -> GoogleGenerativeAIEmbeddings | OpenAIEmbeddings:
+    """An embedding model -- never the local chat provider, and never a fallback.
+
+    Embeddings are not interchangeable the way chat models are: the collection is built at
+    one model's vector space, and pointing queries at a different embedding model doesn't
+    error -- it silently returns nonsense neighbours.
+
+    `model_name` is the name an index recorded when it was built (see index_metadata.py).
+    Queries and ingests against an index pass it, so they always embed with the model that
+    built *that* index, whatever EMBEDDING_PROVIDER currently says. The configured provider
+    decides which model a *new* index generation is built with (`rag-assistant reindex`);
+    it no longer silently changes what an existing index is queried with. Omitted, it is the
+    configured model.
     """
     settings = get_settings()
-    if settings.embedding_provider == "openai":
+    if model_name is None:
+        provider = settings.embedding_provider
+        model = {
+            "openai": settings.openai_embedding_model,
+            "local": settings.local_embedding_model,
+            "gemini": settings.gemini_embedding_model,
+        }[provider]
+    else:
+        provider, model = parse_embedding_model_name(model_name)
+    if provider == "openai":
+        if not settings.openai_api_key:
+            raise EmbeddingModelUnavailable(
+                f"The index was built with {model_name!r}, which needs OPENAI_API_KEY."
+            )
         # max_retries covers the transient 429/5xx a long ingest will eventually meet;
         # without it one dropped request fails the whole run.
         return OpenAIEmbeddings(
-            model=settings.openai_embedding_model,
+            model=model,
             api_key=settings.openai_api_key,
             max_retries=6,
         )
-    if settings.embedding_provider == "local":
+    if provider == "local":
+        if not settings.local_embedding_base_url:
+            raise EmbeddingModelUnavailable(
+                f"The index was built with {model_name!r}, which needs LOCAL_EMBEDDING_BASE_URL."
+            )
         return OpenAIEmbeddings(
-            model=settings.local_embedding_model,
+            model=model,
             base_url=settings.local_embedding_base_url,
             timeout=httpx.Timeout(
                 settings.local_embedding_timeout_seconds,
@@ -374,6 +413,6 @@ def get_embeddings_model() -> GoogleGenerativeAIEmbeddings | OpenAIEmbeddings:
             max_retries=6,
         )
     return GoogleGenerativeAIEmbeddings(
-        model=settings.gemini_embedding_model,
+        model=model,
         google_api_key=settings.google_api_key,
     )

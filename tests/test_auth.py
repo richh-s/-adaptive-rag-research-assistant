@@ -8,6 +8,20 @@ from rag_assistant import api
 from rag_assistant.auth import parse_api_keys, resolve_owner
 
 
+def _as_async(stub):
+    """Wraps a graph stub so it can stand in for `ainvoke`.
+
+    `/api/v1/research` awaits the graph now -- the LLM-bound nodes are coroutines, so there is
+    no synchronous `invoke` to patch. Without this the handler would fall through to the real
+    graph and make live provider calls from the test suite.
+    """
+
+    async def _ainvoke(*args, **kwargs):
+        return stub(*args, **kwargs)
+
+    return _ainvoke
+
+
 @pytest.fixture(autouse=True)
 def _no_rate_limit(monkeypatch):
     # Same rationale as test_conversations.py: the limiter's in-memory hit counts persist
@@ -85,12 +99,20 @@ def test_versioned_and_legacy_research_paths_are_both_protected(monkeypatch):
 
 def test_valid_key_via_header_and_bearer(monkeypatch):
     monkeypatch.setenv("API_KEYS", "alice:secret-a")
-    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_fake_invoke))
     client = TestClient(api.app)
 
     checked = client.get("/api/v1/auth/check", headers={"X-API-Key": "secret-a"})
     assert checked.status_code == 200
-    assert checked.json() == {"ok": True, "auth_required": True, "owner": "alice"}
+    assert checked.json() == {
+        "ok": True,
+        "auth_required": True,
+        "owner": "alice",
+        "method": "api_key",
+        "user": None,
+        "groups": [],
+        "scopes": ["read", "write"],
+    }
 
     bearer = client.get("/api/v1/auth/check", headers={"Authorization": "Bearer secret-a"})
     assert bearer.status_code == 200
@@ -99,12 +121,20 @@ def test_valid_key_via_header_and_bearer(monkeypatch):
 def test_auth_check_reports_open_mode():
     client = TestClient(api.app)
     body = client.get("/api/v1/auth/check").json()
-    assert body == {"ok": True, "auth_required": False, "owner": "public"}
+    assert body == {
+        "ok": True,
+        "auth_required": False,
+        "owner": "public",
+        "method": "open",
+        "user": None,
+        "groups": [],
+        "scopes": [],
+    }
 
 
 def test_conversations_are_scoped_per_tenant(monkeypatch):
     monkeypatch.setenv("API_KEYS", "alice:secret-a,bob:secret-b")
-    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_fake_invoke))
     client = TestClient(api.app)
     alice = {"X-API-Key": "secret-a"}
     bob = {"X-API-Key": "secret-b"}

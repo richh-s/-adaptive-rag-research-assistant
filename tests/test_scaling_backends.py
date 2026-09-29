@@ -199,3 +199,36 @@ def test_an_explicit_persist_dir_still_uses_embedded_mode(monkeypatch, tmp_path,
     store = get_vector_store(embeddings=fake_embeddings, persist_dir=tmp_path / "chroma")
 
     assert store is not None
+
+
+def test_postgres_keyword_search_without_the_pgvector_index_is_refused():
+    """The degradation would be invisible: keyword search fails closed and returns no hits,
+    the vector path still answers, and the pipeline quietly runs on half its retrieval with
+    nothing in the response to say so."""
+    import pytest
+    from pydantic import ValidationError
+
+    from rag_assistant.config import Settings
+
+    with pytest.raises(ValidationError, match="VECTOR_BACKEND=pgvector"):
+        Settings(
+            google_api_key="k",
+            anthropic_api_key="",
+            keyword_backend="postgres",
+            vector_backend="chroma",
+        )
+
+
+def test_postgres_keyword_search_without_a_database_url_is_refused():
+    import pytest
+    from pydantic import ValidationError
+
+    from rag_assistant.config import Settings
+
+    with pytest.raises(ValidationError, match="DATABASE_URL"):
+        Settings(
+            google_api_key="k",
+            anthropic_api_key="",
+            keyword_backend="postgres",
+            vector_backend="pgvector",
+        )

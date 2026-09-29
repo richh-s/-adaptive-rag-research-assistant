@@ -12,7 +12,8 @@ class _FakeGraph:
         self.state = state
         self.calls = []
 
-    def invoke(self, state, config=None):
+    async def ainvoke(self, state, config=None):
+        # The MCP tool awaits the graph, like the API does: the LLM-bound nodes are coroutines.
         self.calls.append(state)
         return self.state
 
@@ -21,7 +22,7 @@ def _index_result():
     return IndexResult(indexed_chunks=4, changed_files=1, skipped_files=0, removed_files=0)
 
 
-def test_research_question_returns_report_with_transparency_footer(monkeypatch):
+async def test_research_question_returns_report_with_transparency_footer(monkeypatch):
     fake = _FakeGraph(
         {
             "research_report": "# Answer\nAnthropic was founded in 2021. [1]",
@@ -32,7 +33,7 @@ def test_research_question_returns_report_with_transparency_footer(monkeypatch):
     )
     monkeypatch.setattr(mcp_server, "_get_graph", lambda: fake)
 
-    output = mcp_server.research_question("Who founded Anthropic?")
+    output = await mcp_server.research_question("Who founded Anthropic?")
 
     assert output.startswith("# Answer")
     assert "route: vector" in output

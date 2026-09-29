@@ -24,6 +24,20 @@ from rag_assistant.retrieval.bm25_store import bm25_search, invalidate_bm25_inde
 from rag_assistant.retrieval.vector_store import get_retriever
 
 
+def _as_async(stub):
+    """Wraps a graph stub so it can stand in for `ainvoke`.
+
+    `/api/v1/research` awaits the graph now -- the LLM-bound nodes are coroutines, so there is
+    no synchronous `invoke` to patch. Without this the handler would fall through to the real
+    graph and make live provider calls from the test suite.
+    """
+
+    async def _ainvoke(*args, **kwargs):
+        return stub(*args, **kwargs)
+
+    return _ainvoke
+
+
 @pytest.fixture
 def tenant_corpus(tmp_path):
     """A corpus with one shared baseline file and one private file per tenant."""
@@ -224,7 +238,7 @@ def test_research_passes_the_authenticated_owner_into_the_graph(monkeypatch):
         captured.update(state)
         return {"research_report": "ok", "route": "vector", "confidence_score": 0.9}
 
-    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_fake_invoke))
     client = TestClient(api.app)
 
     response = client.post(

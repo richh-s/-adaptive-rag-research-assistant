@@ -17,8 +17,10 @@ const STAGE_LABELS: Record<string, string> = {
   web_search: 'Retrieval',
   fuse_results: 'Fusion',
   grade_and_score: 'Grading',
+  refine_retrieval: 'Corpus Re-ask',
   corrective_web_search: 'Corrective Search',
   synthesize_answer: 'Synthesis',
+  verify_groundedness: 'Grounding Check',
   format_report: 'Formatting',
 }
 
@@ -101,8 +103,34 @@ export function ResearchSummaryPanel({ summary }: ResearchSummaryPanelProps) {
       </div>
 
       <div className="summary-row">
-        <span className="summary-label">Corrective Search</span>
-        <span className="summary-value">{summary.correction_attempted ? 'Yes' : 'No'}</span>
+        <span className="summary-label">Retry</span>
+        <span className="summary-value">
+          {summary.correction_attempted
+            ? summary.refinement_attempted
+              ? 'Corpus re-asked, then web search'
+              : 'Corrective web search'
+            : summary.refinement_attempted
+              ? 'Corpus re-asked with rewritten queries'
+              : 'No'}
+        </span>
+      </div>
+
+      {/* Reported separately from Confidence above, because they answer different questions:
+          that one grades retrieval, this one grades the answer written from it. "Not checked"
+          is shown as itself rather than as a clean result -- an unverified answer and a
+          verified one with nothing wrong both have zero unsupported claims. */}
+      <div className="summary-row">
+        <span className="summary-label">Answer grounded</span>
+        <span className="summary-value">
+          {!summary.groundedness_checked
+            ? 'Not checked'
+            : summary.groundedness_score === null || summary.groundedness_score === undefined
+              ? 'No claims to check'
+              : `${(summary.groundedness_score * 100).toFixed(0)}% of claims supported` +
+                (summary.unsupported_claim_count
+                  ? ` (${summary.unsupported_claim_count} unsupported)`
+                  : '')}
+        </span>
       </div>
 
       {stages.length > 0 && (

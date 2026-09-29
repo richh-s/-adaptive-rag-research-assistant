@@ -109,7 +109,7 @@ def test_a_local_embedding_server_that_is_unreachable_is_not_ready(monkeypatch, 
     """Unlike the local *chat* tier, embeddings have no fallback: only the model that built
     the index can query it. An unreachable server means every question fails, so the replica
     must leave the load balancer rather than merely report the problem."""
-    monkeypatch.setattr(readiness, "check_embedding_model", lambda persist_dir, model: (True, None))
+    monkeypatch.setattr(readiness, "index_embedding_model", lambda persist_dir: None)
     monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
     monkeypatch.setenv("LOCAL_EMBEDDING_BASE_URL", "http://gpu-box.example.ts.net:11434/v1")
 
@@ -125,7 +125,7 @@ def test_a_local_embedding_server_that_is_unreachable_is_not_ready(monkeypatch, 
 
 
 def test_a_reachable_local_embedding_server_is_ready(monkeypatch):
-    monkeypatch.setattr(readiness, "check_embedding_model", lambda persist_dir, model: (True, None))
+    monkeypatch.setattr(readiness, "index_embedding_model", lambda persist_dir: None)
     monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
     monkeypatch.setenv("LOCAL_EMBEDDING_BASE_URL", "http://gpu-box.example.ts.net:11434/v1/")
     called = {}
@@ -139,7 +139,7 @@ def test_a_reachable_local_embedding_server_is_ready(monkeypatch):
 
 def test_a_hosted_embedding_provider_makes_no_network_call(monkeypatch):
     """Gemini/OpenAI embeddings need no probe; a readiness poll must stay ~free."""
-    monkeypatch.setattr(readiness, "check_embedding_model", lambda persist_dir, model: (True, None))
+    monkeypatch.setattr(readiness, "index_embedding_model", lambda persist_dir: None)
     monkeypatch.setenv("EMBEDDING_PROVIDER", "gemini")
     monkeypatch.setattr(
         readiness.httpx, "get", lambda *a, **k: pytest.fail("probed a hosted provider")
@@ -148,17 +148,48 @@ def test_a_hosted_embedding_provider_makes_no_network_call(monkeypatch):
     assert readiness.check_embeddings() == (True, None)
 
 
-def test_a_model_mismatch_is_reported_before_any_probe(monkeypatch):
-    """The silent failure takes precedence: a reachable server does not make a collection
-    built by another model usable."""
+def test_a_configured_model_that_differs_is_a_pending_migration_not_an_outage(monkeypatch):
+    """Every reader embeds with the model the serving generation recorded, so changing the
+    configured model cannot make the index return nonsense any more. It is the model the
+    next generation will be built with, and readiness says so without pulling the replica."""
     monkeypatch.setattr(
-        readiness, "check_embedding_model", lambda persist_dir, model: (False, "model mismatch")
+        readiness, "index_embedding_model", lambda persist_dir: "models/older-embedding-model"
     )
-    monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "gemini")
+
+    ok, note = readiness.check_embeddings()
+
+    assert ok
+    assert "models/older-embedding-model" in note and "reindex" in note
+
+
+def test_a_recorded_model_this_deployment_cannot_use_is_not_ready(monkeypatch):
+    """The index was built with OpenAI embeddings and the key has since been removed: no
+    query can be embedded, and there is no fallback model that could read this index."""
     monkeypatch.setattr(
-        readiness.httpx, "get", lambda *a, **k: pytest.fail("probed despite a mismatch")
+        readiness, "index_embedding_model", lambda persist_dir: "openai/text-embedding-3-small"
     )
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "gemini")
+    monkeypatch.setenv("OPENAI_API_KEY", "")
 
     ok, err = readiness.check_embeddings()
 
-    assert not ok and err == "model mismatch"
+    assert not ok
+    assert "OPENAI_API_KEY" in err
+
+
+def test_the_local_server_probed_is_the_one_the_index_needs(monkeypatch):
+    """A generation built on the self-hosted server is probed even when the configured
+    provider has moved on to a hosted one -- it is the server every query still depends on."""
+    monkeypatch.setattr(readiness, "index_embedding_model", lambda persist_dir: "local/all-minilm")
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "gemini")
+    monkeypatch.setenv("LOCAL_EMBEDDING_BASE_URL", "http://gpu-box.example.ts.net:11434/v1")
+
+    def _boom(*args, **kwargs):
+        raise httpx.ConnectError("no route to host")
+
+    monkeypatch.setattr(readiness.httpx, "get", _boom)
+
+    ok, err = readiness.check_embeddings()
+
+    assert not ok and "unreachable" in err

@@ -1,3 +1,5 @@
+import { getAccessToken } from './sso'
+
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000'
 
 // API key handling: the backend runs open (no key needed) unless its API_KEYS setting is
@@ -23,6 +25,10 @@ export function storeApiKey(key: string | null): void {
 }
 
 function authHeaders(): Record<string, string> {
+  // A signed-in SSO user is identified by their access token; an API key is the fallback
+  // for deployments (and people) not using SSO.
+  const token = getAccessToken()
+  if (token) return { Authorization: `Bearer ${token}` }
   const key = getStoredApiKey()
   return key ? { 'X-API-Key': key } : {}
 }
@@ -67,8 +73,20 @@ export interface ResearchSummary {
   // How many fused documents the synthesis context budget dropped. Optional so a response
   // from a backend predating the budget still parses.
   context_documents_dropped?: number
+  // Grades *retrieval* -- how relevant the documents are to the question.
   confidence_score: number | null
   correction_attempted: boolean
+  // Whether the corpus was re-asked with rewritten queries before (or instead of) the web
+  // fallback. Optional so a response from a backend predating the escalation still parses.
+  refinement_attempted?: boolean
+  refined_sub_queries?: string[]
+  // Grades the *answer* -- the fraction of its claims the retrieved context supports. Distinct
+  // from `confidence_score` above, and the two routinely disagree. `groundedness_checked` is
+  // not the same as a null score: a checked abstention scores null too, so false here means no
+  // check ran and the absence of unsupported claims says nothing.
+  groundedness_checked?: boolean
+  groundedness_score?: number | null
+  unsupported_claim_count?: number
   node_latencies_ms: NodeLatency[]
   total_latency_ms: number
 }

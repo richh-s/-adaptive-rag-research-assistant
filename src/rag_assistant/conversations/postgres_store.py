@@ -21,6 +21,8 @@ import time
 import uuid
 from dataclasses import dataclass
 
+from rag_assistant.advisory_lock import advisory_lock_id
+from rag_assistant.auth import CONVERSATION_OWNER_SEPARATOR
 from rag_assistant.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -117,6 +119,12 @@ def _migration_002_feedback(cur) -> None:
 
 _MIGRATIONS: list = [_migration_001_baseline, _migration_002_feedback]
 
+# Distinct from the pgvector backend's lock id: the two migration chains are
+# independent and may run against the same database at the same time, so sharing an
+# id would serialise unrelated startups. Computed by `advisory_lock_id` rather than
+# `hash()`, which is salted per process and would hand every replica its own lock.
+_MIGRATION_LOCK_ID = advisory_lock_id("rag_assistant_migrations")
+
 
 def _get_pool():
     """One connection pool per process.
@@ -154,7 +162,7 @@ def _migrate() -> None:
     """
     with _pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_lock(%s)", (hash("rag_assistant_migrations") % 2**31,))
+            cur.execute("SELECT pg_advisory_lock(%s)", (_MIGRATION_LOCK_ID,))
             try:
                 cur.execute(
                     "CREATE TABLE IF NOT EXISTS schema_migrations "
@@ -177,9 +185,7 @@ def _migrate() -> None:
                     )
                     conn.commit()
             finally:
-                cur.execute(
-                    "SELECT pg_advisory_unlock(%s)", (hash("rag_assistant_migrations") % 2**31,)
-                )
+                cur.execute("SELECT pg_advisory_unlock(%s)", (_MIGRATION_LOCK_ID,))
                 conn.commit()
 
 
@@ -335,10 +341,16 @@ def prune_conversations(owner: str = "public") -> int:
 
 def delete_all_for_owner(owner: str) -> tuple[int, int]:
     """Postgres counterpart of the SQLite implementation -- same semantics, one transaction."""
+    prefix = owner + CONVERSATION_OWNER_SEPARATOR
     with _get_pool().connection() as conn, conn.cursor() as cur:
-        cur.execute("DELETE FROM conversations WHERE owner = %s", (owner,))
+        cur.execute(
+            "DELETE FROM conversations WHERE owner = %s OR starts_with(owner, %s)",
+            (owner, prefix),
+        )
         conversations = cur.rowcount
-        cur.execute("DELETE FROM feedback WHERE owner = %s", (owner,))
+        cur.execute(
+            "DELETE FROM feedback WHERE owner = %s OR starts_with(owner, %s)", (owner, prefix)
+        )
         feedback = cur.rowcount
         conn.commit()
     return conversations, feedback

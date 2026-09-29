@@ -77,7 +77,7 @@ jobs:
           enable-cache: true
       - name: Install dependencies
         run: uv sync --frozen --extra postgres
-      # Named explicitly rather than running the whole suite: these two files are the ones
+      # Named explicitly rather than running the whole suite: these files are the ones
       # that skip without a database, so running them here is what turns a silent skip into
       # a real result.
       - name: Postgres-backed backends
@@ -85,7 +85,8 @@ jobs:
         run: |
           set -o pipefail
           uv run pytest -q --no-cov -rs \
-            tests/test_postgres_store.py tests/test_pgvector_store.py | tee pg-tests.log
+            tests/test_postgres_store.py tests/test_pgvector_store.py \
+            tests/test_pgvector_isolation.py | tee pg-tests.log
           # Both suites skip themselves when no database is reachable, which is correct on a
           # developer machine and useless here: without this check an unreachable service
           # container produces a green job that verified nothing at all.
@@ -103,7 +104,8 @@ jobs:
             --cov=rag_assistant.conversations.postgres_store \
             --cov=rag_assistant.retrieval.pgvector_store \
             --cov-report=term-missing --cov-fail-under=90 \
-            tests/test_postgres_store.py tests/test_pgvector_store.py
+            tests/test_postgres_store.py tests/test_pgvector_store.py \
+            tests/test_pgvector_isolation.py
 
   # Same reasoning as the postgres job: the Redis-backed paths (answer cache, per-tenant
   # budget, ingest task registry) were covered only by a hand-written fake, which agrees with
@@ -144,6 +146,87 @@ jobs:
             echo "::error::Redis suite skipped -- the service container was not reachable."
             exit 1
           fi
+
+  # Chroma in server mode was the last backend verified only at the construction boundary --
+  # a test asserting an HttpClient gets built with the configured host, which says nothing
+  # about whether the resulting store stores, filters or retrieves. CHROMA_SERVER_HOST is the
+  # documented way off the single-worker ceiling, so "it is configuration, not a rewrite"
+  # needed to be a tested claim rather than a design statement.
+  chroma-server:
+    runs-on: ubuntu-latest
+    env:
+      GOOGLE_API_KEY: ci-test-key
+      ANTHROPIC_API_KEY: ""
+      RAG_TEST_CHROMA_HOST: 127.0.0.1
+      RAG_TEST_CHROMA_PORT: "8000"
+    services:
+      chroma:
+        # Pinned to the client version in uv.lock: Chroma's HTTP API has changed shape
+        # between minors (v1 -> v2 heartbeat), and a floating tag turns an upstream release
+        # into a red build on an unrelated PR.
+        image: chromadb/chroma:1.5.9
+        ports:
+          - 8000:8000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --frozen
+      # The image ships no curl, so the readiness poll runs from the runner rather than as a
+      # service `--health-cmd`.
+      - name: Wait for Chroma
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/api/v2/heartbeat > /dev/null; then
+              echo "chroma healthy after ${attempt} attempt(s)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "chroma never became healthy"
+          exit 1
+      - name: Chroma server mode
+        shell: bash
+        run: |
+          set -o pipefail
+          uv run pytest -q --no-cov -rs tests/test_chroma_server.py | tee chroma-tests.log
+          # Same rule as the postgres and redis jobs: a suite that skips itself produces a
+          # green job having verified nothing, which is worse than no job at all.
+          if grep -q "skipped" chroma-tests.log; then
+            echo "::error::Chroma server suite skipped -- the service container was not reachable."
+            exit 1
+          fi
+
+  # Static analysis, separate from `audit` (which reads the dependency manifests) because
+  # this reads the code. Neither can find what it was not taught to look for -- see
+  # SECURITY.md, which says plainly that no independent review has been done -- but the class
+  # of bug they do catch is cheap to catch on every PR.
+  #
+  # Blocking, unlike `audit`: a bandit finding is a statement about code in this repo, which
+  # someone here can act on immediately, whereas an advisory against a transitive dependency
+  # often has no released fix to take. Findings reviewed and cleared carry an inline
+  # `# nosec` with the reason, so the baseline is zero and any new finding is genuinely new.
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: secret scanning is only meaningful across commits, since the point
+          # is a credential that was committed once and "removed" in a later commit.
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      # -ll: medium severity and above. The low-severity band is dominated by `assert` in
+      # test helpers and subprocess-without-shell, which would bury the findings that matter.
+      - name: Scan source for security defects
+        run: uvx bandit -q -r src -ll
+      - name: Scan history for committed secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_ENABLE_SUMMARY: "false"
 
   frontend:
     runs-on: ubuntu-latest

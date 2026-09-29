@@ -2,13 +2,15 @@ import pytest
 
 from rag_assistant.graph.build_graph import build_graph
 
+# The graph is driven through `ainvoke`: its LLM-bound nodes are coroutines, so there is no
+# synchronous entry point any more (see graph/build_graph.py).
 _CONFIG = {"recursion_limit": 50}
 
 
 @pytest.mark.live
-def test_vector_routed_question_returns_cited_answer():
+async def test_vector_routed_question_returns_cited_answer():
     """Assumes `rag-assistant ingest` has already been run against data/corpus."""
-    result = build_graph().invoke(
+    result = await build_graph().ainvoke(
         {"question": "Who founded Anthropic and what is their safety research called?"}, _CONFIG
     )
 
@@ -22,8 +24,8 @@ def test_vector_routed_question_returns_cited_answer():
 
 
 @pytest.mark.live
-def test_web_routed_question_returns_answer():
-    result = build_graph().invoke(
+async def test_web_routed_question_returns_answer():
+    result = await build_graph().ainvoke(
         {"question": "What is the most recent Claude model release?"}, _CONFIG
     )
 
@@ -34,8 +36,8 @@ def test_web_routed_question_returns_answer():
 
 
 @pytest.mark.live
-def test_compound_question_decomposes_into_multiple_subqueries():
-    result = build_graph().invoke(
+async def test_compound_question_decomposes_into_multiple_subqueries():
+    result = await build_graph().ainvoke(
         {"question": "Compare Anthropic and Mistral AI's founding stories and safety focus."},
         _CONFIG,
     )
@@ -48,11 +50,11 @@ def test_compound_question_decomposes_into_multiple_subqueries():
 
 
 @pytest.mark.live
-def test_out_of_corpus_vector_question_can_trigger_corrective_web_search():
+async def test_out_of_corpus_vector_question_can_trigger_corrective_web_search():
     """A question the router should classify as vector-only but the local corpus can't
     answer well -- best-effort trigger for the corrective loop; not guaranteed since
     routing is LLM-driven, but the confidence/grading fields must always be well-formed."""
-    result = build_graph().invoke(
+    result = await build_graph().ainvoke(
         {"question": "What safety research did Anthropic publish this week?"}, _CONFIG
     )
 

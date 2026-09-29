@@ -48,3 +48,4 @@ nul
 coverage.xml
 htmlcov/
 .gitignore
+data/golden_eval/candidates.jsonl

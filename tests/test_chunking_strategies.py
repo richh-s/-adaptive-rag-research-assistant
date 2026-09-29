@@ -265,31 +265,31 @@ def test_a_chunk_with_no_stored_parent_keeps_its_own_content(tmp_path):
     assert expanded[0].content == "just the chunk"
 
 
-def test_synthesis_expands_only_when_parent_context_is_enabled(tmp_path, monkeypatch):
-    from unittest.mock import MagicMock
+async def test_synthesis_expands_only_when_parent_context_is_enabled(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
 
     from rag_assistant.graph.nodes import synthesize as synthesize_module
 
     monkeypatch.setenv("CHROMA_PERSIST_DIR", str(tmp_path))
     replace_parents_for_source(tmp_path, "a.md", "public", {"p1": "THE FULL SECTION"})
-    fake_llm = MagicMock()
-    fake_llm.invoke.return_value = MagicMock(text="answer")
+    fake_llm = AsyncMock()
+    fake_llm.ainvoke.return_value = MagicMock(text="answer")
     monkeypatch.setattr(synthesize_module, "get_chat_model", lambda **kw: fake_llm)
     docs = [doc("small chunk", parent_id="p1")]
 
-    synthesize_module.synthesize_answer(
+    await synthesize_module.synthesize_answer(
         {"question": "q", "fused_documents": docs, "route": "vector"}
     )
-    assert "THE FULL SECTION" not in fake_llm.invoke.call_args[0][0]
+    assert "THE FULL SECTION" not in fake_llm.ainvoke.call_args[0][0]
 
     monkeypatch.setenv("PARENT_CONTEXT", "true")
     from rag_assistant.config import get_settings
 
     get_settings.cache_clear()
-    synthesize_module.synthesize_answer(
+    await synthesize_module.synthesize_answer(
         {"question": "q", "fused_documents": docs, "route": "vector"}
     )
-    assert "THE FULL SECTION" in fake_llm.invoke.call_args[0][0]
+    assert "THE FULL SECTION" in fake_llm.ainvoke.call_args[0][0]
 
 
 @pytest.mark.parametrize("enabled", ["true", "false"])

@@ -1,4 +1,6 @@
 from rag_assistant.auth import PUBLIC_OWNER
+from rag_assistant.config import get_settings
+from rag_assistant.graph.state import access_principals
 from rag_assistant.retrieval.bm25_store import bm25_search
 from rag_assistant.retrieval.vector_store import get_retriever
 from rag_assistant.schemas.models import RetrievedDoc, SubQueryResult
@@ -10,7 +12,10 @@ def retrieve_vector(state: dict) -> dict:
     state -- see `dispatch_retrieval` for why the owner has to be copied into the payload."""
     sub_query = state["sub_query"]
     docs = get_retriever(
-        k=4, owner=state.get("owner", PUBLIC_OWNER), filters=state.get("filters")
+        k=get_settings().retrieval_k,
+        owner=state.get("owner", PUBLIC_OWNER),
+        filters=state.get("filters"),
+        principals=access_principals(state),
     ).invoke(sub_query)
     retrieved = [
         RetrievedDoc(
@@ -29,6 +34,10 @@ def retrieve_bm25(state: dict) -> dict:
     embedding similarity sometimes under-ranks."""
     sub_query = state["sub_query"]
     docs = bm25_search(
-        sub_query, k=4, owner=state.get("owner", PUBLIC_OWNER), filters=state.get("filters")
+        sub_query,
+        k=get_settings().retrieval_k,
+        owner=state.get("owner", PUBLIC_OWNER),
+        filters=state.get("filters"),
+        principals=access_principals(state),
     )
     return {"bm25_results": [SubQueryResult(sub_query=sub_query, docs=docs)]}

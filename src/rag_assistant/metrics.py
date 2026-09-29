@@ -127,6 +127,23 @@ ingest_tasks_total = Counter(
 )
 
 
+# Retrieval confidence says whether the right documents were found. This says whether the
+# answer stayed inside them, which is the question a reader is actually asking when they look
+# at a confidence number next to a paragraph of prose.
+groundedness_outcomes_total = Counter(
+    "rag_groundedness_checks_total",
+    "Answer groundedness checks by outcome: checked, no_claims (an abstention has nothing to "
+    "ground), or unavailable (the check itself failed -- never counted as a grounded answer).",
+    ["outcome"],
+)
+
+groundedness_score = Histogram(
+    "rag_groundedness_score",
+    "Fraction of an answer's factual claims the retrieved context supports.",
+    buckets=(0.0, 0.25, 0.5, 0.75, 0.9, 1.0),
+)
+
+
 # The only metric sourced from a human rather than from the system's own behaviour. Everything
 # else here measures whether the service is working; this measures whether it is any *good*,
 # which no amount of latency and error-rate data can tell you.
@@ -267,6 +284,35 @@ def record_injection_signals(categories: list[str]) -> None:
         prompt_injection_signals_total.labels(category=category).inc()
 
 
+pii_detections_total = Counter(
+    "rag_pii_detections_total",
+    "Personal-data patterns found in ingested content, by category and whether the match was "
+    "redacted before storage or only flagged. Advisory, like the injection counter: the "
+    "patterns match formats, not people, so a non-zero value means review rather than breach.",
+    ["category", "action"],
+)
+
+
+def record_pii(category: str, count: int, *, redacted: bool) -> None:
+    """The label is a fixed category from pii.py's own list, never the matched text -- which
+    is the personal data itself, and putting it in a metric label would both create unbounded
+    series and copy the data somewhere new."""
+    pii_detections_total.labels(
+        category=category, action="redacted" if redacted else "flagged"
+    ).inc(count)
+
+
+def record_groundedness(outcome: str, score: float | None = None) -> None:
+    """Outcome always, score only when there was one to record.
+
+    A failed check must not land in the score histogram at all: imputing a 0.0 would make a
+    provider outage read as a run of fabricated answers, and imputing a 1.0 would hide it.
+    """
+    groundedness_outcomes_total.labels(outcome=outcome).inc()
+    if score is not None:
+        groundedness_score.observe(score)
+
+
 def record_cache(namespace: str, result: str) -> None:
     cache_operations_total.labels(namespace=namespace, result=result).inc()
 
@@ -281,3 +327,43 @@ def record_node_timing(node: str, duration_seconds: float) -> None:
 
 def record_ingest_task(stage: str) -> None:
     ingest_tasks_total.labels(stage=stage).inc()
+
+
+# Source connectors (see connectors/). The connector label is bounded by construction: it is
+# a name from the operator's CONNECTORS_FILE, never anything a request or a remote system
+# supplies.
+connector_syncs_total = Counter(
+    "rag_connector_syncs_total",
+    "Connector sync runs by outcome: ok, partial (some documents failed to fetch), refused "
+    "(the deletion guard stopped it), or error (listing failed; nothing was changed).",
+    ["connector", "outcome"],
+)
+
+connector_documents_total = Counter(
+    "rag_connector_documents_total",
+    "Documents a connector sync added, updated, re-permissioned or deleted.",
+    ["connector", "change"],
+)
+
+connector_last_success_timestamp = Gauge(
+    "rag_connector_last_success_timestamp_seconds",
+    "Unix time of each connector's last sync that completed without error. What the "
+    "staleness alert reads: a connector that has silently stopped syncing is serving a corpus "
+    "that drifts further from its source every hour, and nothing else would say so.",
+    ["connector"],
+)
+
+
+def record_connector_sync(connector: str, outcome: str, changes: dict[str, int]) -> None:
+    connector_syncs_total.labels(connector=connector, outcome=outcome).inc()
+    for change, count in changes.items():
+        if count:
+            connector_documents_total.labels(connector=connector, change=change).inc(count)
+    if outcome in ("ok", "partial"):
+        connector_last_success_timestamp.labels(connector=connector).set_to_current_time()
+
+
+index_generation_switches_total = Counter(
+    "rag_index_generation_switches_total",
+    "Times the serving index generation changed (see ingestion/generations.py).",
+)

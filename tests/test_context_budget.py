@@ -88,25 +88,25 @@ def test_token_estimate_scales_with_the_configured_ratio():
     assert estimate_tokens("x" * 100, chars_per_token=2.0) == 50
 
 
-def test_synthesis_applies_the_budget_and_aligns_citations_with_it(monkeypatch):
+async def test_synthesis_applies_the_budget_and_aligns_citations_with_it(monkeypatch):
     """The citation markers must describe the documents that actually reached the prompt --
     if the budget drops documents but citations still enumerate all of them, every marker
     past the cut points at the wrong source."""
-    from unittest.mock import MagicMock
+    from unittest.mock import AsyncMock, MagicMock
 
     from rag_assistant.graph.nodes import synthesize as synthesize_module
 
     monkeypatch.setenv("SYNTHESIS_CONTEXT_BUDGET_TOKENS", "25")
-    fake_llm = MagicMock()
-    fake_llm.invoke.return_value = MagicMock(text="An answer [1].")
+    fake_llm = AsyncMock()
+    fake_llm.ainvoke.return_value = MagicMock(text="An answer [1].")
     monkeypatch.setattr(synthesize_module, "get_chat_model", lambda **kw: fake_llm)
 
     docs = [doc("x" * 40, source_id=f"{i}.md") for i in range(5)]
-    result = synthesize_module.synthesize_answer(
+    result = await synthesize_module.synthesize_answer(
         {"question": "q", "fused_documents": docs, "route": "vector"}
     )
 
     assert [c.source_id for c in result["citations"]] == ["0.md", "1.md"]
     assert result["context_documents_dropped"] == 3
-    prompt = fake_llm.invoke.call_args[0][0]
+    prompt = fake_llm.ainvoke.call_args[0][0]
     assert "[3]" not in prompt

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { checkAuth, type AuthStatus } from './api/client'
+import { completeSignIn } from './api/sso'
 import { useHealthStatus } from './hooks/useHealthStatus'
 import { useResearchStream } from './hooks/useResearchStream'
 import { AccessGate } from './components/AccessGate'
@@ -25,9 +26,14 @@ function App() {
 
   useEffect(() => {
     let cancelled = false
-    void checkAuth().then((status) => {
-      if (!cancelled) setAuthStatus(status)
-    })
+    // A load that is the identity provider's redirect back finishes signing in first, so the
+    // auth check that follows already carries the new token.
+    void completeSignIn()
+      .catch(() => false)
+      .then(() => checkAuth())
+      .then((status) => {
+        if (!cancelled) setAuthStatus(status)
+      })
     return () => {
       cancelled = true
     }

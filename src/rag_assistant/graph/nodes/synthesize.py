@@ -6,6 +6,7 @@ from rag_assistant import metrics
 from rag_assistant.cache import cache_get, cache_key, cache_set
 from rag_assistant.content_trust import build_untrusted_context, new_nonce
 from rag_assistant.config import get_settings
+from rag_assistant.ingestion.generations import active_index_dir
 from rag_assistant.graph.context_budget import select_context_documents
 from rag_assistant.graph.state import ResearchState
 from rag_assistant.llm import get_chat_model
@@ -73,7 +74,14 @@ def expand_to_parents(docs: list[FusedDocument], persist_dir) -> list[FusedDocum
     return expanded
 
 
-def synthesize_answer(state: ResearchState) -> dict:
+def _content_digest(content: str) -> str:
+    """Identity of one document's text, for the answer cache key. Truncated to 16 hex
+    characters: this distinguishes revisions of a document, which is a collision space of a
+    handful of strings per source, not an adversarial one."""
+    return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+
+async def synthesize_answer(state: ResearchState) -> dict:
     """Builds the final cited answer from the fused, deduplicated, rank-ordered documents,
     or answers directly from the model's own knowledge when the router decided no retrieval
     was needed. Citation markers follow fused rank order, so the highest-consensus documents
@@ -86,7 +94,7 @@ def synthesize_answer(state: ResearchState) -> dict:
     # Expansion happens before the budget, never after: the budget must measure the text that
     # actually reaches the prompt, and a section is several times the size of its chunk.
     if settings.parent_context and all_docs:
-        all_docs = expand_to_parents(all_docs, settings.chroma_persist_dir)
+        all_docs = expand_to_parents(all_docs, active_index_dir())
     budgeted = select_context_documents(
         all_docs,
         budget_tokens=settings.synthesis_context_budget_tokens,
@@ -101,8 +109,20 @@ def synthesize_answer(state: ResearchState) -> dict:
     history_digest = (
         hashlib.sha256(json.dumps(history, sort_keys=True).encode()).hexdigest() if history else ""
     )
+    # Keyed on what the prompt will actually contain, not on which files it came from.
+    # `source_id` is a stable path, so a document edited and re-ingested produced the same
+    # key as its previous version: the cached answer -- built from text the index no longer
+    # holds -- was served for the rest of CACHE_TTL_SYNTHESIS, with citations that still
+    # looked right. Ingest invalidates the BM25 index but has no way to reach a Redis key it
+    # doesn't know exists, so the identity has to come from the content itself. Hashing per
+    # document rather than over the concatenation keeps the boundary between documents part
+    # of the identity, so two docs that differ only in where they are split still differ.
     key = cache_key(
-        "synthesis", question, state.get("route", ""), history_digest, *(d.source_id for d in docs)
+        "synthesis",
+        question,
+        state.get("route", ""),
+        history_digest,
+        *(f"{d.source_id}:{_content_digest(d.content)}" for d in docs),
     )
     cached = cache_get(key)
     if cached is not None:
@@ -110,6 +130,10 @@ def synthesize_answer(state: ResearchState) -> dict:
             "final_answer": cached["final_answer"],
             "citations": [Citation(**c) for c in cached["citations"]],
             "context_documents_dropped": budgeted.dropped_documents,
+            # Recorded on the cached path too: a replayed answer still has to be verifiable,
+            # and these are the documents whose digests the cache key was built from, so they
+            # are by construction the ones the cached answer was written from.
+            "context_documents": docs,
         }
 
     history_block = _history_block(history)
@@ -123,9 +147,9 @@ def synthesize_answer(state: ResearchState) -> dict:
             prompt = NO_CONTEXT_PROMPT.format(question=question, history_block=history_block)
         else:
             prompt = EMPTY_RETRIEVAL_PROMPT.format(question=question, history_block=history_block)
-        answer = get_chat_model(timeout=get_settings().synthesis_request_timeout_seconds).invoke(
-            prompt
-        )
+        answer = await get_chat_model(
+            timeout=get_settings().synthesis_request_timeout_seconds
+        ).ainvoke(prompt)
         result = {"final_answer": answer.text, "citations": []}
     else:
         # Every document here is attacker-influenceable -- uploaded by a tenant or fetched
@@ -149,9 +173,9 @@ def synthesize_answer(state: ResearchState) -> dict:
         prompt = SYNTHESIS_PROMPT.format(
             question=question, context=context, history_block=history_block
         )
-        answer = get_chat_model(timeout=get_settings().synthesis_request_timeout_seconds).invoke(
-            prompt
-        )
+        answer = await get_chat_model(
+            timeout=get_settings().synthesis_request_timeout_seconds
+        ).ainvoke(prompt)
         citations = [
             Citation(marker=f"[{i + 1}]", source_id=display_source(d.source_id))
             for i, d in enumerate(docs)
@@ -166,4 +190,8 @@ def synthesize_answer(state: ResearchState) -> dict:
         },
         settings.cache_ttl_synthesis,
     )
-    return {**result, "context_documents_dropped": budgeted.dropped_documents}
+    return {
+        **result,
+        "context_documents_dropped": budgeted.dropped_documents,
+        "context_documents": docs,
+    }

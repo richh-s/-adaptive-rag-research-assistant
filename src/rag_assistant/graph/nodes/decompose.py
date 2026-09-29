@@ -8,13 +8,13 @@ from rag_assistant.prompts.decompose_prompt import DECOMPOSE_PROMPT
 from rag_assistant.schemas.models import SubQueries
 
 
-def decompose_query(state: ResearchState) -> dict:
+async def decompose_query(state: ResearchState) -> dict:
     """Query decomposition: split a compound question into focused sub-queries so each
     retrieval pass targets one thing instead of one averaged embedding for everything at
     once. Simple questions pass through as a single-element list, so every downstream node
     can assume a uniform "list of sub-queries" shape regardless of question complexity."""
     llm = get_structured_llm(SubQueries)
-    result: SubQueries = llm.invoke(DECOMPOSE_PROMPT.format(question=state["question"]))
+    result: SubQueries = await llm.ainvoke(DECOMPOSE_PROMPT.format(question=state["question"]))
     return {"sub_queries": result.sub_queries}
 
 
@@ -32,7 +32,14 @@ def dispatch_retrieval(state: ResearchState) -> list[Send]:
     owner = state.get("owner") or PUBLIC_OWNER
     sends = []
     for sub_query in state["sub_queries"]:
-        payload = {"sub_query": sub_query, "owner": owner, "filters": state.get("filters")}
+        # The caller's principals travel with the owner, for the same reason: a payload
+        # without them would be read as "bypass document ACLs".
+        payload = {
+            "sub_query": sub_query,
+            "owner": owner,
+            "principals": state.get("principals"),
+            "filters": state.get("filters"),
+        }
         if route in ("vector", "both"):
             sends.append(Send("retrieve_vector", payload))
             sends.append(Send("retrieve_bm25", payload))

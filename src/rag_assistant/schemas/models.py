@@ -74,6 +74,29 @@ class SubQueries(BaseModel):
         return _decode_stringified_list(value, "sub_queries")
 
 
+class RefinedQueries(BaseModel):
+    """Structured output for the retrieval-refinement node.
+
+    Separate from `SubQueries` because the task is different: decomposition splits a compound
+    question into parts, while this rewrites queries that already retrieved badly. A schema
+    whose field description said "2-5 focused sub-questions" would be asking for the first
+    thing while the prompt asked for the second.
+    """
+
+    sub_queries: list[str] = Field(
+        description=(
+            "1-5 rewritten queries covering the same question in different words -- the "
+            "vocabulary the documents would use, with abbreviations expanded or contracted "
+            "the other way. Never a broader or different question."
+        )
+    )
+
+    @field_validator("sub_queries", mode="before")
+    @classmethod
+    def _decode(cls, value: Any) -> Any:
+        return _decode_stringified_list(value, "sub_queries")
+
+
 class SubQueryResult(BaseModel):
     """One retrieval path's results for one sub-query -- the unit that Send-based fan-out
     nodes return, later merged across all sub-queries and both paths via `operator.add`."""
@@ -156,4 +179,50 @@ class GoldenQuestion(BaseModel):
     #                   confabulate, which is the failure mode no happy-path row can catch
     #   current      -- needs fresh information the corpus can't have; should route to web
     #   no_retrieval -- general knowledge; retrieving at all is wasted spend
-    category: Literal["factual", "multi_hop", "unanswerable", "current", "no_retrieval"] = "factual"
+    #   follow_up    -- arrives with prior turns, so `question` is only answerable once
+    #                   condensation has resolved its references against them
+    category: Literal[
+        "factual", "multi_hop", "unanswerable", "current", "no_retrieval", "follow_up"
+    ] = "factual"
+    # Prior turns, oldest first, as the API's `history` carries them. Empty for every
+    # single-turn row, which is what keeps rows written before this field valid.
+    #
+    # Its absence was a hole in the gate: condensation is the first node in the graph and the
+    # one that rewrites the question every later node reads, and no golden row exercised it.
+    # A regression that broke follow-up resolution -- or that dropped the fencing around the
+    # conversation, which is an untrusted surface -- moved no measured number at all.
+    chat_history: list[dict] = []
+
+
+class ClaimCheck(BaseModel):
+    """One factual claim from an answer, and whether the retrieved context actually says it."""
+
+    claim: str = Field(
+        description="One factual claim from the answer, quoted or closely paraphrased."
+    )
+    supported: bool = Field(
+        description=(
+            "True only if the numbered context states or directly entails this claim. False "
+            "when it is merely plausible or known from general knowledge."
+        )
+    )
+    marker: str | None = Field(
+        default=None,
+        description="Marker of the document supporting the claim, e.g. '[2]', or null.",
+    )
+
+
+class GroundednessReport(BaseModel):
+    """Structured output for verifying a whole answer in a single LLM call."""
+
+    claims: list[ClaimCheck] = Field(
+        description=(
+            "One entry per distinct factual claim in the answer. Empty when the answer makes "
+            "no factual claims -- an abstention is not an ungrounded answer."
+        )
+    )
+
+    @field_validator("claims", mode="before")
+    @classmethod
+    def _decode(cls, value: Any) -> Any:
+        return _decode_stringified_list(value, "claims")

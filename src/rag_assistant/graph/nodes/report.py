@@ -1,5 +1,6 @@
 import re
 
+from rag_assistant.config import get_settings
 from rag_assistant.graph.state import ResearchState
 
 _MARKER_RE = re.compile(r"\[\d+\]")
@@ -50,4 +51,37 @@ def format_report(state: ResearchState) -> dict:
         )
         lines.append("")
 
+    caveat = _groundedness_caveat(state)
+    if caveat:
+        lines.extend([caveat, ""])
+
     return {"research_report": "\n".join(lines)}
+
+
+def _groundedness_caveat(state: ResearchState) -> str | None:
+    """A visible note when the answer asserted more than its sources support.
+
+    On the report, never on `final_answer`. The answer is what gets streamed to the browser,
+    stored in the transcript and replayed as conversation history, and editing it on the word
+    of a check that is itself a model call would rewrite history on a maybe. The report is
+    the surface that already carries the pipeline's own commentary about how the answer was
+    produced, so the caveat belongs beside the source list rather than inside the prose.
+
+    Silent unless a check actually ran and actually found something: an unverified answer
+    gets no note, because "not checked" is not "checked and clean" and a reassuring absence
+    would conflate them.
+    """
+    if not state.get("groundedness_checked"):
+        return None
+    unsupported = state.get("unsupported_claims") or []
+    score = state.get("groundedness_score")
+    if not unsupported or score is None:
+        return None
+    if score >= get_settings().groundedness_threshold:
+        return None
+    count = len(unsupported)
+    noun = "statement" if count == 1 else "statements"
+    return (
+        f"> **Check:** {count} {noun} in this answer could not be traced back to the sources "
+        f"above. Treat {'it' if count == 1 else 'them'} as unverified."
+    )

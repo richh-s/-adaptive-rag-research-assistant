@@ -26,7 +26,7 @@ def _format_history(history: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def condense_question(state: ResearchState) -> dict:
+async def condense_question(state: ResearchState) -> dict:
     """Conversational memory: rewrite a follow-up ("what about their pricing?") into a
     self-contained question using the chat history, so routing/decomposition/retrieval all
     operate on something that stands alone. First-turn questions (no history) pass through
@@ -41,7 +41,7 @@ def condense_question(state: ResearchState) -> dict:
 
     try:
         llm = get_structured_llm(CondensedQuestion)
-        result: CondensedQuestion = llm.invoke(
+        result: CondensedQuestion = await llm.ainvoke(
             CONDENSE_PROMPT.format(
                 history=fence_block(
                     _format_history(history), nonce=new_nonce(), label="CONVERSATION"

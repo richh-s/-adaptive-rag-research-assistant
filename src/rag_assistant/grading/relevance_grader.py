@@ -10,7 +10,7 @@ from rag_assistant.schemas.models import DocGrade, DocGradeBatch, FusedDocument
 logger = logging.getLogger(__name__)
 
 
-def grade_documents(question: str, docs: list[FusedDocument]) -> list[DocGrade]:
+async def grade_documents(question: str, docs: list[FusedDocument]) -> list[DocGrade]:
     """Grades every document's relevance to the question in a single LLM call (Corrective-RAG
     style) rather than one call per document, so grading cost stays flat regardless of how
     many documents were fused."""
@@ -34,7 +34,7 @@ def grade_documents(question: str, docs: list[FusedDocument]) -> list[DocGrade]:
         )
     llm = get_structured_llm(DocGradeBatch, timeout=get_settings().grading_request_timeout_seconds)
     try:
-        result: DocGradeBatch = llm.invoke(
+        result: DocGradeBatch = await llm.ainvoke(
             GRADING_PROMPT.format(question=question, documents=numbered)
         )
     except Exception:

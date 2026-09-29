@@ -1,19 +1,19 @@
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock
 
 from rag_assistant.graph.nodes.decompose import decompose_query, dispatch_retrieval
 from rag_assistant.schemas.models import SubQueries
 
 
-def test_decompose_query_returns_sub_queries(monkeypatch):
+async def test_decompose_query_returns_sub_queries(monkeypatch):
     fake_result = SubQueries(sub_queries=["Who founded Anthropic?", "Who founded OpenAI?"])
-    fake_structured_llm = MagicMock()
-    fake_structured_llm.invoke.return_value = fake_result
+    fake_structured_llm = AsyncMock()
+    fake_structured_llm.ainvoke.return_value = fake_result
 
     monkeypatch.setattr(
         "rag_assistant.graph.nodes.decompose.get_structured_llm", lambda schema: fake_structured_llm
     )
 
-    result = decompose_query({"question": "Who founded Anthropic and OpenAI?"})
+    result = await decompose_query({"question": "Who founded Anthropic and OpenAI?"})
 
     assert result == {"sub_queries": ["Who founded Anthropic?", "Who founded OpenAI?"]}
 
@@ -55,4 +55,9 @@ def test_dispatch_retrieval_web_only():
 
     assert len(sends) == 1
     assert sends[0].node == "web_search"
-    assert sends[0].arg == {"sub_query": "q1", "owner": "public", "filters": None}
+    assert sends[0].arg == {
+        "sub_query": "q1",
+        "owner": "public",
+        "principals": None,
+        "filters": None,
+    }

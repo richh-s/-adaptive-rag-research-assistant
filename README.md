@@ -42,9 +42,31 @@ OpenAI-compatible server you host yourself. No paid services are required — le
 - **RAG Fusion (Reciprocal Rank Fusion)** — results from every sub-query and every retrieval path
   (vector, BM25, web) are merged and reranked by RRF score, not concatenated or naively
   deduplicated.
-- **Confidence scoring / Corrective-RAG** — retrieved documents are graded for relevance; when
-  confidence on a vector-only route falls below threshold, the system automatically falls back to
-  a web search before answering.
+- **Confidence scoring / Corrective-RAG** — retrieved documents are graded for relevance, and a
+  low grade escalates in order of what is likeliest and cheapest rather than straight out of the
+  corpus. First the corpus is re-asked: an LLM rewrites the sub-queries into the vocabulary a
+  document would use (formal terms over casual ones, abbreviations expanded the other way) and
+  re-retrieves with a widened `k`. Only if that still grades badly does a web search run. The
+  reason is that a low grade says retrieval failed and says nothing about *why* — escalating
+  straight to the web assumed the corpus could not contain the answer, when the ordinary cause
+  is a question phrased the way a person asks rather than the way a document writes, which is
+  the one case where leaving the corpus cannot help. The `both` route, which previously got no
+  correction at all, now gets the local retry.
+- **Answer groundedness verification** — everything else in the graph grades *retrieval*; this
+  checks the answer. After synthesis, one structured call decomposes the answer into claims and
+  asks whether the numbered context actually supports each one. The score, the unsupported
+  claims and a `checked` flag reach the transparency panel and Prometheus, and the report
+  carries a visible caveat below threshold. It reports rather than intervenes: regenerating
+  doubles cost on exactly the questions the corpus is thinnest on, and stripping sentences
+  edits prose on the word of a check that is itself a model call. The distinction it keeps is
+  between "verified and clean" and "not verified" — a failed or disabled check is never
+  reported as a clean bill of health.
+- **Personal data detection and redaction** — ingested text is scanned for emails, phone
+  numbers, Luhn-valid card numbers, SSNs, IBANs and cloud access keys. `PII_MODE=flag` (the
+  default) counts and logs; `redact` replaces each match with a category marker *before* the
+  text is embedded, keyword-indexed or stored as a parent section, leaving the uploaded file on
+  disk untouched so the decision stays reversible. Honest boundary: regexes find formats, not
+  people — a name, an address or a date of birth passes straight through.
 - **Grade-informed reranking** — the relevance grades bought for confidence scoring are reused
   (zero extra LLM calls) to rerank the synthesis context: graded-relevant documents move to the
   front ordered by semantic relevance, graded-irrelevant ones are pruned so they can't pollute
@@ -62,9 +84,12 @@ OpenAI-compatible server you host yourself. No paid services are required — le
   and, optionally, LLM-judged faithfulness/answer relevancy, run explicitly via
   `rag-assistant eval` rather than left unmeasured. The dataset spans every route (`vector`,
   `web`, `both`, `none`), including a case designed to exercise the corrective-fallback loop.
-  It's a small (13-question), hand-curated set with no adversarial cases and no naive-RAG
+  It's a small, hand-curated set with no adversarial cases and no naive-RAG
   baseline to compare against — useful as a regression smoke test, not as proof the adaptive
-  pipeline outperforms a simpler one.
+  pipeline outperforms a simpler one. A second set (`conversational.jsonl`) carries prior turns
+  on every row, because condensation is the first node in the graph and rewrites the question
+  every later node reads: without it, a regression that broke follow-up resolution moved no
+  measured number at all.
 - **Provider fallback** — a three-tier chain, tried in priority order and skipping any tier
   that isn't configured: a self-hosted local model (when `LOCAL_LLM_BASE_URL` is set), then
   Anthropic Claude (when `ANTHROPIC_API_KEY` is set), then Gemini, wired with
@@ -128,13 +153,26 @@ flowchart TD
     webSearch --> fuse
 
     fuse --> grade[grade_and_score]
-    grade -- low confidence, vector-only, not yet retried --> corrective[corrective_web_search]
+    grade -- low confidence, corpus not yet re-asked --> refine[refine_retrieval\nrewrite queries, widen k]
+    refine --> fuse
+    grade -- still low, vector-only, web not yet tried --> corrective[corrective_web_search]
     corrective --> fuse
     grade -- confident enough --> synth
 
-    synth --> format[format_report]
+    synth --> verify[verify_groundedness\nclaims vs. retrieved context]
+    verify --> format[format_report]
     format --> DONE([done])
 ```
+
+Nodes drawn in the escalation path run at most once each: `refine_retrieval` re-asks the corpus
+with rewritten queries before the pipeline is willing to leave it, and `corrective_web_search`
+runs only if that still grades badly. Both rejoin at fusion rather than at synthesis, so a
+second attempt's documents are ranked *against* the first attempt's instead of replacing them.
+
+The nodes whose work is an LLM call — condensation, routing, decomposition, grading, synthesis,
+refinement, verification — are coroutines and await it on the event loop; the ones doing
+blocking library work — retrieval, web search, fusion, formatting — stay synchronous and run in
+a worker thread. See [Concurrency](#concurrency) for why.
 
 - `retrieve_vector` / `retrieve_bm25` / `web_search` fan out via `Send` — one invocation per
   sub-query, per applicable route — and join back at `fuse_results`.
@@ -159,16 +197,35 @@ structured summary alongside the prose report:
   "fused_document_count": 6,
   "confidence_score": 0.62,
   "correction_attempted": false,
+  "refinement_attempted": true,
+  "refined_sub_queries": ["annual revenue figure", "reported turnover"],
+  "groundedness_checked": true,
+  "groundedness_score": 0.83,
+  "unsupported_claim_count": 1,
   "node_latencies_ms": [{ "node": "route_query", "latency_ms": 1523.7 }, "..."],
   "total_latency_ms": 21026.6
 }
 ```
 
 The web UI renders this as a panel: route, a sub-query checklist, per-source retrieval counts,
-the post-fusion unique document count, confidence, whether the corrective fallback fired, and a
+the post-fusion unique document count, confidence, whether either escalation fired, and a
 latency table grouped by pipeline stage. It exists so the assistant doesn't just produce an
 answer — it shows its work, which matters both for debugging and for demoing an agentic system as
 something more than "a single LLM call with extra steps."
+
+Two pairs of fields are easy to conflate and are deliberately distinct:
+
+- `confidence_score` grades **retrieval** — how relevant the documents are to the question.
+  `groundedness_score` grades the **answer** — the fraction of its factual claims the retrieved
+  context actually supports. They routinely disagree, and the gap between them is the failure
+  RAG exists to prevent: retrieval can be perfect and the write-up can still assert a figure no
+  document contains. A UI that prints a confidence number next to a paragraph of prose is
+  showing the first while the reader is asking about the second.
+- `groundedness_checked` is not the same as a `groundedness_score` of `null`. A *checked*
+  abstention scores `null` too, because an answer that makes no factual claims has nothing to
+  ground — so `checked: false` means no check ran, and the absence of unsupported claims says
+  nothing at all. Reporting the second as the first would turn a provider outage or a disabled
+  setting into a clean bill of health.
 
 ## Setup
 
@@ -235,6 +292,8 @@ uv run rag-assistant loadtest --requests 500 --concurrency 25
 uv run rag-assistant labels                   # the router label each document carries
 uv run rag-assistant labels --relabel report.pdf                  # ask the model again
 uv run rag-assistant labels --relabel report.pdf --set "Ethio Re -- annual report -- 2020/21"
+uv run rag-assistant delete report.pdf        # remove one document from the index and corpus
+uv run rag-assistant feedback --export        # queue downvoted questions as eval candidates
 ```
 
 Labels are worth a look after a first ingest. They are model output about a document's opening
@@ -268,6 +327,20 @@ curl -N -X POST http://127.0.0.1:8000/api/v1/research/stream \
   -H "Content-Type: application/json" \
   -d '{"question": "Who founded Anthropic and what is their safety research called?"}'
 ```
+
+Removing one indexed document — the unit that erasure was missing, since it previously existed
+only per tenant:
+
+```bash
+curl -X DELETE http://127.0.0.1:8000/api/v1/sources/anthropic.md
+curl -X DELETE http://127.0.0.1:8000/api/v1/sources/_t/alice/report.md   # tenant-owned
+```
+
+It removes the chunks, the parent sections, the manifest entry and the uploaded file, and
+invalidates the keyword index so the text stops being searchable immediately. Scoped to the
+caller's own sources; someone else's is reported as absent rather than forbidden, because
+"forbidden" would confirm a filename exists to anyone willing to guess. Needs the `write`
+scope, as `DELETE /api/v1/tenant/data` does.
 
 `/api/v1/research/stream` emits Server-Sent Events — one `"progress"` frame per graph node as it
 completes, then a final `"done"` frame carrying the report and the Research Summary above (or a
@@ -410,6 +483,46 @@ docker build -t rag-assistant .
 docker run -p 8000:8000 --env-file .env rag-assistant   # full app on http://localhost:8000
 ```
 
+#### Continuous deployment
+
+`.github/workflows/deploy.yml` ships `main` automatically once CI is green. It is off until
+configured, and says so rather than failing:
+
+| Setting | Kind | What it is |
+| --- | --- | --- |
+| `RENDER_API_KEY` | secret | Render API key with deploy permission |
+| `RENDER_SERVICE_ID` | secret | The `srv-...` id of the service |
+| `DEPLOY_HEALTHCHECK_URL` | variable | Public base URL, e.g. `https://your-app.onrender.com` |
+
+The trigger is a **successful CI run**, not a push. A `push` trigger races the test suite and
+will deploy a commit whose tests are still running — and it deploys the SHA that CI actually
+tested, because by the time a deploy starts another push may have landed and shipping that one
+means shipping something no green run ever covered.
+
+A deploy is not finished when the platform accepts it. The workflow waits for the deploy to
+report live, then polls `/health` until the instance answers (a free instance cold-starts in
+about a minute) and finally checks `/ready`, which pings Chroma and the embedding provider. A
+container that boots perfectly against a mismatched index fails there rather than in front of
+a user.
+
+#### Rollback
+
+Every successful deploy writes its SHA into the run summary, so the last known-good revision
+is findable without opening the host's dashboard.
+
+> **Actions → Deploy → Run workflow → `commit` = the last known-good SHA**
+
+That redeploys the old revision through the same verified path — platform-live, then
+`/health`, then `/ready` — so a rollback is checked exactly as carefully as a deploy. It is
+deliberately a manual decision: sometimes the right response to a bad deploy is to roll
+forward, and no workflow can tell which situation it is in.
+
+What this does **not** cover is state. A rollback returns the *code*; it does not un-apply a
+database migration, and the migrations here are forward-only (`_MIGRATIONS` in
+`conversations/postgres_store.py` and `retrieval/pgvector_store.py`). A revision that adds a
+column is safe to roll back from; one that drops or rewrites data is not, and needs a
+deliberate plan before it ships. Nothing in the pipeline enforces that distinction.
+
 ### Evaluation
 
 Two layers, because they answer different questions and only one of them can gate a build.
@@ -440,6 +553,33 @@ A baseline recorded on Claude Sonnet against the sample corpus is committed at
 expected document retrieved, and ranked first), `abstention_accuracy` 0.778, `route_accuracy`
 0.786 — see Known limitations for why the last two are lower, which is partly the dataset
 rather than the system.
+
+**Multi-turn coverage.** `data/golden_eval/conversational.jsonl` carries prior turns on every
+row. It exists because condensation is the first node in the graph and rewrites the question
+every later node reads — routing, decomposition, both retrieval paths and synthesis all see its
+output rather than what the user typed — and no single-turn row exercises it. A regression that
+broke follow-up resolution, or that dropped the fencing around the conversation (an untrusted
+surface, since an assistant turn carries whatever the web path retrieved), moved no measured
+number at all. Twelve rows cover pronoun resolution, bare ellipsis ("What about funding?"), a
+referent two turns back with an intervening subject, a topic switch where the history is a
+distractor, an already-self-contained follow-up that condensation must *not* damage, an
+unanswerable follow-up, and a conversation whose own history contains injection-shaped text.
+
+It is a separate dataset with its own baseline rather than rows added to `dataset.jsonl`,
+following the same rule the private corpus does: scores are only comparable against a baseline
+recorded on the same questions.
+
+```bash
+uv run rag-assistant eval \
+  --dataset data/golden_eval/conversational.jsonl \
+  --baseline data/golden_eval/conversational-baseline.json \
+  --limit 12 --record-baseline
+```
+
+No baseline is committed for it, because recording one requires running the graph against real
+models and this repo cannot do that in CI. Until someone records it, condensation is covered by
+structural checks (`tests/test_conversational_eval.py`) and unit tests but is not *gated* — see
+Known limitations.
 
 `--check` compares against `data/golden_eval/baseline.json` with a tolerance (default 0.05),
 rather than against absolute thresholds. Absolute numbers get set to whatever today's run
@@ -521,6 +661,18 @@ any of them on is a configuration change — none requires a re-index except whe
 | `CHUNKING_STRATEGY=semantic` | Splits a section where consecutive sentences stop being similar, instead of every N characters. Fixed-size splitting routinely severs a claim from the sentence that qualifies it | One embedding call per section at ingest. Re-indexes automatically (`CHUNKING_VERSION`) |
 | `PARENT_CONTEXT=true` | Small-to-big: retrieve on precise chunks, then hand synthesis the whole section each winner came from. Retrieval wants small chunks for precision, synthesis wants large ones for context — this refuses the trade | More of the context budget per document. No re-index: sections are always recorded |
 | `RERANKER=cohere` / `cross_encoder` | Scores (query, document) pairs jointly. RRF ranks by retriever *consensus* and never compares a document against the question, so a passage every path returns for lexical reasons outranks the one that answers it | An API key, or `sentence-transformers` (torch). Both are optional extras |
+| `RETRIEVAL_MMR=true` | Maximal Marginal Relevance over local retrieval. Dense search ranks candidates against the query independently, so the top-k may be k restatements of one passage — likely on a corpus of structurally similar documents, and *not* something fusion's near-duplicate collapsing catches, since those are different texts making the same point rather than the same text | Fetches `RETRIEVAL_FETCH_K` candidates instead of `RETRIEVAL_K`. No extra model call. `RETRIEVAL_MMR_LAMBDA` is the dial: 1.0 is plain similarity, 0.5 refuses the third restatement |
+
+`RETRIEVAL_K` (default 4) is how many documents each path returns per sub-query — the number
+that most directly controls recall, and until recently the only retrieval knob that was a
+literal in the node rather than a setting. Raising it costs context budget and grading tokens,
+not extra round trips.
+
+Both vector backends run the *same* MMR implementation (`retrieval/mmr.py`) rather than each
+using its own. Chroma ships one and pgvector has none, so the obvious split — native on one
+side, hand-written on the other — would make the two backends agree on plain retrieval and
+disagree the moment diversity was switched on. `tests/test_pgvector_store.py` asserts they
+select identically, against a real Postgres in CI.
 
 ```bash
 uv sync --extra rerank-cohere   # RERANKER=cohere, needs COHERE_API_KEY
@@ -548,6 +700,22 @@ Those questions are the material a golden eval dataset goes stale for lack of. T
 catches regressions against a *fixed* set of questions; it cannot tell you the set stopped
 resembling what people actually ask. This is the only signal here sourced from a human rather
 than from the system's own behaviour, which is why it is also the only alert of its kind.
+
+`rag-assistant feedback --export` is what consumes it: downvoted questions become rows in
+`data/golden_eval/candidates.jsonl`, deduplicated against the questions already in the dataset
+so repeated exports converge instead of accumulating.
+
+```bash
+uv run rag-assistant feedback            # counts, plus the downvoted questions
+uv run rag-assistant feedback --export   # queue them as golden-dataset candidates
+```
+
+The candidate rows carry the question and the route the system actually chose, and leave
+`ground_truth`, `reference_contexts` and `expected_sources` **blank**. That is the point, not
+an omission: those three fields are the assertions every metric is computed against, and
+auto-filling them from the answer a user had just rejected would encode the failure as the
+expected behaviour — after which the gate would defend the bug. A person completes each row
+and moves it into the dataset, and the baseline is re-recorded.
 
 ### Backup and restore
 
@@ -583,10 +751,16 @@ Each of those ceilings is now a setting rather than a rewrite:
 
 | Setting | Removes |
 | --- | --- |
-| `CHROMA_SERVER_HOST` | The vector index's file lock — replicas share a Chroma server |
+| `CHROMA_SERVER_HOST` | The vector index's file lock — replicas share a Chroma server. Verified against a real Chroma server in CI (`tests/test_chroma_server.py`), not just at the construction boundary |
 | `TASK_BACKEND=redis` | Per-process ingest tasks. Without it a client polling a load-balanced deployment gets "unknown ingest task" from every replica that didn't accept the upload |
 | `CONVERSATIONS_BACKEND=postgres` + `DATABASE_URL` | SQLite's single-writer lock, the main obstacle to a second replica. Needs `uv sync --extra postgres`; migrations are advisory-locked so replicas can start simultaneously |
 | `VECTOR_BACKEND=pgvector` + `DATABASE_URL` | The same file lock `CHROMA_SERVER_HOST` removes, but without operating a second service — the index becomes a table in a database that is already backed up, replicated and monitored. Needs the `vector` extension in that database |
+| `KEYWORD_BACKEND=postgres` | The in-memory keyword index. BM25 is built by reading *every* chunk in the collection into the process and keeping it there, once per replica, so build time and resident memory both scale with the whole corpus and a restart pays for it again before the first keyword query is served. This moves keyword search to a full-text index in the same table the vectors live in. The trade is ranking, not correctness — Postgres ranks with `ts_rank_cd` rather than BM25, which fusion tolerates because it combines paths by *rank position* rather than by score |
+| `RATE_LIMIT_STORAGE_URI` | Per-process rate-limit counters. Without it every replica enforces its own private copy of `RATE_LIMIT_RPM_GLOBAL`, so the "global" cap is really N times the configured number — the one shared-state ceiling that fails silently rather than loudly, since nothing errors and the service simply absorbs more load than it was told to |
+
+`DEPLOYMENT_PROFILE=multi-replica` sets all of these together (and requires `DATABASE_URL`),
+because they are not independent choices: every half-shared combination breaks as intermittent
+flakiness rather than as an obvious misconfiguration. Anything you set explicitly still wins.
 
 Both Postgres-backed paths are verified against a real Postgres — `tests/test_postgres_store.py`
 for conversations and `tests/test_pgvector_store.py` for the index — and both skip unless
@@ -643,25 +817,39 @@ uv run rag-assistant ingest --full     # re-parses and re-embeds; PDFs pay visio
 Avoiding that outage entirely is a deployment choice, not a code one: run the embedding model
 in the same failure domain as the app, or embed with a hosted provider and accept the bill.
 
-### Concurrency ceiling
+### Concurrency
 
-Worth stating explicitly because it is arithmetic, not a benchmark, and nothing else in this
-document says it:
+`POST /api/v1/research` is an async handler and the graph is driven through `ainvoke`. That
+is a deliberate structural choice rather than a style one, and it is the difference between
+the two paragraphs below.
 
-`POST /api/v1/research` is a synchronous handler. FastAPI runs those on the AnyIO worker
-threadpool, and each in-flight research call holds one thread for the entire graph run --
-seconds, not milliseconds. So a single worker's concurrency ceiling is `API_THREADPOOL_SIZE`
-(default 40), regardless of how idle the CPU is: the 41st concurrent research request waits
-for a thread rather than starting one.
+**What it used to be.** The handler was a synchronous `def`, so FastAPI ran it on the AnyIO
+worker threadpool and each in-flight question held one thread for the whole graph run --
+seconds, not milliseconds. A single worker's ceiling was therefore `API_THREADPOOL_SIZE`
+(default 40) no matter how idle the CPU was, because the work being waited on was not CPU at
+all. It was almost entirely provider latency, which is to say it was I/O being done with
+threads.
 
-That interacts with `--workers 1` in the Dockerfile. One container serves ~40 concurrent
-research calls; more than that queues. `rag_research_in_flight` is the gauge to alert on, and
-it is the number that should drive the decision to scale out rather than CPU or memory, both
-of which will look healthy while requests queue.
+**What it is now.** The graph is mixed on purpose. Nodes whose work is an LLM call --
+condensation, routing, decomposition, grading, synthesis, refinement, groundedness -- are
+coroutines and await it on the event loop. Nodes whose work is a blocking library call --
+Chroma, psycopg, the web-search client -- stay synchronous, and LangGraph runs them in a
+worker thread for the milliseconds they take. So the threadpool no longer bounds how many
+questions can be in flight; `tests/test_concurrency_ceiling.py` pins that by running twelve
+concurrent questions against a **two**-thread pool and asserting all twelve overlap, which is
+the assertion that fails if a future change puts blocking work back in the request path.
 
-Raising the setting trades memory and context-switching for queueing, and stops helping
-entirely once the binding constraint is the LLM provider's own rate limit -- which, for most
-deployments, it will be well before 40.
+`API_THREADPOOL_SIZE` still bounds the blocking half, and `rag_research_in_flight` is still
+the gauge to alert on -- it now tracks concurrent questions rather than occupied threads. The
+binding constraint for most deployments is the provider's own rate limit, which this change
+makes it much easier to actually reach.
+
+Two caveats, stated because the change is easy to over-claim. The graph is the part that was
+made async; the conversation store and the token budget are still synchronous calls inside
+the handler (SQLite and Redis, milliseconds each) and have not been moved off the loop. And
+the probe in that test sleeps rather than computing, so it models provider latency -- which is
+what a real graph run overwhelmingly is -- and not CPU contention or memory pressure. It
+bounds the concurrency behaviour, not performance under real load.
 
 ### Load testing
 
@@ -832,8 +1020,10 @@ allowed more requests than the rest:
 ]}
 ```
 
-Writes (`POST /api/v1/ingest*`, `DELETE /api/v1/conversations/*`) need the `write` scope;
-everything else needs `read`. A valid key without the scope gets **403, not 401** — 401 would
+Writes (`POST /api/v1/ingest*`, `DELETE /api/v1/conversations/*`, `DELETE`/`PUT
+/api/v1/sources/*`, `POST /api/v1/connectors/*`) need the `write` scope; everything under
+`/api/v1/admin` needs `admin`, which a key file entry must name explicitly and which no SSO
+token carries; everything else needs `read`. A valid key without the scope gets **403, not 401** — 401 would
 tell a read-only client to re-authenticate, which presenting the same key again cannot fix.
 Every decision is audited with the key's fingerprint, never the key: an audit trail that
 records secrets is a secret store nobody is guarding. The key cache is keyed on the file's
@@ -876,6 +1066,196 @@ the convention that both happened to call the same splitter. The tradeoff is tha
 search reflects what has been indexed rather than what is on disk — which is the honest
 behaviour, since an un-ingested file was always invisible to vector search.
 
+### Single sign-on
+
+API keys identify a *tenant*; a company needs to know which *person* is asking, from the
+directory it already runs. Set `OIDC_ISSUER` and `OIDC_AUDIENCE` and the API accepts access
+tokens from that identity provider — Okta, Entra ID, Auth0, Google, Keycloak — as
+`Authorization: Bearer <jwt>`, alongside any API keys (keys are compared first, so turning SSO
+on breaks no existing integration). Set `OIDC_CLIENT_ID` too and the web UI's access gate
+offers **Sign in with SSO**: an authorization-code + PKCE flow with no client secret and no
+library, the access token held in `sessionStorage` so it dies with the tab. Register the UI's
+URL as the client's redirect URI; on Entra ID, add the API's scope to `OIDC_SCOPES` (e.g.
+`openid profile email api://rag-assistant/access`) so the token issued is one for this API,
+and configure the app to emit group names rather than object ids if ACLs use names.
+
+Tokens are verified locally against the issuer's published keys (`oidc.py`), and strictly,
+because every relaxation is a known way JWT validation fails in practice: only the configured
+asymmetric algorithms (never `none`, never HS256 keyed with the public key — both have tests),
+exact issuer, required audience (the config refuses to start with an issuer and no audience,
+since without it a token minted for any other app at the same IdP is honoured here), required
+expiry. The tenant comes from `OIDC_TENANT_CLAIM` and a token *missing* that claim is rejected
+rather than defaulted, since defaulting would show the user the default tenant's documents.
+Signing keys are cached; an unknown `kid` triggers at most one refetch a minute, so tokens
+with random key ids cannot turn every request into outbound traffic.
+
+Groups map to capabilities: `OIDC_WRITE_GROUPS` may upload and delete, `OIDC_ADMIN_GROUPS`
+additionally bypass document permissions inside their tenant. Neither grants the deployment
+`admin` scope — a tenant's admins are not the operator. Machine clients using client
+credentials get `write` from the `rag.write` OAuth scope instead of a group. Conversations
+and feedback become per *user* (`<tenant>::<user>`) once a caller has a user identity: with
+per-document permissions a transcript is as sensitive as the documents it quotes. Erasing a
+tenant still reaches every user's rows.
+
+### Document-level permissions
+
+Tenancy says which organisation owns a document; it cannot say "only finance may read the
+board pack". A document now either has no ACL — visible to its whole tenant, exactly as
+before — or a list of users, groups and email domains that may read it (`ingestion/acl.py`).
+The caller's principals come from their identity: user id, email, email domain, SSO groups,
+or the `user`/`groups` an API key file entry declares. A key with neither is tenant-wide.
+
+```bash
+curl -X POST .../api/v1/ingest -F file=@board.pdf -F allowed_groups=finance,leadership
+curl -X PUT  .../api/v1/sources/_t/acme/board_1f3a9c2b.pdf/acl \
+     -H 'Content-Type: application/json' -d '{"groups": ["finance"]}'
+```
+
+The ACL lives in a sidecar file next to the document (`board.pdf.acl.json`) for the reason
+ownership lives in the path: it survives manifest resets, backups, restores and re-indexes,
+where a permission stored only in the manifest would silently revert to "visible to
+everyone". A sidecar that exists but cannot be parsed makes the document readable by nobody.
+
+At index time the ACL is stamped on every chunk and enforced **inside** the vector search —
+Chroma `$or`/`$contains`, a Postgres `?|` predicate, the same predicate in the in-memory
+keyword filter — so a restricted document never shrinks `k` for someone who cannot see it.
+Listings, the router's corpus description, deletion and ACL edits all apply the same check: a
+filename is information, so a document you cannot read is one you cannot see listed, delete,
+or re-permission either, and an ACL change that would lock its author out is refused. A
+permission change does not re-embed anything: the manifest records an ACL fingerprint, and
+when only that differs the chunks' metadata is rewritten in place — measured in the tests as
+zero embedding calls. That matters because permission changes are the most frequent change a
+synced source produces.
+
+With auth disabled nobody holds any principals, so an open demo serves every unrestricted
+document and no restricted one. Permissions are only as good as the identity behind them.
+
+### Strict tenant isolation
+
+`TENANT_ISOLATION=filter` (the default) keeps one shared collection with a tenant predicate on
+every query: correct, tested, and one bug away from a cross-tenant leak, because the predicate
+is the only thing between tenants. `strict` adds a boundary that does not depend on every
+query remembering it:
+
+- **Chroma** gets one collection per tenant. A tenant's search goes to their collection and
+  the public one and merges by distance (comparable, because one generation is one embedding
+  space). Another tenant's vectors are not filtered out of the search; they are not in it — a
+  test replaces the `where` clause with one that matches everything and confirms a tenant
+  still cannot reach another's documents. Deletes route by the owner encoded in the chunk id,
+  and everything that reads "the whole index" (BM25 build, readiness, re-embedding) unions
+  the collections.
+- **pgvector** always carries a row-level-security policy on the chunks table, keyed on a
+  per-connection setting that every connection the store hands out sets. It fails closed — a
+  connection that never set it sees no rows — and `FORCE` keeps it binding on the table's
+  owner. Postgres exempts superusers and `BYPASSRLS` roles from every policy, so the app must
+  connect as an ordinary role for this layer to exist; `/ready` reports `row_security` so a
+  deployment believing it has two layers and having one is told. The tests create such a
+  role, because the CI container's superuser would pass them while proving nothing.
+
+An index keeps the layout it was written with, so flipping the setting never hides existing
+documents. Moving to `strict` is a re-index into a new generation and a pointer flip — see
+below — with no downtime.
+
+## Source connectors
+
+Uploading files by hand keeps a corpus current for about a week. `CONNECTORS_FILE` names a
+JSON file of sources to mirror into tenants' corpora — Confluence spaces, Google Drive
+folders (My Drive or shared drives, walked recursively; Docs exported as HTML) and mounted
+file shares:
+
+```json
+{"connectors": [
+  {"name": "eng-wiki", "type": "confluence", "owner": "acme", "interval_minutes": 60,
+   "base_url": "https://acme.atlassian.net/wiki", "space_key": "ENG",
+   "email_env": "CONFLUENCE_EMAIL", "token_env": "CONFLUENCE_API_TOKEN",
+   "default_acl": {"groups": ["engineering"]}},
+  {"name": "policies", "type": "google_drive", "owner": "acme",
+   "folder_id": "1AbC...", "credentials_file_env": "DRIVE_SERVICE_ACCOUNT_FILE"}
+]}
+```
+
+```bash
+rag-assistant connectors list
+rag-assistant connectors sync [name] [--due] [--force]   # cron: `connectors sync --due`
+```
+
+or `CONNECTOR_SCHEDULER=true` to run due syncs inside the API, or
+`POST /api/v1/connectors/{name}/sync` for one tenant's connector on demand. Secrets are never
+in the file — each connector names the *environment variables* holding them.
+
+A connector's documents are written as ordinary corpus files (plus ACL sidecars) under the
+tenant's `_sources/<connector>/` directory, then the tenant is re-indexed incrementally. That
+is why the design is small: change detection, deletion, permission updates, PII policy,
+backups and index generations already work on corpus files, so a synced document gets all of
+them without any of them knowing connectors exist. What the sync engine adds is what mirroring
+a system you do not control needs:
+
+- **Fetch only what changed**, by the source's own version marker — a sync of an unchanged
+  space is a listing, not a download of every page.
+- **Deletion sync.** A page deleted upstream — often deleted *because* it should not be
+  read — is deleted from the corpus and its chunks from the index.
+- **A deletion guard.** An expired token or revoked share makes a source *list* as empty,
+  and faithful deletion sync would erase the corpus. A sync whose listing came back empty, or
+  that would delete more than `CONNECTOR_MAX_DELETE_FRACTION` (50%) of what it holds and at
+  least three documents, is refused, nothing changes, and an alert fires; `--force` applies it
+  once someone has confirmed it is real.
+- **Failures change nothing.** A listing that raised is not evidence the rest was deleted; a
+  document that fails to fetch keeps its previous copy. An unmounted share raises rather than
+  listing empty.
+- **Permissions are translated conservatively.** Drive exposes each file's full permission
+  list, so users, groups, domains and "anyone" map directly, and a file whose permissions
+  cannot be read is indexed as readable by nobody. Confluence exposes page restrictions
+  (read here for the page *and* every ancestor, since a parent's restriction binds its
+  children) but not space permissions, so `default_acl` is required. A page restricted at
+  several levels needs a reader to pass all of them, which an "any of these principals" ACL
+  cannot express; it is flattened to the principals named at every level — someone
+  Confluence would admit through two different groups may be refused, nobody it would refuse
+  is admitted. Misconfiguration that would publish documents to a whole tenant, or send a
+  credential over plain HTTP, fails at load, in front of the operator.
+
+`rag_connector_last_success_timestamp_seconds` drives a staleness alert: a connector that has
+quietly stopped syncing leaves deleted and re-permissioned documents searchable, and the
+service keeps answering perfectly well from the stale copy, so nothing else would say so.
+
+## Re-indexing without downtime
+
+Changing the embedding model used to mean `ingest --full`: reset the collection, then serve
+from a half-empty index (or not at all) while every file was re-parsed and re-embedded. Now
+the index has **generations** (`ingestion/generations.py`): complete indexes built side by
+side — vectors, manifest, parent sections and the metadata naming the model that built them
+— with one pointer saying which serves.
+
+```bash
+rag-assistant reindex build --embedding-model openai/text-embedding-3-large
+rag-assistant reindex activate g20260929120000a1b2c3
+rag-assistant reindex rollback     # flip back; the previous generation is kept
+rag-assistant reindex gc           # delete everything but the serving and rollback generations
+rag-assistant reindex status
+```
+
+(`POST /api/v1/admin/index/reindex` does the same inside the API process, which embedded
+Chroma requires since the server holds the index open.)
+
+- **Re-embed, don't re-parse.** By default a build copies chunk text, parent sections,
+  document labels and ACLs from the serving generation and recomputes only the vectors. A
+  model change is a change of vector space, not of text; re-parsing would repeat every vision
+  and description call the corpus ever cost (on the private 30-report corpus, ~370 vision
+  transcriptions) for byte-identical text. `--from-corpus` re-parses when the text itself
+  must change.
+- **Catch-up.** Ingestion keeps writing to the serving generation during a build, so the
+  build ends — and activation begins — with an incremental pass against the corpus on disk,
+  bringing across every upload, deletion and permission change made meanwhile. The final pass
+  and the pointer flip happen under one hold of the ingest lock.
+- **Queries follow the index, not the config.** Every reader embeds with the model the
+  serving generation recorded. Changing `EMBEDDING_PROVIDER` therefore no longer silently
+  breaks retrieval; it chooses the model the *next* generation is built with, and `/ready`
+  reports the difference as a pending migration rather than an outage. Readiness fails only
+  when the recorded model cannot be used at all (its credentials or server are gone).
+- **Every replica converges within `INDEX_POINTER_POLL_SECONDS`**, each serving a complete
+  generation throughout. On pgvector a generation is a schema (`rag_idx_<id>`) and the
+  pointer a row every replica reads; on Chroma it is a directory, and in server mode a
+  collection-name suffix. Backups archive the serving generation.
+
 ## Production readiness
 
 Beyond the core RAG pipeline, the API is hardened for running as an actual service rather than a
@@ -886,7 +1266,7 @@ local demo script:
 | Containerization | Multi-stage `Dockerfile` (non-root user), `docker-compose.yml` wiring `api` + `redis` with a named volume for the Chroma persist directory. Embedded Chroma's SQLite backing locks the file to one process, which is why the image pins `--workers 1`; `CHROMA_SERVER_HOST` switches to server mode when that ceiling matters (see [Scaling out](#scaling-out)) |
 | Health & readiness | `GET /health` is a pure liveness check; `GET /ready` actually pings Chroma (`_collection.count()`) and DuckDuckGo (`HEAD` request) and returns 503 if either dependency is down, so an orchestrator can distinguish "process is up" from "can actually serve a request" |
 | Input validation | `question` is required, capped at 2000 chars, HTML-tag-stripped, and rejected as gibberish if under 10% alphanumeric — all in a pydantic `field_validator`, so bad input 422s before it ever reaches the graph |
-| Rate limiting | `slowapi`-based, both per-IP (`RATE_LIMIT_RPM`, default 10/min) and a global cap (`RATE_LIMIT_RPM_GLOBAL`, default 30/min) across `/research` and `/research/stream` |
+| Rate limiting | `slowapi`-based, both per-caller (`RATE_LIMIT_RPM`, default 10/min) and a global cap (`RATE_LIMIT_RPM_GLOBAL`, default 30/min) across `/research` and `/research/stream`. Counters live wherever `RATE_LIMIT_STORAGE_URI` points — in-process by default, which is correct for one container and wrong for two, so `multi-replica` fills it in from `REDIS_URL`. Without that the "global" cap is really N times the configured number, once per replica. An unreachable store degrades to per-process counting rather than failing requests, and `/ready` reports it |
 | Timeouts | The web search client is capped at `WEB_SEARCH_TIMEOUT_SECONDS` (default 10s); the whole graph execution behind `/research/stream` is bounded by `GRAPH_TIMEOUT_SECONDS` (default 45s) via a monotonic-clock deadline around `astream()`, emitting an `"error"` SSE frame and closing the connection instead of hanging indefinitely |
 | Graceful shutdown | SIGTERM is caught via `loop.add_signal_handler` inside the FastAPI lifespan; active SSE connections (tracked in a `weakref.WeakSet`) are sent a `"close"` frame before the process exits, instead of being cut off mid-stream |
 | Structured logging | JSON logs (`python-json-logger`) with a UUID4 `trace_id` generated per request by an ASGI middleware, propagated through `contextvars` *and* threaded explicitly into the LangGraph state (belt-and-suspenders, since LangGraph's internal scheduling isn't guaranteed to preserve context automatically) — every log line, including each node's completion log, carries `trace_id`/`node`/`route`/`latency_ms`, and the response carries the same trace ID in an `X-Trace-Id` header |
@@ -931,6 +1311,11 @@ local demo script:
 | Alerting | Prometheus rules and a Grafana dashboard in `ops/`, with tests asserting every metric they reference exists. Thresholds are stated with their reasoning — an alert whose number nobody can justify is one that gets silenced the first time it fires at 3am |
 | Load testing | `rag-assistant loadtest` reports p50/p95/p99 and never a mean. Measured single-worker at concurrency 25: 376 rps on `/health`, 407 rps on a SQLite-backed endpoint, p95 172ms/109ms, no errors |
 | Quality signal | Thumbs up/down per answer, surfacing recently downvoted questions. The eval gate catches regressions against a fixed dataset; only this can tell you the dataset stopped resembling what people ask |
+| Continuous deployment | `.github/workflows/deploy.yml` deploys on a **successful** CI run for `main`, not on push — a push trigger races the suite and ships commits whose tests are still running, or have already failed. It deploys the SHA CI tested rather than the branch tip, waits for the platform to report the deploy live, then polls the public `/health` and `/ready`; `/ready` is the one that matters, since it pings Chroma and the embedding provider, so an image that boots cleanly against a broken index fails here instead of in front of a user. Skips with a notice when unconfigured, so a fork carries no red badge for a deployment it was never meant to do |
+| Rollback | `workflow_dispatch` with a `commit` input redeploys any SHA, and each successful deploy writes its own SHA into the run summary — so the last known-good revision is findable without reading the host's dashboard. Deliberately manual: the right answer to a bad deploy is sometimes to roll forward, and a workflow cannot tell which. Deploys never run concurrently and never cancel each other, because interrupting a rollout leaves the service half-updated |
+| Static analysis | `bandit` over `src` at medium severity and above, **blocking** rather than warning — unlike the dependency audit, a finding here is code in this repo that someone can act on today. The baseline is zero: the ten findings it started with were reviewed individually and carry an inline `# nosec` naming the reason (every one was a module-constant table name in an otherwise fully parameterised query), so a new finding is genuinely new. The one real finding it surfaced — `extractall` on a restore archive — is fixed |
+| Secret scanning | `gitleaks` over the **full history**, not the tip. Scanning only the current tree misses the case that actually matters: a credential committed once and "removed" in a later commit is still in the history, and still compromised |
+| Threat model | `SECURITY.md` states the disclosure path and names, per threat, what the mitigation does *not* cover — a control nobody can name the attacker for is a control nobody can evaluate. It also says plainly that no independent review or penetration test has been done |
 
 ## Self-audit: findings & fixes
 
@@ -966,6 +1351,18 @@ resulting Research Summary (`retrieval_counts: 0`, `confidence_score: 0.0`, `cit
 synthesized answer ("No relevant sources were found...") both came out correct — confirming the
 state plumbing, not just the code path in isolation.
 
+A third pass asked a narrower question — is the multi-replica story *true*? — and read the
+code behind each claim rather than the claim. Two of the four findings are bugs that no test
+could have caught, because in both cases the test would have been comparing a value to itself:
+
+| Area | Finding | Fix |
+| --- | --- | --- |
+| Migration locking | Both migration chains serialised themselves with `pg_advisory_lock(hash("...") % 2**31)`, and `str.__hash__` is **salted per process**. Every replica therefore took a *different* advisory lock and contended with nobody — the exact scenario the lock was written for, with a comment saying so. `CREATE TABLE IF NOT EXISTS` hid it for the migrations written so far; the first one to `ALTER` or `INSERT` would have surfaced it as a startup crash on whichever replica lost a race that was not supposed to exist | `advisory_lock.py` derives the id with CRC32 — a pure function of the bytes rather than of a runtime seed. The test spawns two interpreters with different `PYTHONHASHSEED` and compares, since a single-process assertion compares a value to itself and passes either way. A second test asserts `hash()` really is unstable, so the rationale fails loudly if that ever changes |
+| Rate limiting | The limiter was built with slowapi's default in-process storage. On one container that is correct; under `DEPLOYMENT_PROFILE=multi-replica` — which shares the index, the conversations and the task registry — each replica kept private buckets, so `RATE_LIMIT_RPM_GLOBAL`, documented as a cap on aggregate load *regardless of client*, was really that number once per replica | `RATE_LIMIT_STORAGE_URI`, filled in from `REDIS_URL` by the profile. An unreachable store degrades to per-process counting rather than failing requests — a limiter that 500s the API because its bookkeeping store is down has inverted its own purpose — and `/ready` reports the degradation. Verified against a real Redis by driving two separately-built limiters and asserting the second sees the first's hits |
+| Tar extraction | `bandit` flagged `extractall` on a restore archive. A false positive as written — `_safe_extract` already rejects path escapes and link members first — but the hardening was free and real | `filter="data"` as well: CPython's own sanitiser additionally rejects absolute paths, device and FIFO members, and strips setuid bits, none of which the existing loop inspects |
+| Restore identifiers | Reviewing bandit's SQL findings turned up one that was not a false positive in the same way as the rest: in `_load_postgres` the *column* names are read out of the archive's JSON and interpolated into the `INSERT`, and an archive is untrusted input by this module's own reasoning. Attempts to exploit it all failed — psycopg's extended protocol refuses multiple commands per statement, and its placeholder accounting rejects the malformed statements a crafted name produces — so this was a latent reliance on driver behaviour rather than a live hole | Composed with `psycopg.sql.Identifier`, so a hostile column name fails as an unknown column. The guarantee now comes from this code rather than from an adapter detail that a different driver or a `COPY` rewrite would change. A test drives `_load_postgres` with a crafted name and asserts the table survives |
+| Verification gaps | Chroma **server mode** was covered only at the construction boundary (an assertion that an `HttpClient` gets built), and behaviour at the `API_THREADPOOL_SIZE` ceiling was unmeasured because reaching it with real traffic means raising the rate limiter and spending real provider quota | Server mode now runs against a real Chroma service container in CI, asserting retrieval, tenant scoping and the cosine metric over HTTP. The ceiling is measured with a sleeping stand-in for the graph: at a ceiling of 4, peak concurrency is 4 and 12 requests take ~0.50s in three waves; with the limiter left at AnyIO's default the peak is 12 and they take ~0.18s — so the assertion has teeth and costs nothing |
+
 Gaps identified but deliberately not yet acted on: no few-shot examples in the router/
 decomposition prompts, and exact-content-hash dedup can still let the same source get cited
 twice under different markers if local and web copies differ even slightly. (The third gap
@@ -995,7 +1392,8 @@ has none.
   naive-RAG comparison now exists for the private corpus (see [Evaluation](#evaluation)), but
   not for this one.
 - **Retrieval-quality features are correctness-tested, not quality-measured.** Semantic
-  chunking, reranking and small-to-big all behave as specified and are covered by tests, but
+  chunking, reranking, small-to-big and MMR diversity all behave as specified and are covered by
+  tests, but
   whether they *improve* answers on a given corpus is exactly what the eval gate answers — and
   that requires recording a baseline against real models first. The embedding model, the
   per-document labels and the chunk context lines *have* been measured this way, on a private
@@ -1029,16 +1427,25 @@ has none.
   fail rather than pass if their suites skip, since a suite that skips itself produces a green
   job having verified nothing. The Redis tests deliberately read back through a *second* client,
   which is the part a fake cannot check — a fake agrees with whatever the code expects of it,
-  including about TTLs and about what another replica sees. Chroma **server mode** is still
-  covered only at the construction boundary and still runs nowhere in CI.
-- **All tenants share one Chroma collection.** Retrieval and ingestion are tenant-scoped, and
-  `GET /api/v1/tenant/usage` now answers both halves of "what is this tenant costing me" —
-  sources, chunks and corpus bytes alongside today's token spend — scoped to the caller, like
-  the erasure endpoint. What a shared collection still cannot give is isolation: one tenant's
-  vectors sit beside another's, separated by a metadata predicate rather than by storage, which
-  is the argument for separate collections and the natural companion to the Qdrant move below.
-  Embedding and vision spend is still charged from an estimate rather than reported usage,
-  because neither surfaces token counts through LangChain's callbacks.
+  including about TTLs and about what another replica sees. Chroma **server mode** now runs
+  against a real server in CI too, covering retrieval, tenant scoping and the distance metric
+  over HTTP rather than only the construction boundary. What no job covers is *two replicas at
+  once*: every suite runs one process against a shared service, so "these replicas agree" is
+  still argued from the storage being shared rather than demonstrated by running two.
+- **Tenants share one collection unless `TENANT_ISOLATION=strict`.** The default is still one
+  shared collection separated by a metadata predicate, because moving an existing deployment
+  is a deliberate re-index rather than something a default flip should do. `strict` gives
+  Chroma one collection per tenant and pgvector always has row-level security (see
+  [Strict tenant isolation](#strict-tenant-isolation)); what neither gives is per-tenant
+  *capacity* isolation — one tenant's large ingest still shares the embedding provider,
+  the ingest lock and the process with everyone else's. `GET /api/v1/tenant/usage` answers
+  both halves of "what is this tenant costing me" — sources, chunks and corpus bytes
+  alongside today's token spend — scoped to the caller, like the erasure endpoint.
+  Erasure now has both units — `DELETE /api/v1/sources/{source}` removes one document across all
+  five stores, and `DELETE /api/v1/tenant/data` still removes everything a tenant owns — so a
+  takedown request or a retention date no longer means deleting a tenant's whole corpus and
+  re-uploading the rest. Embedding and vision spend is still charged from an estimate rather
+  than reported usage, because neither surfaces token counts through LangChain's callbacks.
 
 - **Prompt-injection defense is structural, and structural is not proof.** All four prompts
   that interpolate text the pipeline did not author -- synthesis, grading, routing and
@@ -1062,18 +1469,96 @@ has none.
   pass notices the stale record. A broker is the right answer once ingest volume justifies
   operating one.
 
-- **The pipeline is load-tested only at low concurrency.** `/api/v1/research` has now been
-  measured end to end (12 requests at concurrency 4: p50 10.3s, p95 11.0s, p99 11.1s), which is
-  enough to confirm the latency objective and that the tail is provider latency rather than
-  queueing. What it does *not* establish is behaviour at the `API_THREADPOOL_SIZE` ceiling: the
-  per-IP rate limiter starts returning 429 long before 40 concurrent research calls, so testing
-  that ceiling means raising `RATE_LIMIT_RPM` deliberately and spending real provider quota. The
-  arithmetic below remains a bound, not a benchmark.
-- **Choosing an embedding provider is one-way.** Switching means a full re-index. `/ready` detects
-  the mismatch rather than serving nonsense, and on the pgvector backend a model of a *different*
-  width is rejected outright at insert — but a model of the *same* width is still caught only by
-  the recorded embedding-model name, and there is no migration path that keeps the service
-  answering while it re-embeds.
+- **The pipeline is load-tested only at low concurrency, and concurrency is tested without a
+  provider.** `/api/v1/research` has been measured end to end (12 requests at concurrency 4:
+  p50 10.3s, p95 11.0s, p99 11.1s), which confirms the latency objective and that the tail is
+  provider latency rather than queueing. That measurement predates the async handler, so it
+  remains a valid latency figure and is no longer a concurrency one. Concurrency is tested with
+  the graph replaced by an async sleep: twelve questions overlap against a two-thread pool,
+  nothing deadlocks, and the in-flight gauge tracks real concurrency and returns to zero even
+  when every run raises. That pins the property the change was made for. It does not pin
+  *latency* under real load — a sleeping stand-in does not contend for CPU, memory or a
+  provider's own rate limiter — so the ceiling discussion above is a bound rather than a
+  benchmark at full concurrency. The end-to-end latency figures have not been re-measured
+  since the conversion.
+- **The deploy pipeline has never run against a real host.** Its logic is tested — that it
+  refuses a failed CI run, deploys the tested SHA rather than the branch tip, verifies `/ready`
+  and not merely `/health`, and skips rather than fails when unconfigured — by
+  `tests/test_workflow_contracts.py`, which parses the workflow and asserts those properties.
+  What no test can assert is that Render's API behaves as the workflow expects: the deploy
+  call, the status polling and the smoke test have never executed against a live service,
+  because doing so requires credentials this repo does not have. Treat the first real run as
+  the test, and watch it.
+- **Static analysis is not a security review.** `bandit` and `gitleaks` run on every PR and the
+  baseline is zero, which means a new finding is genuinely new — but a scanner cannot find what
+  it was not taught to look for, and every suppression in the tree was reviewed by the same
+  person who wrote the code it suppresses. No independent review and no penetration test has
+  been done. `SECURITY.md` names, per threat, what each mitigation does not cover; that table
+  is a description of intent, not evidence the intent was achieved.
+- **The groundedness check is a model checking a model, and it verifies support, not truth.**
+  It decomposes the answer into claims and asks whether the retrieved context states them, so a
+  claim supported by a document that is itself wrong scores as grounded — correctly, since the
+  corpus is the ground truth here, and whether the corpus deserves to be is a question no
+  runtime check can answer. Verifier and author may also share a blind spot: they are the same
+  model family. It costs one structured call per question that retrieved anything (abstentions
+  and the `none` route skip it), and it is the pipeline's most valuable target for prompt
+  injection — a document that talks it into marking everything supported turns the score into a
+  rubber stamp, which is worse than no check because the number is still reported. The prompt is
+  fenced and the hierarchy stated ahead of the content, with the same caveat as everywhere else:
+  that makes injection harder and attempts visible, not impossible.
+- **PII detection finds formats, not people.** Emails, phone numbers, Luhn-valid cards, US
+  SSNs, IBANs and cloud access keys have enough structure to match without drowning the signal
+  in false positives. A name, a postal address, a date of birth, a medical detail or a national
+  ID with no fixed shape passes through untouched, and no amount of pattern-writing closes that
+  gap. `redact` also applies only to what is ingested *after* it is turned on — reapplying it to
+  an existing corpus needs `ingest --full` — and never touches the uploaded file on disk, which
+  is deliberate (it keeps the decision reversible) and means the original is still there. A
+  deployment with a real regulatory obligation wants a purpose-built classifier and a human
+  review step; this is a floor, not a ceiling.
+- **Postgres keyword search does not rank like BM25.** `KEYWORD_BACKEND=postgres` removes the
+  in-memory index's memory ceiling and changes the ranking function while it is at it:
+  `ts_rank_cd` is cover-density ranking and does not model document length or term saturation
+  the way BM25's `k1`/`b` do, so the two backends return different orderings for the same
+  corpus — unlike the two *vector* backends, which are tested for identical ranking. Fusion
+  tolerates it because RRF votes on rank position rather than score, but it means switching is
+  a retrieval-quality change and wants an eval run behind it. Its text-search configuration is
+  fixed at `english`, so a non-English corpus is stemmed by the wrong rules; the in-memory
+  scorer has the mirror-image problem of no stemming at all.
+- **The conversational eval set has no recorded baseline in this repo.** `conversational.jsonl`
+  is structurally validated in CI — every row carries history, the history alternates and ends
+  on an assistant turn, reference contexts are real passages from the corpus, rows expecting no
+  sources are the abstention cases — but a baseline can only be recorded by running the graph
+  against real models, which this repo cannot do in CI. Until someone runs
+  `rag-assistant eval --dataset data/golden_eval/conversational.jsonl --baseline
+  data/golden_eval/conversational-baseline.json --record-baseline --limit 12`, condensation is
+  covered by structural checks and unit tests but is not *gated*. The committed
+  `dataset.jsonl` baseline is unaffected: single-turn rows send an empty history, and
+  `condense_question` returns early on one, so their behaviour is byte-identical.
+- **The refinement pass costs a call and a wait on exactly the hardest questions.** A
+  low-confidence answer now pays for a rewrite plus a second local retrieval before it may also
+  pay for a web search, so the worst-case question is slower and more expensive than it was.
+  That is the intended trade — those are the questions most likely to be answered badly — but
+  it means `GRAPH_TIMEOUT_SECONDS` has less headroom on a route that escalates twice, and the
+  budget for such a question is roughly double.
+
+- **A re-index still costs a full re-embed, and the multi-replica catch-up has a window.**
+  [Generations](#re-indexing-without-downtime) remove the downtime, not the embedding bill.
+  With several replicas the ingest lock is per process, so an ingest on another replica can
+  reach the old generation in the seconds before that replica notices the flip; `activate`
+  runs one more catch-up after the poll interval, and a file whose ingest is still in flight
+  after that is indexed by the next ingest in its tenant. Semantic chunking computed its
+  boundaries with the old model, and a re-embed keeps them — `--from-corpus` recomputes them.
+- **Identity across systems is only as consistent as the directory.** Document permissions
+  compare strings: a Drive ACL names `finance@acme.com`, a Confluence restriction names a group
+  or an Atlassian account id, and an SSO token carries whatever the IdP puts in `groups` —
+  Entra ID emits group *object ids* by default. Permissions work end to end when group names
+  (or emails) are synced consistently, e.g. by SCIM from the same directory, and silently
+  admit nobody when they are not. That is the safe direction to fail in, and it is still a
+  failure someone has to notice.
+- **Connectors are verified against the APIs' documented shapes, not against live tenants.**
+  Confluence and Drive are tested through a mock HTTP transport replaying their REST
+  responses; the filesystem connector end to end. The first sync against a real space is the
+  real test — run it with a small `interval_minutes` and watch `connectors list`.
 
 ## Service objectives and recovery
 
@@ -1124,14 +1609,15 @@ remembered".
 Deliberately scoped out as needing a concrete driving requirement before they're worth the
 added complexity:
 
-- **Qdrant (or another dedicated vector DB) instead of Chroma** — worth it once per-tenant
-  collections, richer filtering, or corpus size actually demand it. Chroma is not the
-  bottleneck today.
+- **Qdrant (or another dedicated vector DB) instead of Chroma** — worth it once richer
+  filtering or corpus size actually demand it. Per-tenant collections no longer need it
+  (`TENANT_ISOLATION=strict`), and Chroma is not the bottleneck today.
 - **Retrieval-quality evaluation of the optional features** — a scored comparison of
   structural vs. semantic chunking, and with vs. without reranking, on a corpus large enough
   for the difference to be measurable rather than anecdotal.
-- **Streaming re-index** — re-embedding a corpus after an embedding-model change currently
-  means downtime or stale answers; a shadow index swapped in on completion would remove both.
+- **A work queue for ingestion and connector syncs** — both run in the process that started
+  them, serialised per process. A broker would distribute them across replicas and remove the
+  multi-replica catch-up window described under Known limitations.
 
 ## Testing
 
@@ -1147,11 +1633,28 @@ cd frontend
 npm test               # Vitest + React Testing Library — hooks and components
 ```
 
-Two suites need something extra and skip cleanly without it:
+Three suites need a real service and skip cleanly without one. Each is gated on its own
+environment variable, and the matching CI job **fails if the suite skips** — a suite that skips
+itself produces a green job having verified nothing, which reads as coverage:
 
 ```bash
-# Postgres backend (13 tests) -- skipped unless a database is reachable
-RAG_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:55432/postgres uv run pytest tests/test_postgres_store.py
+# Postgres-backed conversations and the pgvector index
+RAG_TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/postgres \
+  uv run pytest tests/test_postgres_store.py tests/test_pgvector_store.py
+
+# Redis-backed answer cache, per-tenant budget, ingest tasks and rate-limit counters
+RAG_TEST_REDIS_URL=redis://127.0.0.1:6379/0 uv run pytest tests/test_redis_backed.py
+
+# Chroma in server mode (CHROMA_SERVER_HOST), over HTTP rather than an on-disk SQLite file
+RAG_TEST_CHROMA_HOST=127.0.0.1 RAG_TEST_CHROMA_PORT=8000 uv run pytest tests/test_chroma_server.py
+```
+
+Each has a one-line Docker equivalent if you do not have the service to hand:
+
+```bash
+docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres pgvector/pgvector:pg17
+docker run -d -p 6379:6379 redis:7-alpine
+docker run -d -p 8000:8000 chromadb/chroma:1.5.9
 ```
 
 Optionally install the pre-commit hooks so lint, lockfile drift, and accidentally-staged
@@ -1161,10 +1664,25 @@ Optionally install the pre-commit hooks so lint, lockfile drift, and accidentall
 uv run pre-commit install
 ```
 
-CI (`.github/workflows/ci.yml`) runs four jobs on every push and PR: **backend** (ruff +
-pytest with a coverage floor), **frontend** (oxlint, Vitest, production build), **audit**
-(`pip-audit` over the exported lockfile and `npm audit`, non-blocking), and **docker** (build,
-Trivy image scan, then boot the real image and wait on `/health`).
+CI (`.github/workflows/ci.yml`) runs on every push and PR:
+
+| Job | What it does |
+| --- | --- |
+| **backend** | ruff lint + format check, pytest with a coverage floor |
+| **postgres** | the Postgres-backed backends against a `pgvector/pgvector` service container, with their own coverage gate |
+| **redis** | the Redis-backed paths against a real Redis, reading back through a second client |
+| **chroma-server** | Chroma server mode against a real Chroma, over HTTP |
+| **static-analysis** | `bandit` over `src` (blocking, zero baseline) and `gitleaks` over the full history |
+| **frontend** | oxlint, Vitest, production build |
+| **audit** | `pip-audit` over the exported lockfile and `npm audit` — non-blocking, since an advisory often has no released fix |
+| **eval** | the retrieval quality gate against the recorded baseline; skips on forks, which have no API keys |
+| **docker** | build, Trivy image scan, then boot the real image and wait on `/health` |
+
+`.github/workflows/private-eval.yml` gates a private corpus on its own weekly schedule, and
+`.github/workflows/deploy.yml` deploys `main` after a green CI run — both skip with a notice
+when unconfigured. `tests/test_workflow_contracts.py` asserts the properties these files are
+relied on for: that the service-container jobs fail rather than pass when their suite skips,
+that images are pinned, and that the deploy refuses a failed CI run.
 
 ## Project layout
 
@@ -1172,9 +1690,14 @@ Trivy image scan, then boot the real image and wait on `/health`).
 src/rag_assistant/
 ├── config.py, llm.py, logging_conf.py   # settings, model factories, structured JSON logging
 ├── tracing.py, cache.py, readiness.py    # trace-ID contextvar, Redis cache, Chroma/web search health checks
-├── metrics.py, auth.py                   # Prometheus collectors + LLM callback handler, API-key auth
+├── metrics.py, auth.py                   # Prometheus collectors + LLM callback handler, API keys + principals
+├── oidc.py                               # single sign-on: verifying identity-provider access tokens
 ├── backup.py, loadtest.py                # snapshot/restore, concurrency measurement
-├── ingestion/                            # load -> split -> embed -> index the sample corpus
+├── advisory_lock.py                      # deterministic Postgres lock ids (hash() is per-process salted)
+├── ingestion/                            # load -> split -> embed -> index the sample corpus;
+│                                          # acl.py (document permissions), generations.py +
+│                                          # reindex.py (rebuild beside the serving index, then switch)
+├── connectors/                           # Confluence, Google Drive, file-share sync + deletion guard
 ├── retrieval/                            # Chroma + pgvector stores, BM25 keyword store, DuckDuckGo web search
 ├── fusion/rrf.py                         # Reciprocal Rank Fusion (pure function)
 ├── grading/relevance_grader.py           # batched LLM relevance grading
@@ -1184,13 +1707,14 @@ src/rag_assistant/
 ├── eval/                                 # golden dataset loader + RAGAS eval harness
 ├── schemas/models.py                     # internal domain / structured-output schemas
 ├── schemas/api.py                        # external API request/response contracts
-├── cli.py                                # Typer app: hello / ingest / retrieve / search / ask / serve / eval
+├── cli.py                                # Typer app: ingest / ask / serve / eval / reindex / connectors / ...
 └── api.py                                # FastAPI: GET /health, GET /ready, POST /research, POST /research/stream
 
 Dockerfile, docker-compose.yml, .dockerignore  # multi-stage build, non-root user, api + redis services
 
 frontend/src/
 ├── api/client.ts                         # fetch + SSE client for the backend API
+├── api/sso.ts                            # OIDC authorization code + PKCE sign-in, no library
 ├── hooks/useHealthStatus.ts              # polls GET /health on mount
 ├── hooks/useResearchStream.ts            # SSE streaming + progress/result state, testable in isolation
 ├── constants/exampleQuestions.ts         # example-question chip data

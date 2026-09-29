@@ -12,6 +12,20 @@ from rag_assistant import api, budget
 from rag_assistant.config import get_settings
 
 
+def _as_async(stub):
+    """Wraps a graph stub so it can stand in for `ainvoke`.
+
+    `/api/v1/research` awaits the graph now -- the LLM-bound nodes are coroutines, so there is
+    no synchronous `invoke` to patch. Without this the handler would fall through to the real
+    graph and make live provider calls from the test suite.
+    """
+
+    async def _ainvoke(*args, **kwargs):
+        return stub(*args, **kwargs)
+
+    return _ainvoke
+
+
 class _FakeRedis:
     """Enough of the Redis surface for the counter, including INCRBY's atomicity, which is
     the property the shared path depends on."""
@@ -215,7 +229,7 @@ def test_an_exhausted_budget_returns_429_before_any_model_call(shared_redis, mon
     def _explode(*args, **kwargs):
         raise AssertionError("the graph must not run once the budget is exhausted")
 
-    monkeypatch.setattr(api._graph, "invoke", _explode)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_explode))
     client = TestClient(api.app)
 
     response = client.post("/api/v1/research", json={"question": "Who founded Anthropic?"})
@@ -248,7 +262,7 @@ def test_a_successful_run_is_charged(shared_redis, monkeypatch):
         accountant.output_tokens = 30
         return {"route": "vector", "final_answer": "ok", "research_report": "ok", "citations": []}
 
-    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_fake_invoke))
     client = TestClient(api.app)
 
     client.post("/api/v1/research", json={"question": "Who founded Anthropic?"})
@@ -266,7 +280,7 @@ def test_a_failed_run_is_still_charged(shared_redis, monkeypatch):
         config["callbacks"][0].input_tokens = 55
         raise RuntimeError("provider exploded")
 
-    monkeypatch.setattr(api._graph, "invoke", _fake_invoke)
+    monkeypatch.setattr(api._graph, "ainvoke", _as_async(_fake_invoke))
     client = TestClient(api.app)
 
     response = client.post("/api/v1/research", json={"question": "Who founded Anthropic?"})

@@ -23,10 +23,17 @@ const STAGES: Stage[] = [
   { key: 'retrieve', label: 'Retrieve', group: ['retrieve_vector', 'retrieve_bm25', 'web_search'] },
   { key: 'fuse_results', label: 'Fuse results' },
   { key: 'grade_and_score', label: 'Grade & score confidence' },
+  { key: 'refine_retrieval', label: 'Re-ask the corpus' },
   { key: 'corrective_web_search', label: 'Corrective web search' },
   { key: 'synthesize_answer', label: 'Synthesize answer' },
+  { key: 'verify_groundedness', label: 'Check answer against sources' },
   { key: 'format_report', label: 'Format report' },
 ]
+
+// Stages that only run when grading is unhappy. Once grading and synthesis have both
+// happened without one of these being visited, it was skipped rather than still pending --
+// the distinction the stepper exists to show.
+const CONDITIONAL_STAGES = new Set(['refine_retrieval', 'corrective_web_search'])
 
 const RETRIEVAL_LABELS: Record<string, string> = {
   retrieve_vector: 'Vector',
@@ -49,15 +56,15 @@ export function GraphVisualization({ visits, loading }: GraphVisualizationProps)
   const visitedNodes = new Set(visits.map((v) => v.node))
   const latestNode = visits[visits.length - 1]?.node
 
-  // grade_and_score decides whether corrective_web_search fires -- once grading has
-  // happened and synthesis has started without ever visiting it, the loop was skipped.
+  // grade_and_score decides whether either escalation fires -- once grading has happened
+  // and synthesis has started without visiting one, that loop was skipped.
   const gradeVisited = visitedNodes.has('grade_and_score')
   const synthesizeVisited = visitedNodes.has('synthesize_answer')
 
   function statusFor(stage: Stage): StageStatus {
-    if (stage.key === 'corrective_web_search') {
-      if (visitedNodes.has('corrective_web_search')) {
-        return latestNode === 'corrective_web_search' && loading ? 'active' : 'done'
+    if (CONDITIONAL_STAGES.has(stage.key)) {
+      if (visitedNodes.has(stage.key)) {
+        return latestNode === stage.key && loading ? 'active' : 'done'
       }
       return gradeVisited && synthesizeVisited ? 'skipped' : 'pending'
     }

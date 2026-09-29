@@ -1,0 +1,182 @@
+# Continuous deployment, and the rollback that makes it safe to have.
+#
+# Two rules shape this file.
+#
+# It deploys only what CI passed. The trigger is `workflow_run` on a *successful* CI run for
+# `main`, not `push` -- a `push` trigger races the test suite and will happily ship a commit
+# whose tests are still running, or have already failed.
+#
+# It verifies afterwards. A deploy that reports success because the API call returned 200 has
+# checked that the control plane accepted the request, not that the service works. This waits
+# for the deploy to go live, then polls the public `/health` and `/ready` -- `/ready` being
+# the one that actually pings Chroma and the embedding provider, so a container that boots
+# with a broken index fails here rather than in front of a user.
+#
+# Everything is gated on configuration and *skips* rather than fails when it is missing: a
+# fork, or this repo before anyone connects Render, should not have a permanently red badge
+# for a deployment it was never meant to do.
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  # The rollback entry point, and the way to redeploy by hand. `commit` takes any SHA the
+  # service can build -- pass the last known-good one to roll back. See "Rollback" in the
+  # README; there is deliberately no automatic revert, because the right response to a bad
+  # deploy is sometimes "roll forward" and a workflow cannot tell which.
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit SHA to deploy (defaults to the tip of main)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # One deploy at a time, and never cancel one in flight: interrupting a deploy mid-rollout
+  # leaves the service in whatever half-updated state the platform reached.
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # `workflow_run` fires on failure too, so the conclusion has to be checked explicitly --
+    # without this, a red CI run deploys.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    environment:
+      name: production
+      url: ${{ vars.DEPLOY_HEALTHCHECK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check preconditions
+        id: guard
+        shell: bash
+        run: |
+          missing=""
+          [ -n "${{ secrets.RENDER_API_KEY }}" ] || missing="$missing RENDER_API_KEY"
+          [ -n "${{ secrets.RENDER_SERVICE_ID }}" ] || missing="$missing RENDER_SERVICE_ID"
+          [ -n "${{ vars.DEPLOY_HEALTHCHECK_URL }}" ] || missing="$missing DEPLOY_HEALTHCHECK_URL"
+          if [ -n "$missing" ]; then
+            echo "::notice::Deploy skipped -- not configured. Missing:$missing"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve the commit to deploy
+        if: steps.guard.outputs.enabled == 'true'
+        id: target
+        shell: bash
+        run: |
+          # For a workflow_run the SHA is the commit CI actually tested, not the branch tip:
+          # by the time this runs another push may have landed, and deploying that one would
+          # ship something no green run ever covered.
+          sha="${{ inputs.commit || github.event.workflow_run.head_sha || github.sha }}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Deploying $sha"
+
+      - name: Trigger the deploy
+        if: steps.guard.outputs.enabled == 'true'
+        id: trigger
+        shell: bash
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+          COMMIT: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          response=$(curl -fsS -X POST \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"commitId\":\"$COMMIT\",\"clearCache\":\"do_not_clear\"}" \
+            "https://api.render.com/v1/services/$RENDER_SERVICE_ID/deploys")
+          deploy_id=$(echo "$response" | jq -r '.id')
+          if [ -z "$deploy_id" ] || [ "$deploy_id" = "null" ]; then
+            echo "::error::Render did not return a deploy id."
+            exit 1
+          fi
+          echo "deploy_id=$deploy_id" >> "$GITHUB_OUTPUT"
+          echo "Render deploy $deploy_id started for $COMMIT"
+
+      - name: Wait for the deploy to go live
+        if: steps.guard.outputs.enabled == 'true'
+        shell: bash
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+          DEPLOY_ID: ${{ steps.trigger.outputs.deploy_id }}
+        run: |
+          set -euo pipefail
+          # 40 * 15s = 10 minutes. A cold Docker build on a small instance is a few minutes;
+          # past ten, something is wrong and a stuck job helps nobody.
+          for attempt in $(seq 1 40); do
+            status=$(curl -fsS \
+              -H "Authorization: Bearer $RENDER_API_KEY" \
+              "https://api.render.com/v1/deploys/$DEPLOY_ID" | jq -r '.status // .deploy.status')
+            echo "[$attempt] status: $status"
+            case "$status" in
+              live) echo "deploy is live"; exit 0 ;;
+              build_failed|update_failed|canceled|deactivated)
+                echo "::error::Deploy finished as '$status' -- the previous version is still serving."
+                exit 1 ;;
+            esac
+            sleep 15
+          done
+          echo "::error::Deploy did not reach a terminal state within 10 minutes."
+          exit 1
+
+      # The step that decides whether this deploy counts. `/ready` pings Chroma and the
+      # embedding provider, so an image that boots cleanly against a broken or
+      # wrong-dimension index fails here.
+      - name: Smoke-test the deployed service
+        if: steps.guard.outputs.enabled == 'true'
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.DEPLOY_HEALTHCHECK_URL }}
+        run: |
+          set -uo pipefail
+          # Retried rather than checked once: a free instance cold-starts in about a minute,
+          # and a single curl the moment the platform says "live" measures the cold start.
+          for attempt in $(seq 1 30); do
+            if curl -fsS --max-time 20 "$BASE_URL/health" > /dev/null; then
+              echo "health ok after ${attempt} attempt(s)"
+              break
+            fi
+            if [ "$attempt" = "30" ]; then
+              echo "::error::/health never responded after the deploy went live."
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "--- /ready ---"
+          ready_body=$(curl -sS --max-time 30 -o /tmp/ready.json -w '%{http_code}' "$BASE_URL/ready") || true
+          cat /tmp/ready.json || true
+          echo
+          if [ "$ready_body" != "200" ]; then
+            echo "::error::/ready returned $ready_body -- the service is live but cannot serve a request."
+            echo "::notice::Roll back by re-running this workflow (Run workflow -> commit = last known-good SHA)."
+            exit 1
+          fi
+          echo "smoke test passed"
+
+      - name: Record the deployed revision
+        if: steps.guard.outputs.enabled == 'true' && success()
+        shell: bash
+        run: |
+          # Written to the run summary so the last-known-good SHA -- the one you pass back in
+          # to roll back -- is findable without reading Render's dashboard.
+          {
+            echo "### Deployed"
+            echo ""
+            echo "- commit: \`${{ steps.target.outputs.sha }}\`"
+            echo "- deploy: \`${{ steps.trigger.outputs.deploy_id }}\`"
+            echo "- url: ${{ vars.DEPLOY_HEALTHCHECK_URL }}"
+            echo ""
+            echo "To roll back to this revision later: Actions -> Deploy -> Run workflow -> commit = \`${{ steps.target.outputs.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

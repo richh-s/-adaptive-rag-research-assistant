@@ -863,3 +863,268 @@ def test_the_embedding_model_record_is_readable_from_a_replica_that_did_not_inge
 
     assert ok is False
     assert "different vector space" in error
+
+
+def test_a_restore_cannot_be_made_to_execute_sql_from_the_archive(
+    sample_corpus_dir, fake_embeddings, tmp_path
+):
+    """Column names in a dump are read out of the archive's JSON, and an archive is whatever
+    was sitting on the backup disk -- the same untrusted input `_safe_extract` exists for.
+
+    Honest about what changed: interpolating them raw was *not* demonstrably exploitable.
+    psycopg's extended protocol refuses more than one command per statement ("cannot insert
+    multiple commands into a prepared statement"), and its placeholder accounting rejects the
+    malformed statements a crafted name produces -- several payloads were tried and all were
+    blocked by the driver rather than by this code. The point of composing with
+    `sql.Identifier` is that the guarantee now comes from the code instead of from an adapter
+    detail that a different driver, a client-side-binding cursor or a `COPY` rewrite would
+    change.
+
+    Drives `_load_postgres` directly because the payload has to survive as a *column name*,
+    which `create_backup` would never produce.
+    """
+    import json
+
+    import psycopg
+
+    from rag_assistant.backup import _load_postgres
+
+    build_index(
+        source_dir=sample_corpus_dir, persist_dir=tmp_path / "idx", embeddings=fake_embeddings
+    )
+    survivors_before = _sql("SELECT COUNT(*) FROM corpus_manifest")[0][0]
+    assert survivors_before > 0
+
+    staging = tmp_path / "postgres"
+    staging.mkdir()
+    # A column name that closes the identifier list and starts a new statement.
+    payload = "source\") VALUES ('x'); DROP TABLE corpus_manifest; --"
+    (staging / "corpus_manifest.jsonl").write_text(json.dumps({payload: "anything"}) + "\n")
+
+    with pytest.raises(psycopg.Error):
+        _load_postgres(staging, ["corpus_manifest"])
+
+    # The table is still there. (The failed restore runs in one transaction, so the DELETE
+    # that precedes the insert is rolled back with it.)
+    assert _sql("SELECT COUNT(*) FROM corpus_manifest")[0][0] == survivors_before
+
+
+def test_mmr_selection_matches_the_chroma_backend(
+    parity_corpus, fake_embeddings, tmp_path, monkeypatch
+):
+    """Diversity selection has to be interchangeable too.
+
+    Chroma ships its own `max_marginal_relevance_search` and pgvector has none, so the
+    obvious implementation -- native on one side, hand-written on the other -- would make the
+    two backends agree on plain retrieval and disagree the moment RETRIEVAL_MMR was set. Both
+    paths call `retrieval/mmr.py`; this is what pins that they keep doing so.
+    """
+    monkeypatch.setenv("RETRIEVAL_MMR", "true")
+    monkeypatch.setenv("RETRIEVAL_MMR_LAMBDA", "0.5")
+    queries = [
+        "Who founded Anthropic and what is Constitutional AI?",
+        "open-weight models from a European company",
+        "reinforcement learning and AI safety research",
+    ]
+
+    def _rank(backend: str, persist_dir):
+        monkeypatch.setenv("VECTOR_BACKEND", backend)
+        get_settings.cache_clear()
+        reset_store_cache()
+        build_index(source_dir=parity_corpus, persist_dir=persist_dir, embeddings=fake_embeddings)
+        return [
+            [
+                d.metadata["source"]
+                for d in get_retriever(
+                    k=4, embeddings=fake_embeddings, persist_dir=persist_dir
+                ).invoke(q)
+            ]
+            for q in queries
+        ]
+
+    pg_ranking = _rank("pgvector", tmp_path / "pg_mmr")
+    chroma_ranking = _rank("chroma", tmp_path / "chroma_mmr")
+
+    assert pg_ranking == chroma_ranking
+    assert all(len(r) == 4 for r in pg_ranking)
+
+
+def test_mmr_keeps_the_tenant_predicate(parity_corpus, fake_embeddings, tmp_path, monkeypatch):
+    """The MMR path builds its own SQL, so it carries its own copy of the tenant scope."""
+    tenant_dir = parity_corpus / TENANT_DIR / "alice"
+    tenant_dir.mkdir(parents=True)
+    (tenant_dir / "private.md").write_text(
+        "Alice's private note about Anthropic Constitutional AI safety research."
+    )
+    monkeypatch.setenv("RETRIEVAL_MMR", "true")
+    monkeypatch.setenv("VECTOR_BACKEND", "pgvector")
+    get_settings.cache_clear()
+    reset_store_cache()
+    persist_dir = tmp_path / "pg_mmr_tenant"
+    build_index(source_dir=parity_corpus, persist_dir=persist_dir, embeddings=fake_embeddings)
+
+    docs = get_retriever(
+        k=10, embeddings=fake_embeddings, persist_dir=persist_dir, owner="bob"
+    ).invoke("Constitutional AI safety research")
+
+    assert all(TENANT_DIR not in d.metadata["source"] for d in docs)
+
+
+def test_postgres_keyword_search_finds_the_matching_document(
+    parity_corpus, fake_embeddings, tmp_path, monkeypatch
+):
+    """The in-memory BM25 index reads every chunk in the collection into the process and keeps
+    it there, once per replica. This is the same retrieval without that ceiling."""
+    from rag_assistant.retrieval.bm25_store import bm25_search
+
+    monkeypatch.setenv("VECTOR_BACKEND", "pgvector")
+    monkeypatch.setenv("KEYWORD_BACKEND", "postgres")
+    get_settings.cache_clear()
+    reset_store_cache()
+    persist_dir = tmp_path / "pg_fts"
+    build_index(source_dir=parity_corpus, persist_dir=persist_dir, embeddings=fake_embeddings)
+
+    hits = bm25_search("Constitutional", k=5, persist_dir=persist_dir, owner="public")
+
+    assert hits
+    assert any("anthropic" in h.source_id for h in hits)
+
+
+def test_postgres_keyword_search_scopes_to_the_tenant(
+    parity_corpus, fake_embeddings, tmp_path, monkeypatch
+):
+    """Keyword search is a second door into the same corpus, so it carries the same predicate
+    -- a backend switch must not be a way around the tenant filter."""
+    from rag_assistant.retrieval.bm25_store import bm25_search
+
+    tenant_dir = parity_corpus / TENANT_DIR / "alice"
+    tenant_dir.mkdir(parents=True)
+    (tenant_dir / "private.md").write_text("Alice's confidential zebra-coded quarterly note.")
+    monkeypatch.setenv("VECTOR_BACKEND", "pgvector")
+    monkeypatch.setenv("KEYWORD_BACKEND", "postgres")
+    get_settings.cache_clear()
+    reset_store_cache()
+    persist_dir = tmp_path / "pg_fts_tenant"
+    build_index(source_dir=parity_corpus, persist_dir=persist_dir, embeddings=fake_embeddings)
+
+    assert bm25_search("zebra", k=5, persist_dir=persist_dir, owner="alice")
+    assert not bm25_search("zebra", k=5, persist_dir=persist_dir, owner="bob")
+
+
+def test_postgres_keyword_search_honours_metadata_filters(
+    parity_corpus, fake_embeddings, tmp_path, monkeypatch
+):
+    from rag_assistant.retrieval.bm25_store import bm25_search
+    from rag_assistant.schemas.api import RetrievalFilters
+
+    monkeypatch.setenv("VECTOR_BACKEND", "pgvector")
+    monkeypatch.setenv("KEYWORD_BACKEND", "postgres")
+    get_settings.cache_clear()
+    reset_store_cache()
+    persist_dir = tmp_path / "pg_fts_filter"
+    build_index(source_dir=parity_corpus, persist_dir=persist_dir, embeddings=fake_embeddings)
+
+    hits = bm25_search(
+        "Constitutional",
+        k=5,
+        persist_dir=persist_dir,
+        owner="public",
+        filters=RetrievalFilters(sources=["mistral.md"]),
+    )
+
+    assert all(h.source_id == "mistral.md" for h in hits)
+
+
+def test_a_punctuation_heavy_question_does_not_error(
+    parity_corpus, fake_embeddings, tmp_path, monkeypatch
+):
+    """`to_tsquery` raises on syntax a user types by accident. A keyword path that can be
+    broken by a question mark is worse than one that ranks imperfectly."""
+    from rag_assistant.retrieval.bm25_store import bm25_search
+
+    monkeypatch.setenv("VECTOR_BACKEND", "pgvector")
+    monkeypatch.setenv("KEYWORD_BACKEND", "postgres")
+    get_settings.cache_clear()
+    reset_store_cache()
+    persist_dir = tmp_path / "pg_fts_syntax"
+    build_index(source_dir=parity_corpus, persist_dir=persist_dir, embeddings=fake_embeddings)
+
+    for question in ["what is 'Constitutional AI'?", "Anthropic & OpenAI!", "a | b : c", "???"]:
+        bm25_search(question, k=5, persist_dir=persist_dir, owner="public")
+
+
+def test_keyword_search_degrades_to_empty_rather_than_failing_the_request(monkeypatch):
+    """Keyword search is one of two local paths. Losing it to a database blip should cost
+    recall, not the request -- the vector path reads the same database and will fail loudly
+    on its own if the problem is not transient."""
+    from rag_assistant.retrieval import bm25_store
+
+    monkeypatch.setenv("KEYWORD_BACKEND", "postgres")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        "rag_assistant.retrieval.pgvector_store.keyword_search",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("connection reset")),
+    )
+
+    assert bm25_store.bm25_search("anything", k=4, owner="public") == []
+
+
+def test_the_multi_replica_profile_moves_keyword_search_too(monkeypatch):
+    """The last piece of per-replica state. Left in memory, every replica holds its own full
+    copy of the corpus -- a ceiling that shows up as memory and a slow first query rather
+    than as a failure."""
+    from rag_assistant.config import Settings
+
+    settings = Settings(
+        google_api_key="k",
+        anthropic_api_key="",
+        deployment_profile="multi-replica",
+        database_url=DATABASE_URL,
+    )
+
+    assert settings.keyword_backend == "postgres"
+
+
+def test_an_explicit_keyword_backend_still_wins_over_the_profile():
+    from rag_assistant.config import Settings
+
+    settings = Settings(
+        google_api_key="k",
+        anthropic_api_key="",
+        deployment_profile="multi-replica",
+        database_url=DATABASE_URL,
+        keyword_backend="memory",
+    )
+
+    assert settings.keyword_backend == "memory"
+
+
+def test_the_archive_excludes_generated_columns(
+    parity_corpus, fake_embeddings, tmp_path, monkeypatch
+):
+    """A generated column is derived data: Postgres recomputes it on every write and rejects
+    an insert that supplies it. Dumping `SELECT *` produced an archive that restored with
+    "cannot insert a non-DEFAULT value into column content_tsv" -- the loud version of the
+    failure. The quiet version is a future generated column doubling the archive with data
+    that is recomputed anyway.
+    """
+    import json
+
+    from rag_assistant.backup import _dump_postgres
+
+    monkeypatch.setenv("VECTOR_BACKEND", "pgvector")
+    get_settings.cache_clear()
+    reset_store_cache()
+    build_index(
+        source_dir=parity_corpus, persist_dir=tmp_path / "pg_dump", embeddings=fake_embeddings
+    )
+
+    staging = tmp_path / "staging"
+    dumped = _dump_postgres(staging, ["corpus_chunks"])
+
+    assert dumped == ["corpus_chunks"]
+    rows = [json.loads(line) for line in (staging / "corpus_chunks.jsonl").read_text().splitlines()]
+    assert rows
+    assert all("content_tsv" not in row for row in rows)
+    # The columns that do carry data are still there -- the exclusion must be precise.
+    assert {"chunk_id", "content", "embedding", "owner", "source"} <= set(rows[0])

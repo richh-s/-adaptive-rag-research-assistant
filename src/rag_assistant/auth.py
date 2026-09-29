@@ -18,6 +18,14 @@ Those live in a JSON file named by `API_KEYS_FILE`:
 A file keeps secrets out of the process listing and lets a key be revoked or rotated by
 editing one place, which an env var full of comma-separated secrets does not.
 
+A key may also carry an identity -- `"user": "svc-reporting", "groups": ["finance"]` -- which
+subjects it to document-level permissions (see ingestion/acl.py). A key with neither is a
+tenant-wide key and reads every document its tenant owns, which is what every key could do
+before permissions existed.
+
+People sign in with single sign-on instead (see oidc.py). Both paths resolve to the same
+`Principal`, so nothing downstream knows or cares which one a request used.
+
 With neither set the API runs open -- every request is the "public" tenant -- which keeps
 local development and the hosted demo frictionless. Setting either flips every data/LLM
 endpoint to require `X-API-Key: <key>` (or `Authorization: Bearer <key>`).
@@ -45,12 +53,18 @@ PUBLIC_OWNER = "public"
 
 READ = "read"
 WRITE = "write"
+# Operating the deployment rather than using it: rebuilding the index, switching generations,
+# running connectors on demand. Deliberately not in ALL_SCOPES -- a key file entry has to ask
+# for it by name, and a key from the plain API_KEYS variable never has it.
+ADMIN = "admin"
 ALL_SCOPES = frozenset({READ, WRITE})
 
 owner_var: ContextVar[str] = ContextVar("api_owner", default=PUBLIC_OWNER)
 # The authenticated key for the current request, for scope checks and audit logging. None
-# when auth is disabled.
+# when auth is disabled or the request authenticated with an SSO token.
 api_key_var: ContextVar["ApiKey | None"] = ContextVar("api_key", default=None)
+# Who is asking, however they authenticated. None when auth is disabled.
+principal_var: ContextVar["Principal | None"] = ContextVar("principal", default=None)
 
 
 @dataclass(frozen=True)
@@ -60,6 +74,10 @@ class ApiKey:
     scopes: frozenset[str] = field(default=ALL_SCOPES)
     expires_at: datetime | None = None
     rate_limit_rpm: int | None = None
+    # Optional identity. A key naming a user or groups is subject to document ACLs; one
+    # naming neither reads its whole tenant (see the module docstring).
+    user: str | None = None
+    groups: frozenset[str] = field(default_factory=frozenset)
 
     def is_expired(self, now: datetime | None = None) -> bool:
         if self.expires_at is None:
@@ -81,6 +99,78 @@ class ApiKey:
         trail that records secrets is a secret store nobody is guarding."""
         return hashlib.sha256(self.key.encode()).hexdigest()[:16]
 
+    def principal(self) -> "Principal":
+        return Principal(
+            owner=self.owner,
+            method="api_key",
+            scopes=self.scopes,
+            subject=self.user,
+            groups=self.groups,
+            bypass_acl=self.user is None and not self.groups,
+            fingerprint=self.fingerprint,
+            rate_limit_rpm=self.rate_limit_rpm,
+        )
+
+
+@dataclass(frozen=True)
+class Principal:
+    """An authenticated caller: which tenant they act in, who they are inside it, and what
+    they may do.
+
+    `principals()` is what document ACLs are checked against -- namespaced strings for the
+    caller's user id, email, email domain and groups. It returns None for a caller that
+    bypasses ACLs (a tenant-wide API key, an SSO member of an admin group), which every
+    retrieval function reads as "no document-level restriction".
+    """
+
+    owner: str
+    method: str
+    scopes: frozenset[str] = field(default=ALL_SCOPES)
+    subject: str | None = None
+    email: str | None = None
+    groups: frozenset[str] = field(default_factory=frozenset)
+    bypass_acl: bool = False
+    fingerprint: str = ""
+    rate_limit_rpm: int | None = None
+
+    def has_scope(self, scope: str) -> bool:
+        return scope in self.scopes
+
+    def principals(self) -> frozenset[str] | None:
+        if self.bypass_acl:
+            return None
+        from rag_assistant.ingestion.acl import DOMAIN_PREFIX, GROUP_PREFIX, USER_PREFIX
+
+        tokens: set[str] = set()
+        if self.subject:
+            tokens.add(USER_PREFIX + self.subject)
+        if self.email:
+            email = self.email.strip().lower()
+            tokens.add(USER_PREFIX + email)
+            if "@" in email:
+                tokens.add(DOMAIN_PREFIX + email.rsplit("@", 1)[1])
+        tokens.update(GROUP_PREFIX + group for group in self.groups)
+        return frozenset(tokens)
+
+    @property
+    def conversation_owner(self) -> str:
+        """The key conversations and feedback are stored under.
+
+        Per user when the caller has a user identity, per tenant otherwise. Once documents
+        have per-user permissions, a transcript is as sensitive as the documents it quotes:
+        a tenant-wide conversation list would show one user's answers -- drawn from documents
+        only they may read -- to everyone else in the tenant. The tenant stays the prefix, so
+        erasing a tenant still reaches every one of its users' conversations.
+        """
+        if self.subject:
+            return f"{self.owner}{CONVERSATION_OWNER_SEPARATOR}{self.subject}"
+        return self.owner
+
+
+# Separates tenant from user in a conversation owner key. Owner labels are filesystem-safe
+# by construction and can never contain it.
+CONVERSATION_OWNER_SEPARATOR = "::"
+
 
 def get_owner() -> str:
     return owner_var.get()
@@ -88,6 +178,28 @@ def get_owner() -> str:
 
 def get_api_key() -> "ApiKey | None":
     return api_key_var.get()
+
+
+def get_principal() -> "Principal | None":
+    return principal_var.get()
+
+
+def get_principals() -> frozenset[str] | None:
+    """The current caller's ACL principals, for retrieval.
+
+    With auth disabled there is no identity at all, so the caller holds no principals: an
+    open deployment serves every *unrestricted* document and no restricted one. Permissions
+    are only as good as the identity behind them, and anonymous access cannot satisfy one.
+    """
+    principal = principal_var.get()
+    if principal is None:
+        return frozenset()
+    return principal.principals()
+
+
+def get_conversation_owner() -> str:
+    principal = principal_var.get()
+    return principal.conversation_owner if principal else owner_var.get()
 
 
 def parse_api_keys(raw: str) -> dict[str, str]:
@@ -140,6 +252,8 @@ def _load_from_file(path_str: str) -> list[ApiKey]:
         if not key:
             continue
         scopes = entry.get("scopes")
+        user = (entry.get("user") or "").strip() or None
+        groups = entry.get("groups") or []
         records.append(
             ApiKey(
                 key=key,
@@ -148,6 +262,8 @@ def _load_from_file(path_str: str) -> list[ApiKey]:
                 scopes=frozenset(scopes) if scopes else ALL_SCOPES,
                 expires_at=_parse_expiry(entry.get("expires_at")),
                 rate_limit_rpm=entry.get("rate_limit_rpm"),
+                user=user,
+                groups=frozenset(str(g).strip() for g in groups if str(g).strip()),
             )
         )
     return records
@@ -189,7 +305,7 @@ def reset_api_key_cache() -> None:
 
 
 def auth_enabled() -> bool:
-    return bool(load_api_keys())
+    return bool(load_api_keys()) or bool(get_settings().oidc_issuer)
 
 
 def resolve_key(presented_key: str | None) -> ApiKey | None:
@@ -224,12 +340,42 @@ def resolve_key(presented_key: str | None) -> ApiKey | None:
 
 
 def resolve_owner(presented_key: str | None) -> str | None:
-    """Owner label for a presented key, or None if rejected. With auth disabled every request
-    (keyed or not) resolves to the public tenant."""
+    """Owner label for a presented credential, or None if rejected. With auth disabled every
+    request (keyed or not) resolves to the public tenant."""
     if not auth_enabled():
         return PUBLIC_OWNER
-    record = resolve_key(presented_key)
-    return record.owner if record else None
+    principal = resolve_principal(presented_key)
+    return principal.owner if principal else None
+
+
+class CredentialRejected(Exception):
+    """A presented credential that is recognisably an SSO token but failed verification.
+    Carries the reason for the audit log; the client only ever sees a generic 401."""
+
+
+def resolve_principal(presented: str | None) -> Principal | None:
+    """The caller behind a presented credential: an API key first, then an SSO token.
+
+    API keys are compared first and always, so a deployment that turns on SSO keeps every
+    existing key working. A value that matches no key is tried as a token only when it looks
+    like one and SSO is configured; anything else is simply rejected. Raises
+    `CredentialRejected` for a token that failed verification, so the audit log can say why.
+    """
+    if not presented:
+        return None
+    record = resolve_key(presented)
+    if record is not None:
+        return record.principal()
+    settings = get_settings()
+    if settings.oidc_issuer:
+        from rag_assistant import oidc
+
+        if oidc.looks_like_jwt(presented):
+            try:
+                return oidc.verify_token(presented)
+            except oidc.TokenRejected as exc:
+                raise CredentialRejected(str(exc)) from exc
+    return None
 
 
 def extract_key(headers: dict[bytes, bytes]) -> str | None:
@@ -250,13 +396,29 @@ def extract_key(headers: dict[bytes, bytes]) -> str | None:
 _WRITE_RULES: tuple[tuple[str, str], ...] = (
     ("POST", "/api/v1/ingest"),
     ("DELETE", "/api/v1/conversations"),
+    # Removing indexed documents is a write, per document and per tenant alike. The tenant
+    # rule was missing: `DELETE /api/v1/tenant/data` matched neither prefix above, fell
+    # through to the READ default, and let a key issued read-only erase every document,
+    # conversation and feedback row its tenant owned -- while the endpoint's own docstring
+    # said a read-only key would get a 403. The default is the safe direction for a *read*
+    # endpoint added without thought, and the reason each write endpoint has to be named
+    # here; this is what happens when one is not.
+    ("DELETE", "/api/v1/sources"),
+    ("DELETE", "/api/v1/tenant/data"),
+    # Changing who may read a document is a write to that document.
+    ("PUT", "/api/v1/sources"),
+    ("POST", "/api/v1/connectors"),
 )
+# Every method: reading index-generation state is as much an operator question as changing it.
+_ADMIN_PREFIXES: tuple[str, ...] = ("/api/v1/admin",)
 
 
 def required_scope(method: str, path: str) -> str:
     """The scope a request needs. Defaults to `read`, so a new endpoint is readable by every
     valid key rather than silently unreachable -- and a new *write* endpoint must be added
     here deliberately."""
+    if path.startswith(_ADMIN_PREFIXES):
+        return ADMIN
     for rule_method, prefix in _WRITE_RULES:
         if method == rule_method and path.startswith(prefix):
             return WRITE
@@ -285,12 +447,14 @@ def audit(event: str, *, path: str, method: str, outcome: str) -> None:
     "which credential did that", which is the first question asked after a leak and the one
     a static env var full of keys has never been able to answer.
     """
-    record = get_api_key()
+    principal = get_principal()
+    if principal is None:
+        who = f"owner={PUBLIC_OWNER} key=none"
+    elif principal.method == "api_key":
+        who = f"owner={principal.owner} key={principal.fingerprint}"
+    else:
+        who = f"owner={principal.owner} user={principal.subject} via={principal.method}"
     logger.info(
         event,
-        extra={
-            "route": path,
-            "node": f"{method} owner={record.owner if record else PUBLIC_OWNER} "
-            f"key={record.fingerprint if record else 'none'} outcome={outcome}",
-        },
+        extra={"route": path, "node": f"{method} {who} outcome={outcome}"},
     )
